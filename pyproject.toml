@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ablator"
+version = "0.1.0"
+description = "Cross-machine ablation/experiment queue orchestrator (stdlib-only, containerized workloads)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Björn Ellensohn", email = "bjoern.ellensohn@gmail.com" }]
+dependencies = []
+
+[project.scripts]
+ablator = "ablator.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ablator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
