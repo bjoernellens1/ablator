@@ -7,6 +7,7 @@ import os
 import time
 
 from . import config as cfgmod
+from . import progress as progmod
 from . import runner, spec as specmod
 from .queue import Queue
 
@@ -59,21 +60,61 @@ def _match(jobs: list[dict], name: str | None) -> list[dict]:
             if j.get("ablation") == name or j.get("id", "").startswith(name + "_")]
 
 
+def _progress(cfg: dict, j: dict) -> str:
+    """Live progress for a running job; model_path resolves against type cwd."""
+    if j.get("status") != "running":
+        return ""
+    try:
+        tcfg = cfgmod.type_cfg(cfg, j.get("type", ""), j.get("claimed_by", "any"))
+    except KeyError:
+        tcfg = {}
+    base = tcfg.get("cwd") or os.getcwd()
+    return progmod.job_progress(j, base, cfg.get("queue", {}))
+
+
+def _status_lines(cfg: dict, jobs: list[dict]) -> list[str]:
+    lines = [f"{'id':<40} {'status':<12} {'machine':<8} {'claimed_by':<10} "
+             f"{'elapsed':<8} {'depends_on':<12} progress"]
+    for j in jobs:
+        lines.append(f"{j.get('id',''):<40} {j.get('status',''):<12} "
+                     f"{j.get('machine',''):<8} {j.get('claimed_by','-'):<10} "
+                     f"{_elapsed(j):<8} {j.get('depends_on','-'):<12} "
+                     f"{_progress(cfg, j)}")
+    counts: dict[str, int] = {}
+    for j in jobs:
+        counts[j.get("status", "?")] = counts.get(j.get("status", "?"), 0) + 1
+    lines.append("")
+    lines.append("totals: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    return lines
+
+
 def cmd_status(cfg: dict, name: str | None) -> None:
     jobs = _match(_queue(cfg).read(), name)
     if not jobs:
         print("no matching jobs in queue")
         return
-    print(f"{'id':<40} {'status':<12} {'machine':<8} {'claimed_by':<10} "
-          f"{'elapsed':<8} depends_on")
-    for j in jobs:
-        print(f"{j.get('id',''):<40} {j.get('status',''):<12} "
-              f"{j.get('machine',''):<8} {j.get('claimed_by','-'):<10} "
-              f"{_elapsed(j):<8} {j.get('depends_on','-')}")
-    counts: dict[str, int] = {}
-    for j in jobs:
-        counts[j.get("status", "?")] = counts.get(j.get("status", "?"), 0) + 1
-    print("\ntotals: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    print("\n".join(_status_lines(cfg, jobs)))
+
+
+def cmd_watch(cfg: dict, name: str | None, interval: int = 60) -> None:
+    """Loop status every `interval` s; mirror to queue_status.txt beside the queue."""
+    status_path = os.path.join(
+        os.path.dirname(cfgmod.queue_path(cfg)), "queue_status.txt")
+    while True:
+        jobs = _match(_queue(cfg).read(), name)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        lines = [f"# queue status @ {stamp}"]
+        lines += _status_lines(cfg, jobs) if jobs else ["no matching jobs in queue"]
+        text = "\n".join(lines) + "\n"
+        try:
+            tmp = status_path + ".tmp"
+            with open(tmp, "w") as f:
+                f.write(text)
+            os.replace(tmp, status_path)
+        except OSError as e:
+            print(f"[watch] WARNING: could not write {status_path}: {e}")
+        print(text, flush=True)
+        time.sleep(interval)
 
 
 # --------------------------------------------------------------- collect
@@ -142,6 +183,9 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--dry-run", action="store_true")
     sp = sub.add_parser("status", help="print queue state")
     sp.add_argument("name", nargs="?")
+    sp = sub.add_parser("watch", help="loop status; mirror to queue_status.txt")
+    sp.add_argument("name", nargs="?")
+    sp.add_argument("--interval", type=int, default=60)
     sp = sub.add_parser("collect", help="print result files of done jobs")
     sp.add_argument("name")
     sp = sub.add_parser("cancel", help="cancel pending jobs of an ablation")
@@ -157,6 +201,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_plan(cfg, a.spec, dry_run=a.dry_run)
     elif a.cmd == "status":
         cmd_status(cfg, a.name)
+    elif a.cmd == "watch":
+        cmd_watch(cfg, a.name, interval=a.interval)
     elif a.cmd == "collect":
         cmd_collect(cfg, a.name)
     elif a.cmd == "cancel":

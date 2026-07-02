@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from ablator import cli, config as cfgmod, resources, runner, spec as specmod
+from ablator import cli, config as cfgmod, progress as progmod, resources, runner, spec as specmod
 from ablator.queue import Queue
 
 
@@ -393,3 +393,37 @@ def test_example_config_parses_and_renders(tmp_path):
     _, env, _ = runner.render_command(tcfg, {**JOB, "type": "bag"}, "r9700")
     assert env["CONTAINER_RUNTIME"] == "docker"
     assert env["TRAIN_EXTRA_ARGS"].endswith("--streaming_report_final")
+
+
+# --------------------------------------------------------------- progress
+
+def test_parse_progress_last_counter_wins():
+    tail = ("Streaming training:  10%| | 100/60000 [00:01<...]\r"
+            "Streaming training:  89%| | 53570/60000 [27:05<02:53, 37.09it/s]")
+    assert progmod.parse_progress(tail) == "iter 53570/60000 (89%)"
+
+
+def test_parse_progress_no_counter():
+    assert progmod.parse_progress("no numbers here") == ""
+
+
+def test_parse_progress_sentinel_cap_fallback():
+    tail = "train:  0%| | 5000/2147483647 [..]"
+    extra = "--foo bar --streaming_max_iterations 60000"
+    assert progmod.parse_progress(tail, extra) == "iter 5000/60000 (8%)"
+
+
+def test_parse_progress_sentinel_without_cap():
+    tail = "train: 5000/2147483647"
+    assert progmod.parse_progress(tail, "--foo bar") == "iter 5000/?"
+
+
+def test_job_progress_reads_configured_log(tmp_path):
+    mp = tmp_path / "run1"
+    mp.mkdir()
+    (mp / "custom.log").write_text("x" * 5000 + " 42/100 [..]")
+    job = {"model_path": "run1", "extra_args": "", "status": "running"}
+    out = progmod.job_progress(job, str(tmp_path), {"progress_log": "custom.log"})
+    assert out == "iter 42/100 (42%)"
+    # default train.log missing -> empty
+    assert progmod.job_progress(job, str(tmp_path), {}) == ""
