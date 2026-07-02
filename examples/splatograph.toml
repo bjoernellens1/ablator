@@ -1,0 +1,106 @@
+# Example ablator config reproducing the splatograph two-machine setup:
+#   main  — Strix Halo (gfx1151), podman, canonical ROS2 stack
+#   r9700 — R9700 (gfx1201), docker, bag jobs only if images pre-pulled
+# Install at ~/.config/ablator/config.toml on BOTH machines (identical file
+# works: machine identity is resolved from hostname patterns at runtime).
+
+[queue]
+path = "/mnt/cps_scratch1_tmp/bjoern/queue/queue.jsonl"
+# log_dir defaults to the queue directory
+model_path_template = "output/scratch/{name}_{arm}"
+# fallback result_glob for `ablator collect` (types may override)
+result_glob = "{model_path}/comparison/*/report.json"
+
+# ------------------------------------------------------------------ machines
+
+[machines.r9700]
+hostname_patterns = ["*r9700*"]
+ssh = "bjoern@cps-wkstn-amd1r9700.local"
+# adjust if ablator lives in a venv on the remote:
+runner_command = "ablator run"
+
+[[machines.r9700.busy_guards]]
+command = ["docker", "ps", "--format", "{{.Image}}"]
+contains = "splatograph"
+
+[machines.main]
+hostname_patterns = ["*"]   # fallback identity
+
+[[machines.main.busy_guards]]
+command = ["podman", "ps", "--format", "{{.Names}}"]
+contains = "splat_train"
+
+[[machines.main.busy_guards]]
+command = ["pgrep", "-f", "chain\\.sh"]
+# no `contains` -> busy if any output (any chain.sh process)
+
+[resources]
+gpu_busy_pct = 20      # busy iff BOTH samples > this (env ABLATOR_GPU_BUSY_PCT overrides)
+sample_gap_s = 3.0
+
+# ------------------------------------------------------------- type: replay
+# Direct container run of train.py --streaming_replay.
+
+[types.replay]
+cwd = "/home/bjoern/git/splatograph"
+command = [
+  "podman", "run", "--rm", "--privileged",
+  "--security-opt", "label=disable", "--group-add", "video",
+  "--network", "host", "--device", "/dev/kfd", "--device", "/dev/dri",
+  "-e", "HSA_XNACK=1",
+  "-v", "/home/bjoern/git/splatograph:/workspace/splatograph",
+  "-v", "/mnt/cps_scratch1_tmp:/mnt/cps_scratch1_tmp",
+  "-v", "{scene}:/data/scene:ro",
+  "-v", "/home/bjoern/.cache/torch:/root/.cache/torch",
+  "-e", "SCENE_SOURCE={scene}",
+  "-w", "/workspace/splatograph",
+  "ghcr.io/bjoernellens1/splatograph:ros2-jazzy",
+  "python", "train.py", "-s", "/data/scene", "-m", "{model_path}",
+  "--streaming_replay", "--iterations", "{iterations}",
+  "--streaming_report_final", "{extra_args}",
+]
+
+[types.replay.machines.r9700]
+command = [
+  "docker", "run", "--rm", "--privileged",
+  "--security-opt", "label=disable", "--group-add", "video",
+  "--network", "host", "--device", "/dev/kfd", "--device", "/dev/dri",
+  "-v", "/home/bjoern/git/splatograph:/workspace/splatograph",
+  "-v", "/mnt/cps_scratch1_tmp:/mnt/cps_scratch1_tmp",
+  "-v", "{scene}:/data/scene:ro",
+  "-v", "/home/bjoern/.cache/torch:/root/.cache/torch",
+  "-e", "SCENE_SOURCE={scene}",
+  "-w", "/workspace/splatograph",
+  "ghcr.io/bjoernellens1/splatograph:latest-gfx1201",
+  "python", "train.py", "-s", "/data/scene", "-m", "{model_path}",
+  "--streaming_replay", "--iterations", "{iterations}",
+  "--streaming_report_final", "{extra_args}",
+]
+
+# ---------------------------------------------------------------- type: bag
+# Offline rosbag replay via the launch script (full ROS2/zenoh stack).
+# extra_args flow in through TRAIN_EXTRA_ARGS, scene through the script arg.
+
+[types.bag]
+cwd = "/home/bjoern/git/splatograph"
+command = [
+  "bash", "/home/bjoern/git/splatograph/human_launch_scripts/05_run_offline_rosbag.sh",
+  "{scene}", "--model-path", "{model_path}",
+]
+[types.bag.env]
+TRAIN_EXTRA_ARGS = "{extra_args} --streaming_report_final"
+
+# r9700 runs bag jobs only if every stack image is already local (docker);
+# never triggers a 20GB+ build/pull from the runner.
+[types.bag.machines.r9700]
+image_probe_runtime = "docker"
+require_images = [
+  "ghcr.io/bjoernellens1/splatograph:ros2-jazzy-gfx1201",
+  "ghcr.io/bjoernellens1/splatograph:rvizsplat-jazzy",
+  "ghcr.io/bjoernellens1/splatograph:rvizsplat-novnc-jazzy",
+  "ghcr.io/bjoernellens1/splatograph-orbslam3:jazzy-orbbec-v3",
+]
+[types.bag.machines.r9700.env]
+CONTAINER_RUNTIME = "docker"
+TRAIN_ROS2_IMG = "ghcr.io/bjoernellens1/splatograph:ros2-jazzy-gfx1201"
+PYTORCH_ROCM_ARCH = "gfx1201"
