@@ -22,13 +22,15 @@ import subprocess
 import time
 
 from . import config as cfgmod
+from . import error as errormod
 from . import health as healthmod
 from . import resources
-from .queue import Queue
+from .queue import Queue, pause_flag_path, write_pause_flag
 
 IDLE_POLL_S = 30
 BUSY_POLL_S = 30
 HEALTH_POLL_S = 60
+STALL_WARN_S = 600  # loudly log if one loop iteration took longer than this
 
 # Manual control action -> status returned by supervise(). "requeue" is
 # turned back into a fresh pending job by run_loop.
@@ -209,8 +211,135 @@ def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
             return "failed"
 
 
-def run_job(cfg: dict, job: dict, machine: str, q: Queue | None = None) -> str:
-    """Execute one job; returns its status. Logs to <log_dir>/<id>.log.
+def write_heartbeat(cfg: dict, machine: str, state: str) -> None:
+    """One line per loop iteration so 'stuck vs sleeping' is diagnosable at a
+    glance: <queue dir>/heartbeat_<machine>.txt. Never raises."""
+    try:
+        path = os.path.join(os.path.dirname(cfgmod.queue_path(cfg)),
+                            f"heartbeat_{machine}.txt")
+        with open(path, "w") as f:
+            f.write(f"{machine} {time.strftime('%Y-%m-%dT%H:%M:%S')} "
+                    f"epoch={time.time():.0f} state={state}\n")
+    except Exception as e:
+        print(f"[ablator] heartbeat write failed: {e!r}", flush=True)
+
+
+def _disk_free_bytes(path: str) -> int | None:
+    try:
+        import shutil
+        d = path if os.path.isdir(path) else os.path.dirname(path) or "."
+        return shutil.disk_usage(d).free
+    except OSError:
+        return None
+
+
+def _docker_storage_free_bytes() -> int | None:
+    for candidate in ("/var/lib/docker", "/var/lib/containers"):
+        if os.path.isdir(candidate):
+            return _disk_free_bytes(candidate)
+    return None
+
+
+def machine_context_snapshot(job: dict, base_dir: str) -> dict:
+    """Best-effort, read-only machine signals for error.classify_failure()."""
+    mp = healthmod.resolve_model_path(job.get("model_path", ""), base_dir)
+    ctx: dict = {
+        "disk_free_bytes": _disk_free_bytes(mp),
+        "docker_storage_free_bytes": _docker_storage_free_bytes(),
+    }
+    for dmesg_path in ("/var/log/messages",):
+        try:
+            from . import progress as progmod
+            ctx["dmesg_tail"] = progmod.read_tail(dmesg_path, 4096)
+            break
+        except OSError:
+            continue
+    return ctx
+
+
+def _job_log_tail(cfg: dict, job: dict) -> str:
+    from . import progress as progmod
+    log = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
+    return progmod.read_tail(log, healthmod.CRASH_TAIL_BYTES)
+
+
+def classify_and_record(cfg: dict, job: dict, exit_code: int | None,
+                        base_dir: str, q: Queue | None = None) -> dict:
+    """Classify a failed job's log/exit-code and persist error_* fields."""
+    tail = _job_log_tail(cfg, job)
+    ctx = machine_context_snapshot(job, base_dir)
+    patterns = errormod.patterns_from_config(cfg)
+    result = errormod.classify_failure(job, tail, exit_code, ctx, patterns=patterns)
+    if q is not None:
+        q.update(job["id"],
+                error_category=result["category"],
+                error_evidence=result["evidence_snippet"],
+                error_confidence=result["confidence"],
+                suggested_action=result["suggested_action"])
+    job["error_category"] = result["category"]
+    job["error_evidence"] = result["evidence_snippet"]
+    job["error_confidence"] = result["confidence"]
+    job["suggested_action"] = result["suggested_action"]
+    return result
+
+
+def handle_failure(cfg: dict, job: dict, exit_code: int | None, machine: str,
+                   base_dir: str, q: Queue) -> str:
+    """Classify a failure and decide the job's terminal/backoff disposition.
+
+    Returns one of: "paused_disk_full", "quarantined", "pending" (requeued
+    with not_before/needs_review bookkeeping already applied via q.update),
+    or "retry" (caller should retry once, existing uniform behavior for
+    'unknown').
+    """
+    result = classify_and_record(cfg, job, exit_code, base_dir, q)
+    category = result["category"]
+    action = result["suggested_action"]
+
+    if action == "pause_queue_alert":
+        path = write_pause_flag(cfgmod.queue_path(cfg), machine, category,
+                                result["evidence_snippet"])
+        print(f"[ablator] PAUSING {machine} — {category}: "
+              f"{result['evidence_snippet']!r} (flag: {path})", flush=True)
+        q.update(job["id"], status="paused_disk_full")
+        return "paused_disk_full"
+
+    if action == "skip_permanently_this_machine":
+        print(f"[ablator] {job['id']}: {category} — quarantining", flush=True)
+        return "quarantined"
+
+    if action == "requeue_backoff_5min":
+        q.update(job["id"], status="pending", health=None,
+                claimed_by=None, claimed_at=None,
+                not_before=time.time() + 5 * 60)
+        return "pending"
+
+    if action == "requeue_backoff_2min":
+        q.update(job["id"], status="pending", health=None,
+                claimed_by=None, claimed_at=None,
+                not_before=time.time() + 2 * 60)
+        return "pending"
+
+    if action == "requeue_once_needs_review":
+        if job.get("oom_killed_once"):
+            print(f"[ablator] {job['id']}: second oom_killed — quarantining", flush=True)
+            return "quarantined"
+        q.update(job["id"], status="pending", health=None,
+                claimed_by=None, claimed_at=None,
+                oom_killed_once=True, needs_review=True)
+        return "pending"
+
+    if action in ("quarantine_no_retry", "quarantine_code_fix_needed"):
+        return "quarantined"
+
+    # unknown -> retry_once_then_quarantine: preserve existing uniform
+    # retry-then-quarantine behavior in run_loop().
+    return "retry"
+
+
+def run_job(cfg: dict, job: dict, machine: str,
+           q: Queue | None = None) -> tuple[str, int | None]:
+    """Execute one job; returns (status, exit_code). Logs to <log_dir>/<id>.log.
 
     While the subprocess runs, a supervision loop mirrors artifact-derived
     health into the queue record, honors control files, and kills
@@ -222,7 +351,7 @@ def run_job(cfg: dict, job: dict, machine: str, q: Queue | None = None) -> str:
         argv, env, cwd = render_command(tcfg, job, machine)
     except (KeyError, TemplateError) as e:
         print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
-        return "failed"
+        return "failed", None
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} (log {log_path})",
           flush=True)
     try:
@@ -234,58 +363,103 @@ def run_job(cfg: dict, job: dict, machine: str, q: Queue | None = None) -> str:
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
             override = supervise(cfg, job, proc, cwd or os.getcwd(), q)
+        rc = proc.returncode
         if override is not None:
-            return override
-        return "done" if proc.returncode == 0 else "failed"
+            return override, rc
+        return ("done" if rc == 0 else "failed"), rc
     except Exception as e:
         print(f"[ablator] {job['id']} crashed: {e}", flush=True)
-        return "failed"
+        return "failed", None
+
+
+def _job_base_dir(cfg: dict, job: dict, machine: str) -> str:
+    try:
+        tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+    except KeyError:
+        tcfg = {}
+    return tcfg.get("cwd") or os.getcwd()
 
 
 def run_loop(cfg: dict, once: bool = False) -> None:
     machine = cfgmod.machine_name(cfg)
     q = Queue(cfgmod.queue_path(cfg))
     print(f"[ablator] runner on {machine} watching {q.path}", flush=True)
+    last_tick = time.monotonic()
     while True:
-        if resources.machine_busy(cfg, machine):
-            if once:
-                return
-            time.sleep(BUSY_POLL_S)
-            continue
-        job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
-        if job is None:
-            if once:
-                return
-            time.sleep(IDLE_POLL_S)
-            continue
-        status = run_job(cfg, job, machine, q)
-        # one retry on failure, then quarantine
-        if status == "failed" and not job.get("retried"):
-            q.update(job["id"], retried=True)
-            print(f"[ablator] retrying {job['id']} once", flush=True)
-            job["retried"] = True
-            status = run_job(cfg, job, machine, q)
+        # Watchdog: if the previous iteration (probes + sleeps, NOT a job
+        # run) took absurdly long, say so loudly — this is the 'stuck loop'
+        # tell.
+        now = time.monotonic()
+        if now - last_tick > STALL_WARN_S:
+            print(f"[ablator] WARNING: loop iteration took {now - last_tick:.0f}s "
+                  f"(> {STALL_WARN_S}s) — a probe or lock likely hung",
+                  flush=True)
+        last_tick = now
+        try:
+            if resources.machine_busy(cfg, machine):
+                write_heartbeat(cfg, machine, "busy-wait")
+                if once:
+                    return
+                time.sleep(BUSY_POLL_S)
+                continue
+            write_heartbeat(cfg, machine, "idle")
+            job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
+            if job is None:
+                if once:
+                    return
+                time.sleep(IDLE_POLL_S)
+                continue
+            write_heartbeat(cfg, machine, f"running:{job['id']}")
+            base_dir = _job_base_dir(cfg, job, machine)
+            status, exit_code = run_job(cfg, job, machine, q)
             if status == "failed":
-                status = "quarantined"
-        if status == "preempted":
-            # lane-1 job yielded to a lane-3 job: back to pending with the
-            # anti-thrash bookkeeping; the loop claims the lane-3 job next
-            q.update(job["id"], status="pending", health=None,
-                     claimed_by=None, claimed_at=None,
-                     preempt_count=int(job.get("preempt_count", 0)) + 1,
-                     last_preempt_at=time.time())
-        elif status == "requeue":
-            # manual requeue: back to pending, clear claim/health so any
-            # runner (including this one) can retake it fresh
-            q.update(job["id"], status="pending", health=None,
-                     claimed_by=None, claimed_at=None)
-        else:
-            if status == "failed_no_retry":  # manual stop: never retried
-                status = "failed"
-            q.finish(job["id"], status)
-        print(f"[ablator] {job['id']} -> {status}", flush=True)
-        if once:
-            return
+                disposition = handle_failure(cfg, job, exit_code, machine, base_dir, q)
+                if disposition == "retry":
+                    # unknown category: preserve existing uniform
+                    # retry-once-then-quarantine behavior.
+                    if not job.get("retried"):
+                        job["retried"] = True
+                        q.update(job["id"], retried=True)
+                        print(f"[ablator] retrying {job['id']} once", flush=True)
+                        status, exit_code = run_job(cfg, job, machine, q)
+                        if status == "failed":
+                            classify_and_record(cfg, job, exit_code, base_dir, q)
+                            status = "quarantined"
+                    else:
+                        status = "quarantined"
+                elif disposition == "pending":
+                    status = "pending"  # already persisted by handle_failure
+                else:
+                    status = disposition  # paused_disk_full | quarantined
+            if status == "preempted":
+                # lane-1 job yielded to a lane-3 job: back to pending with the
+                # anti-thrash bookkeeping; the loop claims the lane-3 job next
+                q.update(job["id"], status="pending", health=None,
+                         claimed_by=None, claimed_at=None,
+                         preempt_count=int(job.get("preempt_count", 0)) + 1,
+                         last_preempt_at=time.time())
+            elif status == "requeue":
+                # manual requeue: back to pending, clear claim/health so any
+                # runner (including this one) can retake it fresh
+                q.update(job["id"], status="pending", health=None,
+                         claimed_by=None, claimed_at=None)
+            elif status in ("pending", "paused_disk_full"):
+                pass  # handle_failure() already persisted this status
+            else:
+                if status == "failed_no_retry":  # manual stop: never retried
+                    status = "failed"
+                q.finish(job["id"], status)
+            write_heartbeat(cfg, machine, f"finished:{job['id']}:{status}")
+            last_tick = time.monotonic()  # job runs are legitimately long
+            print(f"[ablator] {job['id']} -> {status}", flush=True)
+            if once:
+                return
+        except Exception as e:
+            import traceback
+            print(f"[ablator] loop iteration crashed: {e!r}\n"
+                  f"{traceback.format_exc()}", flush=True)
+            write_heartbeat(cfg, machine, "error")
+            time.sleep(60)
 
 
 # ------------------------------------------------------------------ start
