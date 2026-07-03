@@ -12,7 +12,7 @@ from . import config as cfgmod
 from . import health as healthmod
 from . import progress as progmod
 from . import runner, spec as specmod
-from .queue import Queue, job_lane
+from .queue import (Queue, job_lane, clear_pause_flag, pause_flag_path)
 
 
 def _queue(cfg: dict) -> Queue:
@@ -95,20 +95,57 @@ def _display_sort(jobs: list[dict]) -> list[dict]:
     return sorted(jobs, key=lambda j: (-job_lane(j), _STATE_RANK.get(j.get("status"), 2)))
 
 
+def _error_tag(j: dict) -> str:
+    """Inline '[category!]' tag for jobs with a recorded error classification."""
+    cat = j.get("error_category")
+    if not cat or cat == "unknown":
+        return ""
+    return f"[{cat}!]"
+
+
 def _status_lines(cfg: dict, jobs: list[dict]) -> list[str]:
     lines = [f"{'id':<40} {'lane':<4} {'status':<12} {'machine':<8} {'claimed_by':<10} "
              f"{'elapsed':<8} {'depends_on':<12} progress"]
     for j in _display_sort(jobs):
         prog = " ".join(x for x in (_progress(cfg, j), _health_note(j)) if x)
-        lines.append(f"{j.get('id',''):<40} {job_lane(j):<4} {j.get('status',''):<12} "
-                     f"{j.get('machine',''):<8} {j.get('claimed_by','-'):<10} "
-                     f"{_elapsed(j):<8} {j.get('depends_on','-'):<12} "
+        tag = _error_tag(j)
+        if tag:
+            prog = " ".join(x for x in (tag, prog) if x)
+        lines.append(f"{(j.get('id') or ''):<40} {job_lane(j):<4} {(j.get('status') or ''):<12} "
+                     f"{(j.get('machine') or ''):<8} {(j.get('claimed_by') or '-'):<10} "
+                     f"{_elapsed(j):<8} {(j.get('depends_on') or '-'):<12} "
                      f"{prog}")
     counts: dict[str, int] = {}
     for j in jobs:
-        counts[j.get("status", "?")] = counts.get(j.get("status", "?"), 0) + 1
+        key = j.get("status") or "?"
+        counts[key] = counts.get(key, 0) + 1
     lines.append("")
     lines.append("totals: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
+    return lines
+
+
+def _pause_flag_lines(cfg: dict) -> list[str]:
+    """'⚠ <machine> is PAUSED (<category>) since <ts> — see <file>' lines."""
+    qdir = os.path.dirname(cfgmod.queue_path(cfg))
+    lines = []
+    if not os.path.isdir(qdir):
+        return lines
+    for fname in sorted(os.listdir(qdir)):
+        if not (fname.startswith("paused_") and fname.endswith(".txt")):
+            continue
+        machine = fname[len("paused_"):-len(".txt")]
+        path = os.path.join(qdir, fname)
+        info = {}
+        try:
+            with open(path) as f:
+                for line in f:
+                    if "=" in line:
+                        k, _, v = line.strip().partition("=")
+                        info[k] = v
+        except OSError:
+            continue
+        lines.append(f"⚠ {machine} is PAUSED ({info.get('category', '?')}) "
+                     f"since {info.get('timestamp', '?')} — see {fname}")
     return lines
 
 
@@ -124,6 +161,9 @@ def _lane1_restock_warning(all_jobs: list[dict]) -> str | None:
 
 
 def cmd_status(cfg: dict, name: str | None) -> None:
+    pause_lines = _pause_flag_lines(cfg)
+    if pause_lines:
+        print("\n".join(pause_lines))
     all_jobs = _queue(cfg).read()
     jobs = _match(all_jobs, name)
     if not jobs:
@@ -144,6 +184,7 @@ def cmd_watch(cfg: dict, name: str | None, interval: int = 60) -> None:
         jobs = _match(all_jobs, name)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         lines = [f"# queue status @ {stamp}"]
+        lines += _pause_flag_lines(cfg)
         lines += _status_lines(cfg, jobs) if jobs else ["no matching jobs in queue"]
         warn = _lane1_restock_warning(all_jobs)
         if warn:
@@ -276,12 +317,93 @@ def cmd_promote(cfg: dict, job_id: str, lane_str: str) -> None:
     raise SystemExit(f"no job '{job_id}' in queue")
 
 
+# ------------------------------------------------------------------ rerun
+
+def cmd_rerun(cfg: dict, job_id: str, lane_str: str | None = None) -> None:
+    """Reset a terminal (done/failed/quarantined/cancelled) job to pending
+    so a runner picks it up again — the safe alternative to hand-editing
+    queue.jsonl. Refuses to touch a job that is currently running or has no
+    matching id. Clears prior claim/health/finish bookkeeping and bumps a
+    "rerun_count" so re-runs are distinguishable in the ledger/logs."""
+    q = _queue(cfg)
+    with q._open_locked() as f:
+        jobs = q._load(f)
+        target = next((j for j in jobs if j.get("id") == job_id), None)
+        if target is None:
+            raise SystemExit(f"[rerun] no job with id '{job_id}'")
+        if target.get("status") == "running":
+            raise SystemExit(
+                f"[rerun] job '{job_id}' is currently running — use "
+                f"'ablator requeue {job_id}' instead")
+        prev_status = target.get("status")
+        target["status"] = "pending"
+        target["rerun_count"] = int(target.get("rerun_count", 0)) + 1
+        target["rerun_of_status"] = prev_status
+        for k in ("claimed_by", "claimed_at", "finished_at", "health",
+                  "retried", "note"):
+            target.pop(k, None)
+        if lane_str is not None:
+            target["lane"] = int(lane_str)
+        q._save(f, jobs)
+    print(f"[rerun] '{job_id}' reset {prev_status} -> pending "
+          f"(rerun_count={target['rerun_count']}, lane={target.get('lane', 2)})")
+
+
 # ---------------------------------------------------------------- cancel
 
 def cmd_cancel(cfg: dict, name: str) -> None:
     n = _queue(cfg).cancel(
         lambda j: j.get("ablation") == name or j.get("id", "").startswith(name + "_"))
     print(f"[cancel] cancelled {n} pending jobs of ablation '{name}'")
+
+
+# ---------------------------------------------------------------- errors/unpause
+
+def cmd_errors(cfg: dict, name: str | None = None) -> None:
+    """Flat list of failed/quarantined/paused jobs with their classification,
+    most-recent-first (by finished_at, falling back to claimed_at)."""
+    jobs = _match(_queue(cfg).read(), name)
+    interesting = [j for j in jobs
+                   if j.get("status") in ("failed", "quarantined", "paused_disk_full")
+                   or j.get("error_category")]
+    if not interesting:
+        print("no failed/quarantined/paused jobs" + (f" for '{name}'" if name else ""))
+        return
+
+    def sort_key(j):
+        return j.get("finished_at") or j.get("claimed_at") or ""
+
+    interesting.sort(key=sort_key, reverse=True)
+    for j in interesting:
+        cat = j.get("error_category", "-")
+        evidence = j.get("error_evidence", "-")
+        action = j.get("suggested_action", "-")
+        print(f"{j.get('id',''):<40} status={j.get('status',''):<16} "
+              f"category={cat:<20} action={action}")
+        print(f"  evidence: {evidence}")
+
+
+def cmd_unpause(cfg: dict, machine: str | None) -> None:
+    if not machine:
+        raise SystemExit("usage: ablator unpause <machine>")
+    path = pause_flag_path(cfgmod.queue_path(cfg), machine)
+    if not os.path.exists(path):
+        raise SystemExit(f"[unpause] no pause flag for '{machine}' ({path})")
+    info = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                if "=" in line:
+                    k, _, v = line.strip().partition("=")
+                    info[k] = v
+    except OSError:
+        pass
+    cleared = clear_pause_flag(cfgmod.queue_path(cfg), machine)
+    if cleared:
+        print(f"[unpause] cleared {path} — was: category={info.get('category', '?')} "
+              f"since={info.get('timestamp', '?')} evidence={info.get('evidence', '?')}")
+    else:
+        raise SystemExit(f"[unpause] failed to remove {path}")
 
 
 # ------------------------------------------------------------------ main
@@ -309,6 +431,9 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("promote", help="move a pending job to another lane")
     sp.add_argument("job_id")
     sp.add_argument("lane")
+    sp = sub.add_parser("rerun", help="reset a terminal job back to pending")
+    sp.add_argument("job_id")
+    sp.add_argument("lane", nargs="?")
     sp = sub.add_parser("health", help="print artifact-derived job health")
     sp.add_argument("job_id", nargs="?")
     for action, hlp in (("stop", "kill a running job (failed, no retry)"),
@@ -320,6 +445,11 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--once", action="store_true",
                     help="claim/run at most one job, then exit")
     sub.add_parser("start", help="launch runners locally and on ssh remotes")
+    sp = sub.add_parser("errors", help="list failed/quarantined/paused jobs "
+                        "with their classification")
+    sp.add_argument("name", nargs="?")
+    sp = sub.add_parser("unpause", help="clear a machine-level pause flag")
+    sp.add_argument("machine")
 
     a = p.parse_args(argv)
     cfg = cfgmod.load_config(a.config)
@@ -335,6 +465,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_cancel(cfg, a.name)
     elif a.cmd == "promote":
         cmd_promote(cfg, a.job_id, a.lane)
+    elif a.cmd == "rerun":
+        cmd_rerun(cfg, a.job_id, a.lane)
     elif a.cmd == "health":
         cmd_health(cfg, a.job_id)
     elif a.cmd in ("stop", "skip", "requeue"):
@@ -343,6 +475,10 @@ def main(argv: list[str] | None = None) -> None:
         runner.run_loop(cfg, once=a.once)
     elif a.cmd == "start":
         runner.start_runners(cfg)
+    elif a.cmd == "errors":
+        cmd_errors(cfg, a.name)
+    elif a.cmd == "unpause":
+        cmd_unpause(cfg, a.machine)
 
 
 if __name__ == "__main__":
