@@ -1,12 +1,15 @@
-"""ablator CLI: plan / status / collect / cancel / run / start."""
+"""ablator CLI: plan / status / watch / collect / cancel / health /
+stop / skip / requeue / run / start."""
 from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import time
 
 from . import config as cfgmod
+from . import health as healthmod
 from . import progress as progmod
 from . import runner, spec as specmod
 from .queue import Queue
@@ -72,14 +75,26 @@ def _progress(cfg: dict, j: dict) -> str:
     return progmod.job_progress(j, base, cfg.get("queue", {}))
 
 
+def _health_note(j: dict) -> str:
+    """Short health tag from the queue record written by the runner."""
+    if j.get("status") != "running":
+        return ""
+    h = j.get("health")
+    if not isinstance(h, dict):
+        return ""
+    age = h.get("log_age_s")
+    return f"[{h.get('state', '?')}" + (f" {int(age)}s]" if age is not None else "]")
+
+
 def _status_lines(cfg: dict, jobs: list[dict]) -> list[str]:
     lines = [f"{'id':<40} {'status':<12} {'machine':<8} {'claimed_by':<10} "
              f"{'elapsed':<8} {'depends_on':<12} progress"]
     for j in jobs:
+        prog = " ".join(x for x in (_progress(cfg, j), _health_note(j)) if x)
         lines.append(f"{j.get('id',''):<40} {j.get('status',''):<12} "
                      f"{j.get('machine',''):<8} {j.get('claimed_by','-'):<10} "
                      f"{_elapsed(j):<8} {j.get('depends_on','-'):<12} "
-                     f"{_progress(cfg, j)}")
+                     f"{prog}")
     counts: dict[str, int] = {}
     for j in jobs:
         counts[j.get("status", "?")] = counts.get(j.get("status", "?"), 0) + 1
@@ -160,6 +175,52 @@ def cmd_collect(cfg: dict, name: str) -> None:
                     pass
 
 
+# ---------------------------------------------------------- health/control
+
+def cmd_health(cfg: dict, job_id: str | None) -> None:
+    """Print artifact-derived health of running (or the named) job(s)."""
+    jobs = _queue(cfg).read()
+    if job_id:
+        jobs = [j for j in jobs if j.get("id") == job_id]
+        if not jobs:
+            raise SystemExit(f"no job '{job_id}' in queue")
+    else:
+        jobs = [j for j in jobs if j.get("status") == "running"]
+        if not jobs:
+            print("no running jobs")
+            return
+    for j in jobs:
+        try:
+            tcfg = cfgmod.type_cfg(cfg, j.get("type", ""),
+                                   j.get("claimed_by", "any"))
+        except KeyError:
+            tcfg = {}
+        base = tcfg.get("cwd") or os.getcwd()
+        h = healthmod.job_health(j, base, cfg.get("queue", {}))
+        print(f"{j['id']}: {json.dumps(h)}")
+
+
+def cmd_control(cfg: dict, action: str, job_id: str) -> None:
+    """Write a control file the supervising runner honors on its next poll.
+
+    stop    -> kill, mark failed (no retry)
+    skip    -> kill, mark cancelled
+    requeue -> kill, mark pending (re-runs from scratch)
+    """
+    jobs = {j.get("id"): j for j in _queue(cfg).read()}
+    j = jobs.get(job_id)
+    if j is None:
+        raise SystemExit(f"no job '{job_id}' in queue")
+    if j.get("status") != "running":
+        raise SystemExit(f"job '{job_id}' is {j.get('status')}, not running — "
+                         f"use 'cancel' for pending jobs")
+    path = runner.control_path(cfg, job_id)
+    with open(path, "w") as f:
+        f.write(action + "\n")
+    print(f"[{action}] wrote {path} — the runner acts on its next "
+          f"supervision poll (~{runner.HEALTH_POLL_S}s)")
+
+
 # ---------------------------------------------------------------- cancel
 
 def cmd_cancel(cfg: dict, name: str) -> None:
@@ -190,6 +251,13 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("name")
     sp = sub.add_parser("cancel", help="cancel pending jobs of an ablation")
     sp.add_argument("name")
+    sp = sub.add_parser("health", help="print artifact-derived job health")
+    sp.add_argument("job_id", nargs="?")
+    for action, hlp in (("stop", "kill a running job (failed, no retry)"),
+                        ("skip", "kill a running job (cancelled)"),
+                        ("requeue", "kill a running job and re-queue it")):
+        sp = sub.add_parser(action, help=hlp)
+        sp.add_argument("job_id")
     sp = sub.add_parser("run", help="runner loop: claim and execute jobs")
     sp.add_argument("--once", action="store_true",
                     help="claim/run at most one job, then exit")
@@ -207,6 +275,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_collect(cfg, a.name)
     elif a.cmd == "cancel":
         cmd_cancel(cfg, a.name)
+    elif a.cmd == "health":
+        cmd_health(cfg, a.job_id)
+    elif a.cmd in ("stop", "skip", "requeue"):
+        cmd_control(cfg, a.cmd, a.job_id)
     elif a.cmd == "run":
         runner.run_loop(cfg, once=a.once)
     elif a.cmd == "start":

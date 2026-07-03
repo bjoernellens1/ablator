@@ -17,15 +17,23 @@ from __future__ import annotations
 
 import os
 import shlex
+import signal
 import subprocess
 import time
 
 from . import config as cfgmod
+from . import health as healthmod
 from . import resources
 from .queue import Queue
 
 IDLE_POLL_S = 30
 BUSY_POLL_S = 30
+HEALTH_POLL_S = 60
+
+# Manual control action -> status returned by supervise(). "requeue" is
+# turned back into a fresh pending job by run_loop.
+CONTROL_STATUS = {"stop": "failed_no_retry", "skip": "cancelled",
+                  "requeue": "requeue"}
 
 
 class TemplateError(SystemExit):
@@ -105,8 +113,100 @@ def make_can_run(cfg: dict, machine: str):
     return can_run
 
 
-def run_job(cfg: dict, job: dict, machine: str) -> str:
-    """Execute one job; returns 'done' or 'failed'. Logs to <log_dir>/<id>.log."""
+def control_path(cfg: dict, job_id: str) -> str:
+    return os.path.join(os.path.dirname(cfgmod.queue_path(cfg)),
+                        f"control_{job_id}")
+
+
+def read_control(cfg: dict, job_id: str) -> str | None:
+    """Read and consume a manual control file: 'stop'|'skip'|'requeue'."""
+    path = control_path(cfg, job_id)
+    try:
+        with open(path) as f:
+            action = f.read().strip().lower()
+    except OSError:
+        return None
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    return action if action in CONTROL_STATUS else None
+
+
+def kill_job(proc: subprocess.Popen, job: dict) -> None:
+    """Kill the job's process group (SIGTERM, then SIGKILL)."""
+    print(f"[ablator] killing {job['id']} (pid {proc.pid})", flush=True)
+    for sig, wait_s in ((signal.SIGTERM, 30), (signal.SIGKILL, 10)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=wait_s)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
+              q: Queue | None = None,
+              poll_s: float = HEALTH_POLL_S,
+              sleep=None,
+              health_fn=None,
+              kill=None,
+              record=None,
+              control=None) -> str | None:
+    """Watch a running job until its process exits or intervention is needed.
+
+    Returns None when the process exited on its own (caller reads
+    returncode), or an override status: 'failed_no_retry' (manual stop),
+    'cancelled' (manual skip), 'requeue' (manual requeue), 'failed'
+    (hung/crashed — normal retry->quarantine path applies).
+
+    Health comes ONLY from the run's own artifacts (health module); the run
+    itself stays fully standalone and never talks to the runner.
+    """
+    if sleep is None:
+        def sleep(s):  # returns as soon as the process exits
+            try:
+                proc.wait(timeout=s)
+            except subprocess.TimeoutExpired:
+                pass
+    qcfg = cfg.get("queue", {})
+    health_fn = health_fn or (lambda alive: healthmod.job_health(
+        job, base_dir, qcfg, process_alive=alive))
+    kill = kill or (lambda: kill_job(proc, job))
+    record = record or (lambda h: q and q.update(job["id"], health=h))
+    control = control or (lambda: read_control(cfg, job["id"]))
+    while True:
+        if proc.poll() is not None:
+            record(health_fn(None))  # final snapshot; exit code judges result
+            return None
+        sleep(poll_s)
+        alive = proc.poll() is None
+        h = health_fn(alive)
+        record(h)
+        action = control()
+        if action:
+            print(f"[ablator] control '{action}' for {job['id']}", flush=True)
+            kill()
+            return CONTROL_STATUS[action]
+        if not alive:
+            continue  # exited during the sleep; loop back to reap returncode
+        if h["state"] in ("hung", "crashed"):
+            print(f"[ablator] {job['id']} unhealthy ({h['state']}, "
+                  f"log_age={h.get('log_age_s')}s) — killing", flush=True)
+            kill()
+            return "failed"
+
+
+def run_job(cfg: dict, job: dict, machine: str, q: Queue | None = None) -> str:
+    """Execute one job; returns its status. Logs to <log_dir>/<id>.log.
+
+    While the subprocess runs, a supervision loop mirrors artifact-derived
+    health into the queue record, honors control files, and kills
+    hung/crashed jobs.
+    """
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
     try:
         tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
@@ -121,9 +221,13 @@ def run_job(cfg: dict, job: dict, machine: str) -> str:
             lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']}\n"
                      f"# cwd={cwd or os.getcwd()}\n# {shlex.join(argv)}\n")
             lf.flush()
-            rc = subprocess.run(argv, env=env, cwd=cwd,
-                                stdout=lf, stderr=subprocess.STDOUT).returncode
-        return "done" if rc == 0 else "failed"
+            proc = subprocess.Popen(argv, env=env, cwd=cwd,
+                                    stdout=lf, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+            override = supervise(cfg, job, proc, cwd or os.getcwd(), q)
+        if override is not None:
+            return override
+        return "done" if proc.returncode == 0 else "failed"
     except Exception as e:
         print(f"[ablator] {job['id']} crashed: {e}", flush=True)
         return "failed"
@@ -145,16 +249,24 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 return
             time.sleep(IDLE_POLL_S)
             continue
-        status = run_job(cfg, job, machine)
+        status = run_job(cfg, job, machine, q)
         # one retry on failure, then quarantine
         if status == "failed" and not job.get("retried"):
             q.update(job["id"], retried=True)
             print(f"[ablator] retrying {job['id']} once", flush=True)
             job["retried"] = True
-            status = run_job(cfg, job, machine)
+            status = run_job(cfg, job, machine, q)
             if status == "failed":
                 status = "quarantined"
-        q.finish(job["id"], status)
+        if status == "requeue":
+            # manual requeue: back to pending, clear claim/health so any
+            # runner (including this one) can retake it fresh
+            q.update(job["id"], status="pending", health=None,
+                     claimed_by=None, claimed_at=None)
+        else:
+            if status == "failed_no_retry":  # manual stop: never retried
+                status = "failed"
+            q.finish(job["id"], status)
         print(f"[ablator] {job['id']} -> {status}", flush=True)
         if once:
             return
