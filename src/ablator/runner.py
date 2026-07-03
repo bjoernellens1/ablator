@@ -155,12 +155,14 @@ def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
               health_fn=None,
               kill=None,
               record=None,
-              control=None) -> str | None:
+              control=None,
+              preempt=None) -> str | None:
     """Watch a running job until its process exits or intervention is needed.
 
     Returns None when the process exited on its own (caller reads
     returncode), or an override status: 'failed_no_retry' (manual stop),
-    'cancelled' (manual skip), 'requeue' (manual requeue), 'failed'
+    'cancelled' (manual skip), 'requeue' (manual requeue), 'preempted'
+    (lane-1 job yielding to a pending lane-3 job), 'failed'
     (hung/crashed — normal retry->quarantine path applies).
 
     Health comes ONLY from the run's own artifacts (health module); the run
@@ -178,6 +180,8 @@ def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
     kill = kill or (lambda: kill_job(proc, job))
     record = record or (lambda h: q and q.update(job["id"], health=h))
     control = control or (lambda: read_control(cfg, job["id"]))
+    preempt = preempt or (lambda: q.preemption_due(job, cfgmod.machine_name(cfg))
+                          if q is not None else False)
     while True:
         if proc.poll() is not None:
             record(health_fn(None))  # final snapshot; exit code judges result
@@ -191,6 +195,11 @@ def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
             print(f"[ablator] control '{action}' for {job['id']}", flush=True)
             kill()
             return CONTROL_STATUS[action]
+        if preempt():
+            print(f"[ablator] preempting lane-1 job {job['id']} for a pending "
+                  f"lane-3 job", flush=True)
+            kill()
+            return "preempted"
         if not alive:
             continue  # exited during the sleep; loop back to reap returncode
         if h["state"] in ("hung", "crashed"):
@@ -258,7 +267,14 @@ def run_loop(cfg: dict, once: bool = False) -> None:
             status = run_job(cfg, job, machine, q)
             if status == "failed":
                 status = "quarantined"
-        if status == "requeue":
+        if status == "preempted":
+            # lane-1 job yielded to a lane-3 job: back to pending with the
+            # anti-thrash bookkeeping; the loop claims the lane-3 job next
+            q.update(job["id"], status="pending", health=None,
+                     claimed_by=None, claimed_at=None,
+                     preempt_count=int(job.get("preempt_count", 0)) + 1,
+                     last_preempt_at=time.time())
+        elif status == "requeue":
             # manual requeue: back to pending, clear claim/health so any
             # runner (including this one) can retake it fresh
             q.update(job["id"], status="pending", health=None,

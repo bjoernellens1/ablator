@@ -23,6 +23,28 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+# --- priority lanes ---------------------------------------------------------
+# lane 3 "urgent"     -> claimed first (failed-run redos, fast-answer runs)
+# lane 2 "standard"   -> default; validation + direction-finding ablations
+# lane 1 "background" -> fine-tuning around known-good configs; keeps the
+#                        machine busy when nothing else is queued
+# A job with no "lane" field is lane 2 (backward compatible). Within a lane,
+# file order + depends_on/capability semantics are unchanged. A pending
+# lane-3 job preempts a RUNNING lane-1 job on this machine; lane-2 jobs are
+# never preempted. Guard: each lane-1 job is preempted at most once per
+# PREEMPT_COOLDOWN_S (tracked via preempt_count / last_preempt_at).
+LANES = (3, 2, 1)
+PREEMPT_COOLDOWN_S = 30 * 60
+
+
+def job_lane(job: dict) -> int:
+    try:
+        lane = int(job.get("lane", 2))
+    except (TypeError, ValueError):
+        return 2
+    return lane if lane in (1, 2, 3) else 2
+
+
 class Queue:
     def __init__(self, path: str):
         self.path = path
@@ -78,22 +100,58 @@ class Queue:
         with self._open_locked() as f:
             jobs = self._load(f)
             by_id = {j.get("id"): j for j in jobs}
-            for j in jobs:
-                if j.get("status") != "pending":
-                    continue
-                if j.get("machine", "any") not in (machine, "any"):
-                    continue
-                dep = j.get("depends_on")
-                if dep and by_id.get(dep, {}).get("status") != "done":
-                    continue
-                if can_run is not None and not can_run(j):
-                    continue
-                j["status"] = "running"
-                j["claimed_by"] = machine
-                j["claimed_at"] = _now()
-                self._save(f, jobs)
-                return j
+            for lane in LANES:  # urgent (3) first, then standard (2), background (1)
+                for j in jobs:
+                    if job_lane(j) != lane:
+                        continue
+                    if j.get("status") != "pending":
+                        continue
+                    if j.get("machine", "any") not in (machine, "any"):
+                        continue
+                    dep = j.get("depends_on")
+                    if dep and by_id.get(dep, {}).get("status") != "done":
+                        continue
+                    if can_run is not None and not can_run(j):
+                        continue
+                    j["status"] = "running"
+                    j["claimed_by"] = machine
+                    j["claimed_at"] = _now()
+                    self._save(f, jobs)
+                    return j
         return None
+
+    def urgent_pending(self, machine: str) -> bool:
+        """True if a lane-3 job is pending and claimable by this machine."""
+        jobs = self.read()
+        by_id = {j.get("id"): j for j in jobs}
+        for j in jobs:
+            if j.get("status") != "pending" or job_lane(j) != 3:
+                continue
+            if j.get("machine", "any") not in (machine, "any"):
+                continue
+            dep = j.get("depends_on")
+            if dep and by_id.get(dep, {}).get("status") != "done":
+                continue
+            return True
+        return False
+
+    def preemption_due(self, job: dict, machine: str,
+                       now: float | None = None) -> bool:
+        """Should the currently running `job` yield to a pending lane-3 job?
+
+        Only lane-1 (background) jobs are preemptable, at most once per
+        PREEMPT_COOLDOWN_S per job (anti-thrash guard via last_preempt_at).
+        """
+        if job_lane(job) != 1:
+            return False  # lane-2/3 jobs are never preempted
+        now = time.time() if now is None else now
+        last = job.get("last_preempt_at")
+        try:
+            if last is not None and now - float(last) < PREEMPT_COOLDOWN_S:
+                return False
+        except (TypeError, ValueError):
+            pass
+        return self.urgent_pending(machine)
 
     def finish(self, job_id: str, status: str, **extra) -> None:
         with self._open_locked() as f:

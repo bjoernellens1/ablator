@@ -12,7 +12,7 @@ from . import config as cfgmod
 from . import health as healthmod
 from . import progress as progmod
 from . import runner, spec as specmod
-from .queue import Queue
+from .queue import Queue, job_lane
 
 
 def _queue(cfg: dict) -> Queue:
@@ -87,12 +87,20 @@ def _health_note(j: dict) -> str:
     return f"[{h.get('state', '?')}" + (f" {int(age)}s]" if age is not None else "]")
 
 
+_STATE_RANK = {"running": 0, "pending": 1}
+
+
+def _display_sort(jobs: list[dict]) -> list[dict]:
+    """Lane desc (urgent first), then state (running, pending, rest); stable."""
+    return sorted(jobs, key=lambda j: (-job_lane(j), _STATE_RANK.get(j.get("status"), 2)))
+
+
 def _status_lines(cfg: dict, jobs: list[dict]) -> list[str]:
-    lines = [f"{'id':<40} {'status':<12} {'machine':<8} {'claimed_by':<10} "
+    lines = [f"{'id':<40} {'lane':<4} {'status':<12} {'machine':<8} {'claimed_by':<10} "
              f"{'elapsed':<8} {'depends_on':<12} progress"]
-    for j in jobs:
+    for j in _display_sort(jobs):
         prog = " ".join(x for x in (_progress(cfg, j), _health_note(j)) if x)
-        lines.append(f"{j.get('id',''):<40} {j.get('status',''):<12} "
+        lines.append(f"{j.get('id',''):<40} {job_lane(j):<4} {j.get('status',''):<12} "
                      f"{j.get('machine',''):<8} {j.get('claimed_by','-'):<10} "
                      f"{_elapsed(j):<8} {j.get('depends_on','-'):<12} "
                      f"{prog}")
@@ -104,12 +112,27 @@ def _status_lines(cfg: dict, jobs: list[dict]) -> list[str]:
     return lines
 
 
+def _lane1_restock_warning(all_jobs: list[dict]) -> str | None:
+    """Cheap restock hint: WARN when the background lane is running dry."""
+    n = sum(1 for j in all_jobs
+            if job_lane(j) == 1 and j.get("status") == "pending")
+    if n < 2:
+        return (f"WARNING: background lane running dry — {n} pending lane-1 "
+                f"job(s); queue more fine-tuning ablations so idle time "
+                f"is never wasted")
+    return None
+
+
 def cmd_status(cfg: dict, name: str | None) -> None:
-    jobs = _match(_queue(cfg).read(), name)
+    all_jobs = _queue(cfg).read()
+    jobs = _match(all_jobs, name)
     if not jobs:
         print("no matching jobs in queue")
         return
     print("\n".join(_status_lines(cfg, jobs)))
+    warn = _lane1_restock_warning(all_jobs)
+    if warn:
+        print(warn)
 
 
 def cmd_watch(cfg: dict, name: str | None, interval: int = 60) -> None:
@@ -117,10 +140,14 @@ def cmd_watch(cfg: dict, name: str | None, interval: int = 60) -> None:
     status_path = os.path.join(
         os.path.dirname(cfgmod.queue_path(cfg)), "queue_status.txt")
     while True:
-        jobs = _match(_queue(cfg).read(), name)
+        all_jobs = _queue(cfg).read()
+        jobs = _match(all_jobs, name)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
         lines = [f"# queue status @ {stamp}"]
         lines += _status_lines(cfg, jobs) if jobs else ["no matching jobs in queue"]
+        warn = _lane1_restock_warning(all_jobs)
+        if warn:
+            lines.append(warn)
         text = "\n".join(lines) + "\n"
         try:
             tmp = status_path + ".tmp"
@@ -222,6 +249,33 @@ def cmd_control(cfg: dict, action: str, job_id: str) -> None:
           f"supervision poll (~{runner.HEALTH_POLL_S}s)")
 
 
+# ---------------------------------------------------------------- promote
+
+def cmd_promote(cfg: dict, job_id: str, lane_str: str) -> None:
+    """Move a pending job to another lane (1=background, 2=standard, 3=urgent)."""
+    try:
+        lane = int(lane_str)
+    except ValueError:
+        raise SystemExit(f"lane must be 1, 2 or 3 (got {lane_str!r})")
+    if lane not in (1, 2, 3):
+        raise SystemExit(f"lane must be 1, 2 or 3 (got {lane})")
+    q = _queue(cfg)
+    with q._open_locked() as f:
+        jobs = q._load(f)
+        for j in jobs:
+            if j.get("id") == job_id:
+                if j.get("status") != "pending":
+                    raise SystemExit(f"job '{job_id}' is {j.get('status')}, "
+                                     f"not pending — only pending jobs can "
+                                     f"change lanes")
+                old = job_lane(j)
+                j["lane"] = lane
+                q._save(f, jobs)
+                print(f"[promote] {job_id}: lane {old} -> {lane}")
+                return
+    raise SystemExit(f"no job '{job_id}' in queue")
+
+
 # ---------------------------------------------------------------- cancel
 
 def cmd_cancel(cfg: dict, name: str) -> None:
@@ -252,6 +306,9 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("name")
     sp = sub.add_parser("cancel", help="cancel pending jobs of an ablation")
     sp.add_argument("name")
+    sp = sub.add_parser("promote", help="move a pending job to another lane")
+    sp.add_argument("job_id")
+    sp.add_argument("lane")
     sp = sub.add_parser("health", help="print artifact-derived job health")
     sp.add_argument("job_id", nargs="?")
     for action, hlp in (("stop", "kill a running job (failed, no retry)"),
@@ -276,6 +333,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_collect(cfg, a.name)
     elif a.cmd == "cancel":
         cmd_cancel(cfg, a.name)
+    elif a.cmd == "promote":
+        cmd_promote(cfg, a.job_id, a.lane)
     elif a.cmd == "health":
         cmd_health(cfg, a.job_id)
     elif a.cmd in ("stop", "skip", "requeue"):

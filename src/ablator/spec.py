@@ -46,6 +46,10 @@ def expand_spec(spec: dict,
         job_id = f"{name}_{arm_id}"
         base_args = arm.get("base_args", base.get("base_args", "")).strip()
         extra = " ".join(x for x in (base_args, arm.get("extra_args", "").strip()) if x)
+        lane = arm.get("lane", spec.get("lane", base.get("lane", 2)))
+        if lane not in (1, 2, 3):
+            raise SystemExit(f"spec '{name}' arm '{arm_id}': lane must be "
+                             f"1, 2 or 3 (got {lane!r})")
         job = {
             "id": job_id,
             "ablation": name,
@@ -55,6 +59,7 @@ def expand_spec(spec: dict,
             "model_path": model_path_template.format(name=name, arm=arm_id, id=job_id),
             "extra_args": extra,
             "iterations": arm.get("iterations", base.get("iterations", 30000)),
+            "lane": lane,
             "status": "pending",
         }
         if not parallel and prev_id is not None:
