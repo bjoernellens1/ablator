@@ -365,7 +365,20 @@ def run_job(cfg: dict, job: dict, machine: str,
             override = supervise(cfg, job, proc, cwd or os.getcwd(), q)
         rc = proc.returncode
         if override is not None:
+            # Control-triggered stop/skip/requeue (or a lane preemption)
+            # already returned an explicit terminal/backoff status above in
+            # supervise() — the exit code of the killed subprocess is never
+            # consulted here, so a manual kill can never read as "done".
             return override, rc
+        if rc == 0 and _require_result_artifact(cfg, tcfg):
+            h = healthmod.job_health(job, cwd or os.getcwd(), cfg.get("queue", {}),
+                                     process_alive=False)
+            if h["state"] != "done":
+                print(f"[ablator] {job['id']} exited 0 but no completion "
+                      f"artifact found (result_glob unmatched, state="
+                      f"{h['state']!r}) — treating as failed, not done",
+                      flush=True)
+                return "failed", rc
         return ("done" if rc == 0 else "failed"), rc
     except Exception as e:
         print(f"[ablator] {job['id']} crashed: {e}", flush=True)
@@ -380,10 +393,70 @@ def _job_base_dir(cfg: dict, job: dict, machine: str) -> str:
     return tcfg.get("cwd") or os.getcwd()
 
 
+def _require_result_artifact(cfg: dict, tcfg: dict) -> bool:
+    """Per-type (falls back to [queue]) toggle: an exit code of 0 is not
+    sufficient for 'done' — a result_glob artifact must also exist.
+
+    Defaults to False for backward compat; set `require_result_artifact =
+    true` under a [types.<t>] (or its per-machine override) or under
+    [queue] to opt a job type in. This exists because a wrapper script can
+    swallow a killed subprocess's real exit code (e.g. `docker wait X ||
+    true` followed by unconditional `echo "Done."`), which would otherwise
+    let a manually-killed or crashed run masquerade as a successful one.
+    """
+    if "require_result_artifact" in tcfg:
+        return bool(tcfg["require_result_artifact"])
+    return bool(cfg.get("queue", {}).get("require_result_artifact", False))
+
+
+def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
+                            busy: bool | None = None) -> None:
+    """Self-heal 'running' jobs this machine claimed but is no longer
+    supervising (this runner process just (re)started, so any job still
+    marked running-and-claimed-by-us predates this process and has no
+    live supervise() loop watching it).
+
+    Only ever touches jobs with claimed_by == machine — a different
+    machine's claim is untouched, it self-heals on its own restart.
+
+    Never runs while the machine's busy-guards say something is still
+    actually executing (e.g. the training container is still up): we
+    cannot tell *which* job that process belongs to, and reconciling
+    while it might still be writing results would risk a second runner
+    launching a duplicate job against the same model_path. In that case
+    the entry is left stuck for now and a warning is printed; the next
+    idle poll (once the process/container is gone) reconciles it.
+    """
+    if busy is None:
+        busy = resources.machine_busy(cfg, machine)
+    if busy:
+        return
+    for job in q.read():
+        if job.get("status") != "running" or job.get("claimed_by") != machine:
+            continue
+        base_dir = _job_base_dir(cfg, job, machine)
+        h = healthmod.job_health(job, base_dir, cfg.get("queue", {}),
+                                 process_alive=False)
+        if h["state"] == "done":
+            print(f"[ablator] reconcile: {job['id']} has a completion artifact "
+                  f"but was stuck at 'running' (orphaned by a runner "
+                  f"restart/crash) — marking done", flush=True)
+            q.finish(job["id"], "done", health=h, reconciled=True,
+                    reconciled_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+        else:
+            print(f"[ablator] reconcile: {job['id']} stuck at 'running' with no "
+                  f"live process and no completion artifact (state={h['state']}) "
+                  f"— requeuing to pending", flush=True)
+            q.update(job["id"], status="pending", health=h,
+                    claimed_by=None, claimed_at=None, reconciled=True,
+                    reconciled_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+
+
 def run_loop(cfg: dict, once: bool = False) -> None:
     machine = cfgmod.machine_name(cfg)
     q = Queue(cfgmod.queue_path(cfg))
     print(f"[ablator] runner on {machine} watching {q.path}", flush=True)
+    reconcile_stale_running(cfg, machine, q)
     last_tick = time.monotonic()
     while True:
         # Watchdog: if the previous iteration (probes + sleeps, NOT a job

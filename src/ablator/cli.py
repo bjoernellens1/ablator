@@ -12,7 +12,8 @@ from . import config as cfgmod
 from . import health as healthmod
 from . import progress as progmod
 from . import runner, spec as specmod
-from .queue import (Queue, job_lane, clear_pause_flag, pause_flag_path)
+from .queue import (Queue, job_lane, clear_pause_flag, pause_flag_path,
+                    write_pause_flag)
 
 
 def _queue(cfg: dict) -> Queue:
@@ -383,6 +384,21 @@ def cmd_errors(cfg: dict, name: str | None = None) -> None:
         print(f"  evidence: {evidence}")
 
 
+def cmd_pause(cfg: dict, machine: str | None) -> None:
+    """Set a machine-level pause flag: claim_next() returns None for this
+    machine until 'ablator unpause <machine>' clears it. Jobs already
+    running are unaffected — this only blocks new claims, giving an
+    operator a reliable window to kill-then-intervene (e.g. restart the
+    runner with new code) without a reclaim race. Idempotent: overwrites
+    an existing flag."""
+    if not machine:
+        raise SystemExit("usage: ablator pause <machine>")
+    path = write_pause_flag(cfgmod.queue_path(cfg), machine, "manual_pause",
+                            "operator-issued via `ablator pause`")
+    print(f"[pause] wrote {path} — '{machine}' will not claim new jobs until "
+          f"'ablator unpause {machine}'. Currently running jobs are unaffected.")
+
+
 def cmd_unpause(cfg: dict, machine: str | None) -> None:
     if not machine:
         raise SystemExit("usage: ablator unpause <machine>")
@@ -448,6 +464,9 @@ def main(argv: list[str] | None = None) -> None:
     sp = sub.add_parser("errors", help="list failed/quarantined/paused jobs "
                         "with their classification")
     sp.add_argument("name", nargs="?")
+    sp = sub.add_parser("pause", help="set a machine-level pause flag "
+                        "(blocks new claims; running jobs unaffected)")
+    sp.add_argument("machine")
     sp = sub.add_parser("unpause", help="clear a machine-level pause flag")
     sp.add_argument("machine")
 
@@ -477,6 +496,8 @@ def main(argv: list[str] | None = None) -> None:
         runner.start_runners(cfg)
     elif a.cmd == "errors":
         cmd_errors(cfg, a.name)
+    elif a.cmd == "pause":
+        cmd_pause(cfg, a.machine)
     elif a.cmd == "unpause":
         cmd_unpause(cfg, a.machine)
 

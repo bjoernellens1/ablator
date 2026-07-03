@@ -445,3 +445,161 @@ def test_job_progress_reads_configured_log(tmp_path):
     assert out == "iter 42/100 (42%)"
     # default train.log missing -> empty
     assert progmod.job_progress(job, str(tmp_path), {}) == ""
+
+
+# ------------------------------------------------------- stale-running reconciliation
+
+def test_reconcile_marks_done_when_completion_artifact_present(tmp_path):
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_done"
+    (mp / "comparison" / "iter_1000").mkdir(parents=True)
+    (mp / "comparison" / "iter_1000" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main"}])
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert job["reconciled"] is True
+
+
+def test_reconcile_requeues_when_no_artifact_and_no_process(tmp_path):
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_orphaned"
+    mp.mkdir()
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main"}])
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "pending"
+    assert job["claimed_by"] is None
+    assert job["reconciled"] is True
+
+
+def test_reconcile_skips_while_machine_busy(tmp_path):
+    """A still-running process could belong to the stuck job; never touch
+    it (and risk a duplicate launch) while busy-guards say something is
+    still actually executing."""
+    cfg = make_cfg(tmp_path)
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": "nope",
+                          "status": "running", "claimed_by": "main"}])
+    runner.reconcile_stale_running(cfg, "main", q, busy=True)
+    assert read_queue(q.path)[0]["status"] == "running"
+
+
+def test_reconcile_ignores_other_machines_claims(tmp_path):
+    cfg = make_cfg(tmp_path)
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": "nope",
+                          "status": "running", "claimed_by": "r9700"}])
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    assert read_queue(q.path)[0]["status"] == "running"
+    assert read_queue(q.path)[0].get("claimed_by") == "r9700"
+
+
+# ------------------------------------------------------ hard completion validity
+
+def test_exit_zero_without_artifact_is_failed_when_required(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    mp = tmp_path / "run_no_report"
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["true"],
+                              "require_result_artifact": True}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "machine": "any", "type": "replay",
+                          "scene": "/s", "model_path": str(mp),
+                          "status": "pending"}])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    runner.run_loop(cfg, once=True)
+    assert read_queue(q.path)[0]["status"] == "quarantined"  # failed -> retry -> quarantine
+
+
+def test_exit_zero_with_artifact_is_done_when_required(tmp_path, monkeypatch):
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    mp = tmp_path / "run_with_report"
+    (mp / "comparison" / "iter_1000").mkdir(parents=True)
+    (mp / "comparison" / "iter_1000" / "report.json").write_text("{}")
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["true"],
+                              "require_result_artifact": True}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "machine": "any", "type": "replay",
+                          "scene": "/s", "model_path": str(mp),
+                          "status": "pending"}])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    runner.run_loop(cfg, once=True)
+    assert read_queue(q.path)[0]["status"] == "done"
+
+
+def test_require_result_artifact_off_by_default(tmp_path, monkeypatch):
+    """Backward compat: unset -> exit code 0 alone is still 'done'."""
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    mp = tmp_path / "run_no_report2"
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["true"]}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "machine": "any", "type": "replay",
+                          "scene": "/s", "model_path": str(mp),
+                          "status": "pending"}])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    runner.run_loop(cfg, once=True)
+    assert read_queue(q.path)[0]["status"] == "done"
+
+
+def test_control_requeue_never_yields_done_regardless_of_exit_code(tmp_path):
+    """A manual control action (stop/skip/requeue), even against a process
+    that goes on to exit 0, must never be reported as 'done' — supervise()
+    returns the CONTROL_STATUS override, and run_job() returns that
+    override directly without ever consulting the exit code."""
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["sleep", "0.2"]}
+    job = {"id": "j1", "type": "replay", "model_path": "m", "status": "running"}
+
+    # Exercise run_job with a stubbed supervise() that simulates a control
+    # action firing while the underlying process goes on to exit 0.
+    import subprocess as sp
+    real_popen = sp.Popen
+
+    def fake_popen(argv, **kw):
+        return real_popen(["sleep", "0.05"], **kw)
+
+    for action, expected in runner.CONTROL_STATUS.items():
+        sp.Popen = fake_popen
+        orig_supervise = runner.supervise
+        runner.supervise = lambda *a, **k: expected
+        try:
+            status, rc = runner.run_job(cfg, job, "main", q=None)
+        finally:
+            runner.supervise = orig_supervise
+            sp.Popen = real_popen
+        assert status == expected
+        assert status != "done"
+
+
+# --------------------------------------------------------------- pause/unpause CLI
+
+def test_pause_cli_roundtrips_with_unpause(tmp_path, capsys):
+    cfg = make_cfg(tmp_path)
+    from ablator.queue import is_paused
+    assert not is_paused(cfg["queue"]["path"], "main")
+    cli.cmd_pause(cfg, "main")
+    assert is_paused(cfg["queue"]["path"], "main")
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "machine": "any", "type": "replay",
+                          "status": "pending"}])
+    assert q.claim_next("main") is None  # paused -> no new claims
+    cli.cmd_unpause(cfg, "main")
+    assert not is_paused(cfg["queue"]["path"], "main")
+    assert q.claim_next("main")["id"] == "j1"  # claims resume
+
+
+def test_pause_cli_requires_machine_arg(tmp_path):
+    cfg = make_cfg(tmp_path)
+    with pytest.raises(SystemExit):
+        cli.cmd_pause(cfg, None)
