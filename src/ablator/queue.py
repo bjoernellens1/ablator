@@ -18,9 +18,52 @@ import os
 import time
 from typing import Callable
 
+DEFAULT_FLOCK_TIMEOUT_S = 60.0
+
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def pause_flag_path(queue_path: str, machine: str) -> str:
+    return os.path.join(os.path.dirname(queue_path), f"paused_{machine}.txt")
+
+
+def is_paused(queue_path: str, machine: str) -> bool:
+    return os.path.exists(pause_flag_path(queue_path, machine))
+
+
+def write_pause_flag(queue_path: str, machine: str, category: str, evidence: str) -> str:
+    path = pause_flag_path(queue_path, machine)
+    try:
+        with open(path, "w") as f:
+            f.write(f"category={category}\n"
+                     f"timestamp={_now()}\n"
+                     f"evidence={evidence}\n")
+    except OSError as e:
+        print(f"[ablator] could not write pause flag {path}: {e}", flush=True)
+    return path
+
+
+def clear_pause_flag(queue_path: str, machine: str) -> bool:
+    path = pause_flag_path(queue_path, machine)
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+def not_before_ok(job: dict, now: float | None = None) -> bool:
+    """True if job has no future not_before (i.e. is claimable right now)."""
+    nb = job.get("not_before")
+    if nb is None:
+        return True
+    now = time.time() if now is None else now
+    try:
+        return float(nb) <= now
+    except (TypeError, ValueError):
+        return True
 
 
 # --- priority lanes ---------------------------------------------------------
@@ -63,12 +106,30 @@ class Queue:
             f.write(json.dumps(j) + "\n")
         f.flush()
 
-    def _open_locked(self):
+    def _open_locked(self, timeout_s: float | None = None):
+        """Open the queue file and acquire LOCK_EX with a deadline.
+
+        The queue lives on NFS; a lost lock owner or a peer hung while
+        holding the lock must not freeze this runner permanently. Raises
+        TimeoutError instead of blocking forever.
+        """
+        if timeout_s is None:
+            timeout_s = float(os.environ.get("ABLATOR_FLOCK_TIMEOUT_S",
+                                             DEFAULT_FLOCK_TIMEOUT_S))
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         open(self.path, "a").close()
         f = open(self.path, "r+")
-        fcntl.flock(f, fcntl.LOCK_EX)
-        return f
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return f
+            except (BlockingIOError, PermissionError):
+                if time.monotonic() >= deadline:
+                    f.close()
+                    raise TimeoutError(
+                        f"queue flock not acquired within {timeout_s:.0f}s")
+                time.sleep(0.5)
 
     # -- public API ------------------------------------------------------
     def read(self) -> list[dict]:
@@ -96,8 +157,19 @@ class Queue:
         can_run(job) is an optional capability predicate (e.g. required
         container images present); evaluated at most once per job type
         per scan by the caller if desired — here it is called per job.
+
+        A machine-level pause flag (see pause_flag_path) blocks new claims
+        without disturbing already-running jobs. A queue-flock timeout
+        (contended/hung NFS lock) returns None rather than blocking
+        forever — the caller retries on its next poll.
         """
-        with self._open_locked() as f:
+        if is_paused(self.path, machine):
+            return None
+        try:
+            f = self._open_locked()
+        except TimeoutError:
+            return None
+        with f:
             jobs = self._load(f)
             by_id = {j.get("id"): j for j in jobs}
             for lane in LANES:  # urgent (3) first, then standard (2), background (1)
@@ -108,6 +180,8 @@ class Queue:
                         continue
                     if j.get("machine", "any") not in (machine, "any"):
                         continue
+                    if not not_before_ok(j):
+                        continue  # backoff window (e.g. gpu_busy/network_transient requeue)
                     dep = j.get("depends_on")
                     if dep and by_id.get(dep, {}).get("status") != "done":
                         continue
@@ -154,22 +228,33 @@ class Queue:
         return self.urgent_pending(machine)
 
     def finish(self, job_id: str, status: str, **extra) -> None:
-        with self._open_locked() as f:
-            jobs = self._load(f)
-            for j in jobs:
-                if j.get("id") == job_id:
-                    j["status"] = status
-                    j["finished_at"] = _now()
-                    j.update(extra)
-            self._save(f, jobs)
+        for attempt in range(5):
+            try:
+                with self._open_locked() as f:
+                    jobs = self._load(f)
+                    for j in jobs:
+                        if j.get("id") == job_id:
+                            j["status"] = status
+                            j["finished_at"] = _now()
+                            j.update(extra)
+                    self._save(f, jobs)
+                return
+            except TimeoutError as e:
+                print(f"[ablator] finish({job_id}) attempt {attempt + 1}: {e}",
+                      flush=True)
+        print(f"[ablator] ERROR: could not record {job_id} -> {status}; "
+              f"job stays 'running' in the queue file", flush=True)
 
     def update(self, job_id: str, **fields) -> None:
-        with self._open_locked() as f:
-            jobs = self._load(f)
-            for j in jobs:
-                if j.get("id") == job_id:
-                    j.update(fields)
-            self._save(f, jobs)
+        try:
+            with self._open_locked() as f:
+                jobs = self._load(f)
+                for j in jobs:
+                    if j.get("id") == job_id:
+                        j.update(fields)
+                self._save(f, jobs)
+        except TimeoutError as e:
+            print(f"[ablator] update({job_id}) skipped: {e}", flush=True)
 
     def cancel(self, predicate: Callable[[dict], bool]) -> int:
         """Mark matching pending jobs cancelled; returns count."""

@@ -48,7 +48,7 @@ def load_config(path: str | None = None) -> dict:
 
 
 def queue_path(cfg: dict) -> str:
-    return cfg["queue"]["path"]
+    return os.environ.get("ABLATOR_QUEUE_FILE") or cfg["queue"]["path"]
 
 
 def log_dir(cfg: dict) -> str:
