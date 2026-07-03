@@ -38,6 +38,7 @@ def cmd_plan(cfg: dict, spec_path: str, dry_run: bool = False) -> None:
         dep = f"  (after {j['depends_on']})" if j.get("depends_on") else ""
         print(f"  {j['id']:<40} machine={j['machine']:<6} type={j['type']:<8} "
               f"-> {j['model_path']}{dep}")
+        print(f"  {'':<40} scene={j['scene']}")
 
 
 # ---------------------------------------------------------------- status

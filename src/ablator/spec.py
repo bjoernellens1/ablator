@@ -35,12 +35,16 @@ def expand_spec(spec: dict,
     name = spec["name"]
     base = spec.get("base", {})
     parallel = spec.get("parallel", True)
-    base_args = base.get("base_args", "").strip()
     jobs: list[dict] = []
     prev_id: str | None = None
+    seen_ids: set[str] = set()
     for arm in spec["arms"]:
         arm_id = arm["id"]
+        if arm_id in seen_ids:
+            raise SystemExit(f"spec '{name}': duplicate arm id '{arm_id}'")
+        seen_ids.add(arm_id)
         job_id = f"{name}_{arm_id}"
+        base_args = arm.get("base_args", base.get("base_args", "")).strip()
         extra = " ".join(x for x in (base_args, arm.get("extra_args", "").strip()) if x)
         job = {
             "id": job_id,

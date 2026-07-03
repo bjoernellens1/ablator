@@ -110,6 +110,24 @@ def test_arm_overrides_machine_type_iterations():
     assert jobs[1]["type"] == "replay"
 
 
+def test_arm_scene_and_base_args_override():
+    spec = make_spec(arms=[
+        {"id": "x", "scene": "/data/kitchen1", "base_args": "--other 2",
+         "extra_args": "--foo bar"},
+        {"id": "y"},
+    ])
+    jobs = specmod.expand_spec(spec)
+    assert jobs[0]["scene"] == "/data/kitchen1"
+    assert jobs[0]["extra_args"] == "--other 2 --foo bar"  # base_args replaced
+    assert jobs[1]["scene"] == spec["base"]["scene"]
+
+
+def test_expand_refuses_duplicate_arm_ids():
+    spec = make_spec(arms=[{"id": "x"}, {"id": "x"}])
+    with pytest.raises(SystemExit, match="duplicate arm id"):
+        specmod.expand_spec(spec)
+
+
 def test_model_path_template_configurable():
     jobs = specmod.expand_spec(make_spec(), model_path_template="/out/{name}/{arm}")
     assert jobs[0]["model_path"] == "/out/abl/ctrl"
