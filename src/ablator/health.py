@@ -83,6 +83,24 @@ def job_health(job: dict, base_dir: str, qcfg: dict | None = None,
     log = os.path.join(mp, qcfg.get("progress_log", progmod.DEFAULT_LOG))
     markers = qcfg.get("crash_markers", DEFAULT_CRASH_MARKERS)
     result_glob = qcfg.get("result_glob", DEFAULT_RESULT_GLOB)
+    # cli.py's `collect` documents (and configs in the wild use)
+    # "{model_path}/comparison/*/report.json" — a template resolved via
+    # str.format() against job vars, relative to the type's cwd. This
+    # function's own docstring/DEFAULT_RESULT_GLOB documents the OTHER
+    # convention: a bare pattern relative to `mp` (already resolved
+    # above), no placeholder. The same config value must satisfy both
+    # call sites, so normalize the {model_path}-prefixed form down to
+    # the bare form here — this function never templates other
+    # placeholders (scene/extra_args/...), only this one specific,
+    # already-resolved prefix. Confirmed live: without this, every job
+    # using the documented {model_path}/... convention was 100% falsely
+    # classified as incomplete (glob'd for a literal, never-existing
+    # "{model_path}" subdirectory), triggering pointless full retries.
+    if result_glob:
+        for prefix in ("{model_path}/", "{model_path}"):
+            if result_glob.startswith(prefix):
+                result_glob = result_glob[len(prefix):]
+                break
 
     h: dict = {"state": "starting", "iter": None, "total": None, "log_age_s": None}
 

@@ -75,6 +75,23 @@ def test_reporting_and_done(tmp_path):
     assert health.job_health(job, str(tmp_path))["state"] == "done"
 
 
+def test_done_with_model_path_prefixed_result_glob(tmp_path):
+    """cli.py's `collect` documents/uses "{model_path}/comparison/*/report.json"
+    (str.format()-templated against job vars). job_health() never templates —
+    it joins result_glob directly onto the already-resolved model_path — so
+    without normalizing this specific prefix, a real completed job with the
+    documented config convention was ALWAYS misread as incomplete (glob'd for
+    a literal "{model_path}" subdirectory that can never exist), causing
+    require_result_artifact to falsely fail every job and trigger a wasted
+    full retry. Confirmed live in production before this fix."""
+    job = make_run(tmp_path, "Training: 30000/30000", report=True)
+    qcfg = {"result_glob": "{model_path}/comparison/*/report.json"}
+    assert health.job_health(job, str(tmp_path), qcfg)["state"] == "done"
+    # bare form (this module's own documented/default convention) still works
+    qcfg = {"result_glob": "comparison/*/report.json"}
+    assert health.job_health(job, str(tmp_path), qcfg)["state"] == "done"
+
+
 def test_online_sentinel_uses_cap(tmp_path):
     job = make_run(tmp_path, f"Training: 500/{2**31 - 1}")
     job["extra_args"] = "--streaming_max_iterations 6000"
