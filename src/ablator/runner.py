@@ -24,8 +24,8 @@ from . import config as cfgmod
 from . import resources
 from .queue import Queue
 
-IDLE_POLL_S = 180
-BUSY_POLL_S = 120
+IDLE_POLL_S = 30
+BUSY_POLL_S = 30
 
 
 class TemplateError(SystemExit):
