@@ -204,7 +204,7 @@ def test_requeue_status_resets_job(cfg, monkeypatch):
     cfg["machines"] = {"m": {}}
     monkeypatch.setattr(runner.cfgmod, "machine_name", lambda c: "m")
     monkeypatch.setattr(runner.resources, "machine_busy", lambda c, m: False)
-    monkeypatch.setattr(runner, "run_job", lambda c, j, m, q=None: "requeue")
+    monkeypatch.setattr(runner, "run_job", lambda c, j, m, q=None: ("requeue", None))
     runner.run_loop(cfg, once=True)
     j = q.read()[0]
     assert j["status"] == "pending"
