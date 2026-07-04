@@ -316,6 +316,39 @@ def test_render_unknown_variable_fails(tmp_path):
         runner.render_command(tcfg, JOB, "main")
 
 
+def test_tum_sequence_inferred_from_host_scene_path(tmp_path):
+    """Command templates mount `scene` at a generic in-container path, which
+    defeats scene/readers/tum.py's basename inference of Freiburg intrinsics
+    inside the container. render_command must inject --tum_sequence from the
+    HOST scene path (still available pre-mount) so this can't silently train
+    against wrong (Freiburg1-fallback) intrinsics. Confirmed live: this cost
+    fr3par_hybrid_ctrl/gate ~6-8dB, compounding over training."""
+    cfg = make_cfg(tmp_path)
+    tcfg = cfgmod.type_cfg(cfg, "replay", "main")
+    job = {**JOB, "scene": "/data/rgbd_dataset_freiburg3_long_office_household",
+           "extra_args": "--opacity_reg 0.001"}
+    argv, _, _ = runner.render_command(tcfg, job, "main")
+    assert argv[-2:] == ["--tum_sequence", "freiburg3"]
+
+
+def test_tum_sequence_not_overridden_if_already_set(tmp_path):
+    cfg = make_cfg(tmp_path)
+    tcfg = cfgmod.type_cfg(cfg, "replay", "main")
+    job = {**JOB, "scene": "/data/rgbd_dataset_freiburg3_long_office_household",
+           "extra_args": "--tum_sequence freiburg1"}
+    argv, _, _ = runner.render_command(tcfg, job, "main")
+    assert argv[-2:] == ["--tum_sequence", "freiburg1"]
+
+
+def test_tum_sequence_short_form_does_not_false_trigger():
+    """A generic scene path basename like "fr3" (used as a test fixture
+    elsewhere in this suite, not an actual TUM path) must not be mistaken
+    for a Freiburg3 sequence — only the unambiguous "freiburgN" substring
+    counts."""
+    from ablator.runner import _infer_tum_sequence
+    assert _infer_tum_sequence("/data/fr3", "--foo bar") == "--foo bar"
+
+
 # ---------------------------------------------------------------- capability
 
 def test_type_capable_probes_images(tmp_path, monkeypatch):

@@ -42,11 +42,39 @@ class TemplateError(SystemExit):
     pass
 
 
+def _infer_tum_sequence(scene: str, extra_args: str) -> str:
+    """Append --tum_sequence freiburgN when the job's HOST scene path names a
+    TUM Freiburg sequence and extra_args doesn't already set it.
+
+    Command templates mount `scene` at a generic in-container path (e.g.
+    /data/scene), which defeats scene/readers/tum.py's path-basename
+    inference of Freiburg1/2/3 intrinsics inside the container — it only
+    ever sees the generic basename, never matches, and SILENTLY falls back
+    to wrong Freiburg1 intrinsics for the whole run (no crash, just a
+    warning line in train.log). Confirmed live: fr3par_hybrid_ctrl/gate
+    both trained and evaluated an entire freiburg3 run against Freiburg1
+    intrinsics this way, a ~6-8dB PSNR cost that compounded over training.
+    `scene` is still the HOST path here (pre-mount), so recover the real
+    sequence from it before rendering the command.
+    """
+    if "--tum_sequence" in (extra_args or ""):
+        return extra_args
+    name = os.path.basename(os.path.normpath(scene or "")).lower()
+    for seq in ("freiburg1", "freiburg2", "freiburg3"):
+        # Only the unambiguous "freiburgN" substring — a short "frN" form
+        # false-triggers on unrelated scene names (e.g. a generic test
+        # fixture path like "/data/fr3" is not a TUM scene at all).
+        if seq in name:
+            return f"{extra_args} --tum_sequence {seq}".strip()
+    return extra_args
+
+
 def _job_vars(job: dict, machine: str) -> dict:
+    scene = job.get("scene", "")
     return {
-        "scene": job.get("scene", ""),
+        "scene": scene,
         "model_path": job.get("model_path", ""),
-        "extra_args": job.get("extra_args", ""),
+        "extra_args": _infer_tum_sequence(scene, job.get("extra_args", "")),
         "iterations": str(job.get("iterations", "")),
         "id": job.get("id", ""),
         "machine": machine,
