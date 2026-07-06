@@ -584,7 +584,11 @@ def start_runners(cfg: dict) -> None:
         print(f"[start] runner already running on {me} — skipping local start")
     else:
         log = os.path.join(ldir, f"runner_{me}.log")
-        cmd = (f"setsid nohup ablator run --config {shlex.quote(cfg['_path'])} "
+        # --config is a top-level flag (`ablator --config X run`), not a
+        # subcommand argument (`ablator run --config X` fails argparse
+        # with "unrecognized arguments") -- found live 2026-07-06 when
+        # this exact ordering crashed instantly on relaunch.
+        cmd = (f"setsid nohup ablator --config {shlex.quote(cfg['_path'])} run "
                f"</dev/null > {shlex.quote(log)} 2>&1 &")
         subprocess.run(["bash", "-c", cmd], check=True)
         print(f"[start] launched runner on {me} (log {log})")
@@ -594,13 +598,25 @@ def start_runners(cfg: dict) -> None:
             continue
         runner_cmd = m.get("runner_command", "ablator run")
         log = os.path.join(ldir, f"runner_{name}.log")
-        remote = (f"if pgrep -f '[a]blator run' >/dev/null; then "
-                  f"echo '[start] runner already running on {name}'; else "
-                  f"mkdir -p {shlex.quote(ldir)} && "
-                  f"setsid nohup {runner_cmd} </dev/null > {shlex.quote(log)} 2>&1 & "
-                  f"echo '[start] launched runner on {name}'; fi")
+        # Two separate ssh calls, not one conditional one-liner: if the
+        # check and the launch command are sent as a single script, the
+        # *checking* shell process's own argv contains the launch
+        # command's literal text (e.g. "ablator run" in the else branch)
+        # even when that branch never executes — `pgrep -f` then matches
+        # the checking process itself and always reports "already
+        # running" on the first real attempt. Keeping the check's argv
+        # free of the launch text avoids this self-match.
+        check = subprocess.run(["ssh", m["ssh"], "pgrep -f '[a]blator run'"],
+                               capture_output=True, text=True)
+        if check.stdout.strip():
+            print(f"[start] runner already running on {name}")
+            continue
+        remote = (f"mkdir -p {shlex.quote(ldir)} && "
+                  f"setsid nohup {runner_cmd} </dev/null > {shlex.quote(log)} 2>&1 &")
         r = subprocess.run(["ssh", m["ssh"], remote])
-        if r.returncode != 0:
+        if r.returncode == 0:
+            print(f"[start] launched runner on {name}")
+        else:
             print(f"[start] WARNING: could not reach {m['ssh']} — "
                   f"runner on {name} not started")
     print(f"[start] done. Watch: tail -f {ldir}/runner_*.log")
