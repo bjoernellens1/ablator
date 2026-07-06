@@ -15,7 +15,9 @@ queue bookkeeping and process launch.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -365,6 +367,178 @@ def handle_failure(cfg: dict, job: dict, exit_code: int | None, machine: str,
     return "retry"
 
 
+def _k8s_job_name(job_id: str) -> str:
+    """Kubernetes object names must be lowercase RFC-1123 (alnum + '-')."""
+    name = re.sub(r"[^a-z0-9-]", "-", job_id.lower()).strip("-")
+    return f"ablator-{name}"[:63].rstrip("-")
+
+
+def _kubectl(args: list[str], input_text: str | None = None,
+             timeout: float | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(["kubectl", *args], input=input_text, text=True,
+                          capture_output=True, timeout=timeout)
+
+
+def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
+                          cwd: str | None) -> dict:
+    """Build the Job manifest dict for one job on a k8s-backend machine.
+
+    Mounts: `pvc_persistent` (read-only, subPath'd to the job's real dataset
+    directory so the in-container "/data/scene" path used by the rendered
+    command template resolves correctly) and `pvc_scratch` (read-write, at
+    the SAME absolute path bare-metal machines use, /mnt/cps_scratch1_tmp --
+    so the command's own `ln -sfn .../output output/scratch` step, and
+    ablator's own status/collect reading the shared queue.jsonl under that
+    same tree, both work identically to a bare-metal job).
+    """
+    name = _k8s_job_name(job["id"])
+    scene = job.get("scene", "")
+    persistent_root = "/mnt/cps_persistent1_shared"
+    sub_path = scene[len(persistent_root):].lstrip("/") if scene.startswith(persistent_root) else ""
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "Job",
+        "metadata": {
+            "name": name,
+            "namespace": mcfg["namespace"],
+            "labels": {"kai.scheduler/queue": mcfg["kai_queue"], "app": "ablator-job"},
+        },
+        "spec": {
+            "backoffLimit": 0,
+            "ttlSecondsAfterFinished": 86400,
+            # Hard safety net independent of ablator's own control-file polling
+            # loop -- covers the coordinator process itself dying/being killed
+            # mid-job, which would otherwise leave an orphaned Job running
+            # forever on the cluster. 24h is generous for a single replay run
+            # (image pulls included) but still bounds worst-case orphan cost.
+            "activeDeadlineSeconds": mcfg.get("active_deadline_s", 86400),
+            "template": {
+                "metadata": {"labels": {"kai.scheduler/queue": mcfg["kai_queue"],
+                                        "app": "ablator-job"}},
+                "spec": {
+                    "schedulerName": "kai-scheduler",
+                    "priorityClassName": mcfg["priority_class"],
+                    "restartPolicy": "Never",
+                    "imagePullSecrets": [{"name": mcfg["image_pull_secret"]}],
+                    "containers": [{
+                        "name": "trainer",
+                        "image": mcfg["image"],
+                        "workingDir": cwd or "/workspace/splatograph",
+                        "command": argv,
+                        "resources": {
+                            "requests": {"cpu": "4", "memory": "16Gi"},
+                            "limits": {"cpu": "8", "memory": "32Gi",
+                                      "nvidia.com/gpu": str(mcfg.get("gpu_count", 1))},
+                        },
+                        "volumeMounts": [
+                            {"name": "dataset", "mountPath": "/data/scene",
+                             "subPath": sub_path, "readOnly": True},
+                            {"name": "scratch", "mountPath": "/mnt/cps_scratch1_tmp"},
+                        ],
+                    }],
+                    "volumes": [
+                        {"name": "dataset",
+                         "persistentVolumeClaim": {"claimName": mcfg["pvc_persistent"],
+                                                   "readOnly": True}},
+                        {"name": "scratch",
+                         "persistentVolumeClaim": {"claimName": mcfg["pvc_scratch"]}},
+                    ],
+                },
+            },
+        },
+    }
+
+
+def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
+               q: Queue | None = None) -> tuple[str, int | None]:
+    """Execute one job as a Kubernetes Job on a k8s-backend machine.
+
+    Submits via `kubectl apply` (stdlib-only, no k8s Python client
+    dependency, matching this project's zero-dependency philosophy), polls
+    completion via `kubectl get job -o json`, tails logs into the same
+    <log_dir>/<id>.log bare-metal jobs use, deletes the Job on exit either
+    way. Honors the same control-file protocol (stop/skip/requeue) as the
+    subprocess path by deleting the Job when one is found.
+    """
+    log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
+    try:
+        tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+        argv, _env, cwd = render_command(tcfg, job, machine)
+    except (KeyError, TemplateError) as e:
+        print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
+        return "failed", None
+
+    manifest = build_k8s_job_manifest(mcfg, job, argv, cwd)
+    name = manifest["metadata"]["name"]
+    ns = mcfg["namespace"]
+    print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
+          f"(k8s Job {ns}/{name}, log {log_path})", flush=True)
+
+    apply = _kubectl(["apply", "-f", "-"], input_text=json.dumps(manifest))
+    if apply.returncode != 0:
+        print(f"[ablator] {job['id']} k8s apply failed: {apply.stderr}", flush=True)
+        return "failed", None
+
+    log_proc = None
+    try:
+        with open(log_path, "w") as lf:
+            lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']} "
+                     f"(k8s Job {ns}/{name})\n# {shlex.join(argv)}\n")
+            lf.flush()
+            while True:
+                if read_control(cfg, job["id"]) is not None:
+                    _kubectl(["delete", "job", name, "-n", ns, "--ignore-not-found",
+                             "--wait=false"])
+                    return "requeue", None
+                status = _kubectl(["get", "job", name, "-n", ns, "-o", "json"],
+                                  timeout=30)
+                if status.returncode != 0:
+                    time.sleep(HEALTH_POLL_S)
+                    continue
+                st = json.loads(status.stdout).get("status", {})
+                if log_proc is None:
+                    pods = _kubectl(["get", "pods", "-n", ns, "-l",
+                                     f"job-name={name}", "-o",
+                                     "jsonpath={.items[0].metadata.name}"])
+                    if pods.returncode == 0 and pods.stdout.strip():
+                        log_proc = subprocess.Popen(
+                            ["kubectl", "logs", "-f", pods.stdout.strip(), "-n", ns],
+                            stdout=lf, stderr=subprocess.STDOUT)
+                if st.get("succeeded", 0) >= 1:
+                    rc = 0
+                    break
+                if st.get("failed", 0) >= 1:
+                    rc = 1
+                    break
+                time.sleep(HEALTH_POLL_S)
+        if log_proc is not None:
+            try:
+                log_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                log_proc.kill()
+    finally:
+        _kubectl(["delete", "job", name, "-n", ns, "--ignore-not-found", "--wait=false"])
+
+    if rc == 0 and _require_result_artifact(cfg, tcfg):
+        # `cwd` above is the CONTAINER workingDir (/workspace/splatograph),
+        # meaningless on the host running this coordinator process. Health
+        # checks always run on whichever host executes `ablator run`/
+        # `ablator status` -- resolve model_path against THAT host's repo
+        # checkout instead, same as bare-metal jobs do (the base, non-
+        # machine-overridden [types.<t>].cwd, since output/scratch there is
+        # the symlink into the same NFS tree the k8s pod's scratch PVC
+        # mounts, so both paths land on the identical files).
+        host_base_dir = _job_base_dir(cfg, job, machine)
+        h = healthmod.job_health(job, host_base_dir, cfg.get("queue", {}),
+                                 process_alive=False)
+        if h["state"] != "done":
+            print(f"[ablator] {job['id']} k8s Job succeeded but no completion "
+                  f"artifact found (state={h['state']!r}) — treating as failed",
+                  flush=True)
+            return "failed", rc
+    return ("done" if rc == 0 else "failed"), rc
+
+
 def run_job(cfg: dict, job: dict, machine: str,
            q: Queue | None = None) -> tuple[str, int | None]:
     """Execute one job; returns (status, exit_code). Logs to <log_dir>/<id>.log.
@@ -373,6 +547,9 @@ def run_job(cfg: dict, job: dict, machine: str,
     health into the queue record, honors control files, and kills
     hung/crashed jobs.
     """
+    mcfg = cfgmod.machine_cfg(cfg, machine)
+    if mcfg.get("backend") == "k8s":
+        return run_job_k8s(cfg, job, machine, mcfg, q)
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
     try:
         tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
@@ -414,6 +591,14 @@ def run_job(cfg: dict, job: dict, machine: str,
 
 
 def _job_base_dir(cfg: dict, job: dict, machine: str) -> str:
+    # k8s-backend machines have a machine-override `cwd` that is the
+    # CONTAINER workingDir (e.g. /workspace/splatograph), meaningless for
+    # host-side path resolution -- the coordinator process checking health
+    # always runs on a real bare-metal host (main/r9700), never inside the
+    # pod. Fall back to the base (non-machine-overridden) type cwd instead,
+    # same fix as run_job_k8s's own health check.
+    if cfgmod.machine_cfg(cfg, machine).get("backend") == "k8s":
+        return cfg.get("types", {}).get(job.get("type", ""), {}).get("cwd") or os.getcwd()
     try:
         tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
     except KeyError:
@@ -483,8 +668,24 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
 def run_loop(cfg: dict, once: bool = False) -> None:
     machine = cfgmod.machine_name(cfg)
     q = Queue(cfgmod.queue_path(cfg))
-    print(f"[ablator] runner on {machine} watching {q.path}", flush=True)
+    # k8s-backend machines (e.g. a100cluster) have no hostname_patterns --
+    # nothing's identity ever resolves to them, since this repo's code never
+    # runs ON a cluster node itself. Whichever bare-metal host runs `ablator
+    # run` (main/r9700) instead acts as the DISPATCHER: it also claims jobs
+    # explicitly targeting a k8s machine name and submits/polls them via
+    # kubectl (run_job_k8s), on top of claiming its own bare-metal identity's
+    # jobs. This is safe to do from every runner (kubectl apply/get are
+    # idempotent-ish and Queue.claim_next's file lock already serializes
+    # claims across machines), so no extra "dispatcher" config is needed.
+    dispatch_machines = [machine] + [
+        name for name, m in cfg.get("machines", {}).items()
+        if m.get("backend") == "k8s"
+    ]
+    print(f"[ablator] runner on {machine} watching {q.path} "
+          f"(dispatching for: {', '.join(dispatch_machines)})", flush=True)
     reconcile_stale_running(cfg, machine, q)
+    for k8s_name in dispatch_machines[1:]:
+        reconcile_stale_running(cfg, k8s_name, q, busy=False)
     last_tick = time.monotonic()
     while True:
         # Watchdog: if the previous iteration (probes + sleeps, NOT a job
@@ -504,17 +705,23 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 time.sleep(BUSY_POLL_S)
                 continue
             write_heartbeat(cfg, machine, "idle")
-            job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
+            job = None
+            job_machine = machine
+            for cand in dispatch_machines:
+                job = q.claim_next(cand, can_run=make_can_run(cfg, cand))
+                if job is not None:
+                    job_machine = cand
+                    break
             if job is None:
                 if once:
                     return
                 time.sleep(IDLE_POLL_S)
                 continue
             write_heartbeat(cfg, machine, f"running:{job['id']}")
-            base_dir = _job_base_dir(cfg, job, machine)
-            status, exit_code = run_job(cfg, job, machine, q)
+            base_dir = _job_base_dir(cfg, job, job_machine)
+            status, exit_code = run_job(cfg, job, job_machine, q)
             if status == "failed":
-                disposition = handle_failure(cfg, job, exit_code, machine, base_dir, q)
+                disposition = handle_failure(cfg, job, exit_code, job_machine, base_dir, q)
                 if disposition == "retry":
                     # unknown category: preserve existing uniform
                     # retry-once-then-quarantine behavior.
@@ -522,7 +729,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                         job["retried"] = True
                         q.update(job["id"], retried=True)
                         print(f"[ablator] retrying {job['id']} once", flush=True)
-                        status, exit_code = run_job(cfg, job, machine, q)
+                        status, exit_code = run_job(cfg, job, job_machine, q)
                         if status == "failed":
                             classify_and_record(cfg, job, exit_code, base_dir, q)
                             status = "quarantined"
