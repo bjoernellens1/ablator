@@ -491,6 +491,7 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
             lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']} "
                      f"(k8s Job {ns}/{name})\n# {shlex.join(argv)}\n")
             lf.flush()
+            missing_polls = 0
             while True:
                 if read_control(cfg, job["id"]) is not None:
                     _kubectl(["delete", "job", name, "-n", ns, "--ignore-not-found",
@@ -499,8 +500,23 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
                 status = _kubectl(["get", "job", name, "-n", ns, "-o", "json"],
                                   timeout=30)
                 if status.returncode != 0:
+                    # A transient API hiccup looks identical to "the Job was
+                    # deleted out from under us" (e.g. a manual `kubectl
+                    # delete`, or the namespace being cleaned up) -- both
+                    # give a nonzero `kubectl get` exit. Without a giveup
+                    # count this loop spun forever once the Job was gone,
+                    # leaving the job stuck "running" in the ledger with no
+                    # pod/Job to show for it (found live, 2026-07-06).
+                    missing_polls += 1
+                    if missing_polls >= 3:
+                        print(f"[ablator] {job['id']} k8s Job {ns}/{name} "
+                              f"no longer found after {missing_polls} polls "
+                              "-- treating as failed", flush=True)
+                        rc = 1
+                        break
                     time.sleep(HEALTH_POLL_S)
                     continue
+                missing_polls = 0
                 st = json.loads(status.stdout).get("status", {})
                 if log_proc is None:
                     pods = _kubectl(["get", "pods", "-n", ns, "-l",
