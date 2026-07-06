@@ -423,6 +423,12 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                     "containers": [{
                         "name": "trainer",
                         "image": mcfg["image"],
+                        # Non-":latest" tags default to imagePullPolicy=IfNotPresent,
+                        # which silently reuses a stale cached layer on whatever node
+                        # a Job lands on after a fresh push -- found live: a rebuilt
+                        # cuda-dev image (fixing a real ModuleNotFoundError) was
+                        # ignored by a node that had cached the broken prior build.
+                        "imagePullPolicy": "Always",
                         "workingDir": cwd or "/workspace/splatograph",
                         "command": argv,
                         "resources": {
