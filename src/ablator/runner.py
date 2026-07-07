@@ -29,7 +29,7 @@ from . import error as errormod
 from . import health as healthmod
 from . import provenance as provmod
 from . import resources
-from .queue import Queue, pause_flag_path, write_pause_flag
+from .queue import Queue, is_paused, pause_flag_path, write_pause_flag
 from .urgent_fixes import enforce_urgent_fixes
 
 IDLE_POLL_S = 30
@@ -1266,6 +1266,57 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
 
 DEFAULT_K8S_MAX_CONCURRENT = 4
 
+# How fresh a heartbeat must be to trust its "idle" state as "about to try
+# claiming for itself this tick / very soon" — bigger than any single poll
+# interval so a slightly-slow tick doesn't look stale, small enough that a
+# genuinely dead/hung runner stops being treated as idle within a couple of
+# minutes (fail OPEN toward k8s dispatch, i.e. never toward starving k8s).
+IDLE_HEARTBEAT_FRESH_S = 120
+
+
+def _bare_metal_machines(cfg: dict) -> list[str]:
+    return [name for name, m in cfg.get("machines", {}).items()
+            if m.get("backend") != "k8s"]
+
+
+def _other_idle_baremetal(cfg: dict, machine: str) -> bool:
+    """True if some OTHER bare-metal machine looks idle-with-capacity right
+    now (fresh heartbeat, state starts with "idle", not paused) — i.e. it's
+    about to attempt claim_next() for itself on its own very next tick.
+
+    Used to make run_loop defer claiming machine="any" jobs for k8s this
+    tick (see only_pinned= in Queue.claim_next), giving that idle bare-metal
+    machine first shot instead of losing every "any" job to whichever
+    process's k8s-fill loop happens to run first. Deliberately narrow: only
+    fires when another machine is BOTH idle and unpaused, so it can't defer
+    "any" work into a black hole — the deferred-to machine reassesses and
+    claims on its own next poll, or this check stops returning True and k8s
+    resumes claiming "any" jobs the very next tick.
+    """
+    qdir = os.path.dirname(cfgmod.queue_path(cfg))
+    now = time.time()
+    for name in _bare_metal_machines(cfg):
+        if name == machine:
+            continue
+        path = os.path.join(qdir, f"heartbeat_{name}.txt")
+        try:
+            with open(path) as f:
+                line = f.read().strip()
+        except OSError:
+            continue
+        m = re.search(r"epoch=(\d+(?:\.\d+)?)\s+state=(\S+)", line)
+        if not m:
+            continue
+        epoch, state = float(m.group(1)), m.group(2)
+        if now - epoch > IDLE_HEARTBEAT_FRESH_S:
+            continue  # stale — don't trust it, fail open toward k8s
+        if not state.startswith("idle"):
+            continue
+        if is_paused(cfgmod.queue_path(cfg), name):
+            continue  # reports idle but can never claim — don't defer to it
+        return True
+    return False
+
 
 def _k8s_max_concurrent(cfg: dict, k8s_name: str) -> int:
     """Concurrency cap for a k8s-backend dispatch machine.
@@ -1458,14 +1509,33 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 time.sleep(IDLE_POLL_S)
                 continue
 
-            # 1. Fill k8s concurrency slots — non-blocking: each claimed job
+            # 1. Claim (non-blocking) this runner's own bare-metal job FIRST,
+            # before k8s claiming — this is what actually gives an idle
+            # bare-metal machine first shot at machine="any" jobs instead
+            # of losing every race to whichever process's k8s-fill loop
+            # happens to run first. Running it is deferred to step 3 (it's
+            # blocking) so it doesn't starve k8s concurrency in the
+            # meantime — see the design comment above for why that split
+            # matters.
+            job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
+
+            # 2. Fill k8s concurrency slots — non-blocking: each claimed job
             # is handed to a background thread and this loop moves straight
-            # on to bare-metal claiming below without waiting for it.
+            # on to running the bare-metal job (if any) below without
+            # waiting for it. When another bare-metal machine looks
+            # idle-with-capacity right now (fresh heartbeat), defer
+            # claiming machine="any" jobs for k8s this tick so that machine
+            # gets first shot on its own next poll instead of losing every
+            # "any" job to this process's k8s dispatch purely because it
+            # gets to call claim_next() more often. Jobs explicitly pinned
+            # to a k8s machine are never affected by this.
+            defer_any = _other_idle_baremetal(cfg, machine)
             for k8s_name in k8s_machines:
                 cap = _k8s_max_concurrent(cfg, k8s_name)
                 can_run = make_can_run(cfg, k8s_name)
                 while inflight.count(k8s_name) < cap:
-                    kjob = q.claim_next(k8s_name, can_run=can_run)
+                    kjob = q.claim_next(k8s_name, can_run=can_run,
+                                        only_pinned=defer_any)
                     if kjob is None:
                         break
                     print(f"[ablator] dispatching {kjob['id']} to {k8s_name} "
@@ -1480,9 +1550,8 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                     t.start()
                     inflight.add(k8s_name, t, kjob["id"])
 
-            # 2. Claim and run (serially, blocking) at most one bare-metal
-            # job for this runner's own identity — unchanged from before.
-            job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
+            # 3. Run (serially, blocking) the bare-metal job claimed in step
+            # 1, if any.
             if job is None:
                 if once:
                     inflight.join_all()

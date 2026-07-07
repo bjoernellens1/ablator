@@ -959,3 +959,138 @@ def test_reconcile_k8s_reattach_counts_toward_max_concurrent(tmp_path, monkeypat
 
     release.set()
     inflight.join_all()
+
+
+# ------------------------------------------------- "any" job dispatch fairness
+
+def test_any_job_deferred_from_k8s_when_other_baremetal_idle(tmp_path, monkeypatch):
+    """When another bare-metal machine (r9700) reports a fresh idle
+    heartbeat, this process's k8s-fill loop must not vacuum up a
+    machine="any" job that r9700 would otherwise claim for itself on its
+    own next tick — only jobs explicitly pinned to the k8s machine may
+    still be claimed."""
+    cfg = make_k8s_cfg(tmp_path, max_concurrent=2)
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["true"]}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [
+        {"id": "any1", "machine": "any", "type": "replay",
+         "scene": "/s", "model_path": "m1", "status": "pending"},
+        {"id": "any2", "machine": "any", "type": "replay",
+         "scene": "/s", "model_path": "m2", "status": "pending"},
+    ])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    monkeypatch.setattr(runner, "run_job", lambda cfg, job, machine, q=None: ("done", 0))
+    monkeypatch.setattr(runner, "run_job_k8s",
+                        lambda cfg, job, machine, mcfg, q=None: ("done", 0))
+
+    # r9700 looks idle-with-capacity right now.
+    runner.write_heartbeat(cfg, "r9700", "idle k8s_inflight=0")
+
+    runner.run_loop(cfg, once=True)
+
+    jobs = {j["id"]: j for j in read_queue(q.path)}
+    # main's own bare-metal claim (step 1) takes exactly one of the two
+    # "any" jobs and runs it to completion.
+    done_ids = {jid for jid, j in jobs.items() if j["status"] == "done"}
+    pending_ids = {jid for jid, j in jobs.items() if j["status"] == "pending"}
+    assert len(done_ids) == 1
+    assert len(pending_ids) == 1
+    # Crucially: the k8s side must NOT have grabbed the second "any" job
+    # out from under the (simulated) idle r9700 — it's left pending for
+    # r9700 to claim on its own next tick.
+    assert done_ids | pending_ids == {"any1", "any2"}
+
+
+def test_any_job_claimed_by_k8s_when_other_baremetal_busy(tmp_path, monkeypatch):
+    """No idle bare-metal elsewhere (no heartbeat at all, i.e. the classic
+    'r9700 is off/never started' case) — k8s must still be able to claim
+    machine="any" jobs normally; the fairness gate must not starve k8s."""
+    cfg = make_k8s_cfg(tmp_path, max_concurrent=2)
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["true"]}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [
+        {"id": "any1", "machine": "any", "type": "replay",
+         "scene": "/s", "model_path": "m1", "status": "pending"},
+        {"id": "any2", "machine": "any", "type": "replay",
+         "scene": "/s", "model_path": "m2", "status": "pending"},
+    ])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    monkeypatch.setattr(runner, "run_job", lambda cfg, job, machine, q=None: ("done", 0))
+    monkeypatch.setattr(runner, "run_job_k8s",
+                        lambda cfg, job, machine, mcfg, q=None: ("done", 0))
+    # no heartbeat_r9700.txt written at all — no idle machine to defer to.
+
+    runner.run_loop(cfg, once=True)
+
+    jobs = {j["id"]: j for j in read_queue(q.path)}
+    # Both jobs are claimed and finished this tick: one by main's own
+    # bare-metal slot, one by k8s.
+    assert all(j["status"] == "done" for j in jobs.values())
+
+
+def test_any_job_claimed_by_k8s_when_other_baremetal_paused(tmp_path, monkeypatch):
+    """r9700 reports a fresh idle heartbeat but is actually paused (can
+    never claim_next itself) — the fairness gate must recognize it can't
+    really take the job and let k8s claim it rather than stranding it."""
+    cfg = make_k8s_cfg(tmp_path, max_concurrent=2)
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["true"]}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [
+        {"id": "any1", "machine": "any", "type": "replay",
+         "scene": "/s", "model_path": "m1", "status": "pending"},
+        {"id": "any2", "machine": "any", "type": "replay",
+         "scene": "/s", "model_path": "m2", "status": "pending"},
+    ])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    monkeypatch.setattr(runner, "run_job", lambda cfg, job, machine, q=None: ("done", 0))
+    monkeypatch.setattr(runner, "run_job_k8s",
+                        lambda cfg, job, machine, mcfg, q=None: ("done", 0))
+
+    runner.write_heartbeat(cfg, "r9700", "idle k8s_inflight=0")
+    from ablator.queue import write_pause_flag
+    write_pause_flag(cfg["queue"]["path"], "r9700", "manual", "test")
+
+    runner.run_loop(cfg, once=True)
+
+    jobs = {j["id"]: j for j in read_queue(q.path)}
+    assert all(j["status"] == "done" for j in jobs.values())
+
+
+def test_pinned_k8s_job_unaffected_by_fairness_gate(tmp_path, monkeypatch):
+    """A job explicitly pinned to the k8s machine must be claimable by k8s
+    even while an idle bare-metal machine would otherwise cause "any" jobs
+    to be deferred — only machine="any" jobs are ever gated."""
+    cfg = make_k8s_cfg(tmp_path, max_concurrent=2)
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, _k8s_jobs(1))  # pinned to a100cluster
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    monkeypatch.setattr(runner, "run_job_k8s",
+                        lambda cfg, job, machine, mcfg, q=None: ("done", 0))
+
+    runner.write_heartbeat(cfg, "r9700", "idle k8s_inflight=0")
+
+    runner.run_loop(cfg, once=True)
+
+    jobs = {j["id"]: j for j in read_queue(q.path)}
+    assert jobs["kjob0"]["status"] == "done"
+
+
+def test_claim_next_only_pinned_skips_any_jobs(tmp_path):
+    """Direct unit test of the only_pinned= gate added to claim_next."""
+    import json as jsonmod
+    path = tmp_path / "queue.jsonl"
+    jobs = [
+        {"id": "a", "machine": "any", "status": "pending"},
+        {"id": "b", "machine": "a100cluster", "status": "pending"},
+    ]
+    with open(path, "w") as f:
+        for j in jobs:
+            f.write(jsonmod.dumps(j) + "\n")
+    q = Queue(str(path))
+    job = q.claim_next("a100cluster", only_pinned=True)
+    assert job["id"] == "b"  # "any" job skipped, pinned job claimed
+    assert q.claim_next("a100cluster", only_pinned=True) is None

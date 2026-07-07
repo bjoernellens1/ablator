@@ -151,12 +151,20 @@ class Queue:
             self._save(f, jobs)
 
     def claim_next(self, machine: str,
-                   can_run: Callable[[dict], bool] | None = None) -> dict | None:
+                   can_run: Callable[[dict], bool] | None = None,
+                   only_pinned: bool = False) -> dict | None:
         """Claim the first runnable pending job for this machine.
 
         can_run(job) is an optional capability predicate (e.g. required
         container images present); evaluated at most once per job type
         per scan by the caller if desired — here it is called per job.
+
+        only_pinned=True restricts claiming to jobs explicitly pinned to
+        `machine` (job["machine"] == machine), skipping jobs with
+        machine="any" entirely. Used by run_loop's k8s-fill path to defer
+        "any" jobs to an idle bare-metal machine for a tick (see
+        _other_idle_baremetal) without touching pinned-job claiming at
+        all.
 
         A machine-level pause flag (see pause_flag_path) blocks new claims
         without disturbing already-running jobs. A queue-flock timeout
@@ -178,7 +186,11 @@ class Queue:
                         continue
                     if j.get("status") != "pending":
                         continue
-                    if j.get("machine", "any") not in (machine, "any"):
+                    jm = j.get("machine", "any")
+                    if only_pinned:
+                        if jm != machine:
+                            continue
+                    elif jm not in (machine, "any"):
                         continue
                     if not not_before_ok(j):
                         continue  # backoff window (e.g. gpu_busy/network_transient requeue)
