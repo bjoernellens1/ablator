@@ -28,7 +28,20 @@ DEFAULT_LOG = "train.log"
 # mid-training. Real tqdm counters are never immediately preceded by '['
 # or another digit, so this excludes only the timestamp shape, not
 # tqdm's own format.
-DEFAULT_REGEX = r"(?<![\[\d])(\d+)/(\d+)"
+#
+# (?!\s*views\)) additionally excludes this project's periodic report
+# lines, e.g. "[report] iter=7000 train PSNR mean=... (128/323 views)" --
+# same failure mode as the timestamp case (re.findall takes the LAST
+# match; a report line printed during a mid-training report pause lands
+# after the last real tqdm line and wins), confirmed live 2026-07-07 on
+# the same sppgtsanfix_ctrl run immediately after the timestamp fix
+# above. Whack-a-mole risk: any other "(\d+)/(\d+)" shape this project's
+# logging ever introduces needs the same treatment. A more robust
+# long-term fix would positively anchor on tqdm's own "N%|...| cur/total
+# [" shape instead of negatively excluding known non-tqdm shapes, but
+# that requires updating the simplified fake-tqdm-format test fixtures
+# too -- deferred, negative exclusion is enough while it's cheap.
+DEFAULT_REGEX = r"(?<![\[\d])(\d+)/(\d+)(?!\d)(?!\s*views\))"
 DEFAULT_CAP_REGEX = r"--streaming_max_iterations[= ](\d+)"
 TOTAL_SENTINEL = 2**31 - 1
 TAIL_BYTES = 2048

@@ -501,6 +501,20 @@ def test_parse_progress_ignores_log_timestamp_after_last_tqdm_line():
     assert progmod.parse_progress(tail) == "iter 2620/100000 (2%)"
 
 
+def test_parse_progress_ignores_report_line_view_count_after_last_tqdm_line():
+    # Regression: this project's periodic report lines, e.g.
+    # "[report] iter=7000 train PSNR mean=... (128/323 views)", also match
+    # bare "(\d+)/(\d+)" and can land in the tail after the last real tqdm
+    # line during a mid-training report pause. Same failure mode as the
+    # timestamp case above, found live immediately after that fix landed.
+    tail = (
+        "Streaming training:   5%|5 | 5000/98000 [10:20<1:14:49, 20.72it/s]"
+        "\n[report] iter=7000 train PSNR mean=20.64dB min=15.27 max=26.47 "
+        "(128/323 views) [07/07 18:20:05]\n"
+    )
+    assert progmod.parse_progress(tail) == "iter 5000/98000 (5%)"
+
+
 def test_job_progress_reads_configured_log(tmp_path):
     mp = tmp_path / "run1"
     mp.mkdir()
