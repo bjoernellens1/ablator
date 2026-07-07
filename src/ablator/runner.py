@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import threading
@@ -29,6 +30,7 @@ from . import error as errormod
 from . import health as healthmod
 from . import provenance as provmod
 from . import resources
+from . import self_check as selfcheckmod
 from .queue import Queue, is_paused, pause_flag_path, write_pause_flag
 from .urgent_fixes import enforce_urgent_fixes
 
@@ -36,6 +38,7 @@ IDLE_POLL_S = 30
 BUSY_POLL_S = 30
 HEALTH_POLL_S = 60
 STALL_WARN_S = 600  # loudly log if one loop iteration took longer than this
+SELF_CHECK_INTERVAL_S = 3600  # re-check ablator's own git currency hourly
 
 # Manual control action -> status returned by supervise(). "requeue" is
 # turned back into a fresh pending job by run_loop.
@@ -658,6 +661,35 @@ def _kubectl(args: list[str], input_text: str | None = None,
              timeout: float | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(["kubectl", *args], input=input_text, text=True,
                           capture_output=True, timeout=timeout)
+
+
+def k8s_dispatch_enabled(cfg: dict, machine: str) -> bool:
+    """Whether this runner, acting as `machine`, should ever attempt to act
+    as a k8s dispatcher (build dispatch_machines beyond its own identity,
+    invoke kubectl, etc).
+
+    Two independent gates, both must pass:
+      1. [machines.<machine>].k8s_dispatch config flag, default True
+         (preserves pre-2026-07-07 behavior for machines like `main` that
+         genuinely have working cluster access). Set to `false` for a
+         machine that should NEVER dispatch to k8s under any
+         circumstances -- e.g. r9700, which has no route to the cluster's
+         API server and raced/quarantined jobs main would have handled
+         correctly. This is a permanent policy switch, not a fallback.
+      2. `kubectl` binary actually present on PATH (shutil.which). Defense
+         in depth independent of (1): a future misconfigured machine (or
+         one where `k8s_dispatch` was left at the default True by mistake)
+         must never CRASH its entire runner process -- bare-metal jobs and
+         all -- just because kubectl isn't installed. r9700 did exactly
+         this on 2026-07-07 (FileNotFoundError at startup) before this
+         flag existed.
+    """
+    mcfg = cfg.get("machines", {}).get(machine, {})
+    if not mcfg.get("k8s_dispatch", True):
+        return False
+    if shutil.which("kubectl") is None:
+        return False
+    return True
 
 
 def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
@@ -1457,10 +1489,24 @@ def run_loop(cfg: dict, once: bool = False) -> None:
     # background thread, up to a configurable per-machine concurrency cap,
     # so multiple cluster jobs can be in flight at once without blocking
     # bare-metal claiming/dispatch.
-    k8s_machines = [
-        name for name, m in cfg.get("machines", {}).items()
-        if m.get("backend") == "k8s"
-    ]
+    if k8s_dispatch_enabled(cfg, machine):
+        k8s_machines = [
+            name for name, m in cfg.get("machines", {}).items()
+            if m.get("backend") == "k8s"
+        ]
+    else:
+        # This runner must NEVER act as a k8s dispatcher -- either
+        # explicitly configured off (k8s_dispatch = false, e.g. r9700,
+        # which has no route to the cluster API server) or kubectl isn't
+        # even installed here. Zero k8s-related code paths are touched
+        # below: no _kubectl() calls, no reconcile_stale_running() for a
+        # k8s machine, no claiming of k8s-pinned/"any" jobs for k8s.
+        k8s_machines = []
+        reason = ("k8s_dispatch=false in config"
+                  if not cfg.get("machines", {}).get(machine, {}).get("k8s_dispatch", True)
+                  else "kubectl not found on PATH")
+        print(f"[ablator] k8s dispatch DISABLED for {machine} ({reason}) -- "
+              f"bare-metal-only mode", flush=True)
     dispatch_machines = [machine] + k8s_machines
     print(f"[ablator] runner on {machine} watching {q.path} "
           f"(dispatching for: {', '.join(dispatch_machines)})", flush=True)
@@ -1468,6 +1514,25 @@ def run_loop(cfg: dict, once: bool = False) -> None:
     reconcile_stale_running(cfg, machine, q)
     for k8s_name in k8s_machines:
         reconcile_stale_running(cfg, k8s_name, q, busy=False, inflight=inflight)
+
+    # Self-drift check: is THIS host's own ablator installation behind
+    # origin/main? (Different from urgent_fixes.py, which checks the
+    # TARGET repo, splatograph.) Caught live 2026-07-07: r9700 was 9
+    # commits behind, silently, for an unknown period. Runs once at
+    # startup unconditionally (this is exactly when a stale checkout
+    # matters most — right before this process starts making dispatch
+    # decisions with it), then periodically since runner processes stay up
+    # for hours. Dispatched on a daemon thread — `git fetch` against a
+    # remote can be slow/blocked (exactly the offline-r9700 case this is
+    # meant to catch), and this check is purely informational, so it must
+    # never delay bare-metal/k8s dispatch decisions the way a blocking
+    # call in the hot startup/loop path would. Never raises regardless —
+    # see self_check.py for the never-raises contract.
+    def _bg_self_check():
+        selfcheckmod.run_self_check(cfg, machine)
+    threading.Thread(target=_bg_self_check, daemon=True,
+                     name="ablator-self-check").start()
+    last_self_check = time.monotonic()
     last_tick = time.monotonic()
     while True:
         # Watchdog: if the previous iteration (probes + sleeps, NOT a job
@@ -1481,6 +1546,10 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                   f"(> {STALL_WARN_S}s) — a probe or lock likely hung",
                   flush=True)
         last_tick = now
+        if now - last_self_check > SELF_CHECK_INTERVAL_S:
+            threading.Thread(target=_bg_self_check, daemon=True,
+                             name="ablator-self-check").start()
+            last_self_check = now
         try:
             inflight.reap()
             if resources.machine_busy(cfg, machine):

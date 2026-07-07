@@ -1,9 +1,11 @@
 """CPU-only tests for ablator (spec expansion, queue, resources, templates)."""
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
+from unittest import mock
 
 import pytest
 
@@ -702,6 +704,88 @@ def test_k8s_jobs_dispatched_concurrently_up_to_cap(tmp_path, monkeypatch):
     assert state["max_concurrent"] >= 2, "jobs never overlapped in time"
     jobs = read_queue(q.path)
     assert all(j["status"] == "done" for j in jobs)
+
+
+def test_k8s_dispatch_enabled_default_true(tmp_path):
+    """Default (no k8s_dispatch key) preserves pre-existing behavior for a
+    machine like main that genuinely has cluster access."""
+    cfg = make_k8s_cfg(tmp_path)
+    cfg["machines"]["main"] = {}
+    with mock.patch("shutil.which", return_value="/usr/bin/kubectl"):
+        assert runner.k8s_dispatch_enabled(cfg, "main") is True
+
+
+def test_k8s_dispatch_enabled_false_when_configured_off(tmp_path):
+    """k8s_dispatch = false in config disables k8s dispatch even though
+    kubectl is present and k8s machines exist in cfg["machines"]."""
+    cfg = make_k8s_cfg(tmp_path)
+    cfg["machines"]["r9700"] = {"k8s_dispatch": False}
+    with mock.patch("shutil.which", return_value="/usr/bin/kubectl"):
+        assert runner.k8s_dispatch_enabled(cfg, "r9700") is False
+
+
+def test_k8s_dispatch_enabled_false_when_kubectl_missing(tmp_path):
+    """Missing kubectl binary disables k8s dispatch regardless of the
+    config flag's value -- defense in depth against crashing the whole
+    runner process on a machine without kubectl installed."""
+    cfg = make_k8s_cfg(tmp_path)
+    cfg["machines"]["main"] = {}  # k8s_dispatch defaults True
+    with mock.patch("shutil.which", return_value=None):
+        assert runner.k8s_dispatch_enabled(cfg, "main") is False
+
+
+def test_dispatch_machines_excludes_k8s_when_disabled(tmp_path, monkeypatch):
+    """run_loop must build a bare-metal-only dispatch_machines list (and
+    never touch any k8s codepath) when k8s_dispatch is disabled for this
+    machine, even though a k8s machine exists in cfg["machines"]."""
+    cfg = make_k8s_cfg(tmp_path)
+    cfg["machines"]["r9700"] = {"k8s_dispatch": False}
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["true"]}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [
+        {"id": "baremetal1", "machine": "r9700", "type": "replay",
+         "scene": "/s", "model_path": "m", "status": "pending"},
+    ])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "r9700")
+
+    def boom(*a, **k):
+        raise AssertionError("kubectl must never be invoked when k8s_dispatch=false")
+
+    monkeypatch.setattr(runner, "_kubectl", boom)
+    monkeypatch.setattr(runner, "run_job_k8s", boom)
+
+    runner.run_loop(cfg, once=True)
+
+    jobs = read_queue(q.path)
+    assert jobs[0]["status"] == "done"
+
+
+def test_dispatch_machines_excludes_k8s_when_kubectl_missing(tmp_path, monkeypatch):
+    """Even with k8s_dispatch left at its True default, a missing kubectl
+    binary must degrade gracefully to bare-metal-only dispatch instead of
+    crashing the runner."""
+    cfg = make_k8s_cfg(tmp_path)
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["true"]}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [
+        {"id": "baremetal1", "machine": "main", "type": "replay",
+         "scene": "/s", "model_path": "m", "status": "pending"},
+    ])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+
+    def boom(*a, **k):
+        raise AssertionError("kubectl must never be invoked when the binary is missing")
+
+    monkeypatch.setattr(runner, "_kubectl", boom)
+    monkeypatch.setattr(runner, "run_job_k8s", boom)
+
+    runner.run_loop(cfg, once=True)
+
+    jobs = read_queue(q.path)
+    assert jobs[0]["status"] == "done"
 
 
 def test_bare_metal_job_not_blocked_by_inflight_k8s(tmp_path, monkeypatch):
