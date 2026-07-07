@@ -183,3 +183,112 @@ def test_k8s_manifest_termination_grace_period_overridable():
     manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "train.py"], None)
     pod_spec = manifest["spec"]["template"]["spec"]
     assert pod_spec["terminationGracePeriodSeconds"] == 300
+
+
+# --------------------------------------------- build_k8s_job_manifest: git-sync
+
+BASE_MCFG = {"namespace": "jupyterhub", "kai_queue": "kai-batch-low",
+            "priority_class": "kai-batch-low", "image_pull_secret": "regcred",
+            "pvc_persistent": "p", "pvc_scratch": "s", "image": "img:1"}
+GIT_JOB = {"id": "j1", "scene": "/mnt/cps_persistent1_shared/scene"}
+
+
+def test_k8s_manifest_no_git_sync_by_default():
+    """Absent git_sync_repo_url -> byte-identical manifest to today (no
+    initContainers key, no repo-src volume/mount) -- opt-in, not a
+    behavior change for any machine that hasn't configured it."""
+    manifest = runner.build_k8s_job_manifest(
+        BASE_MCFG, GIT_JOB, ["python", "train.py"], None, local_commit="abc123")
+    pod_spec = manifest["spec"]["template"]["spec"]
+    assert "initContainers" not in pod_spec
+    volume_names = {v["name"] for v in pod_spec["volumes"]}
+    assert "repo-src" not in volume_names
+    mount_names = {m["name"] for m in pod_spec["containers"][0]["volumeMounts"]}
+    assert "repo-src" not in mount_names
+
+
+def test_k8s_manifest_git_sync_adds_init_container_and_shared_volume():
+    mcfg = {**BASE_MCFG, "git_sync_repo_url": "git@github.com:bjoernellens1/splatograph.git"}
+    manifest = runner.build_k8s_job_manifest(
+        mcfg, GIT_JOB, ["python", "train.py"], "/workspace/splatograph",
+        local_commit="deadbeef1234")
+    pod_spec = manifest["spec"]["template"]["spec"]
+    assert len(pod_spec["initContainers"]) == 1
+    init = pod_spec["initContainers"][0]
+    assert init["name"] == "git-sync"
+    assert init["image"] == "alpine/git:2.45.2"
+    script = init["command"][-1]
+    # Pins the EXACT dispatching-host commit SHA, not a moving branch head.
+    assert "deadbeef1234" in script
+    assert "git@github.com:bjoernellens1/splatograph.git" in script
+
+    volumes_by_name = {v["name"]: v for v in pod_spec["volumes"]}
+    assert "emptyDir" in volumes_by_name["repo-src"]
+
+    init_mounts = {m["name"]: m for m in init["volumeMounts"]}
+    assert init_mounts["repo-src"]["mountPath"] == "/workspace/splatograph"
+
+    trainer = pod_spec["containers"][0]
+    trainer_mounts = {m["name"]: m for m in trainer["volumeMounts"]}
+    # Overlay decision: fresh checkout replaces the baked source at the
+    # SAME path the trainer already uses, no new path/env for it to know
+    # about.
+    assert trainer_mounts["repo-src"]["mountPath"] == "/workspace/splatograph"
+
+
+def test_k8s_manifest_git_sync_custom_image_overridable():
+    mcfg = {**BASE_MCFG, "git_sync_repo_url": "git@github.com:x/y.git",
+           "git_sync_image": "my-registry/git-sync:v1"}
+    manifest = runner.build_k8s_job_manifest(
+        mcfg, GIT_JOB, ["python", "train.py"], None, local_commit="sha1")
+    init = manifest["spec"]["template"]["spec"]["initContainers"][0]
+    assert init["image"] == "my-registry/git-sync:v1"
+
+
+def test_k8s_manifest_git_sync_no_secret_means_no_creds_mount():
+    """No git_sync_secret_name configured -> no secret volume/mount at all
+    (public-repo case); easy to add later without restructuring."""
+    mcfg = {**BASE_MCFG, "git_sync_repo_url": "https://github.com/bjoernellens1/splatograph.git"}
+    manifest = runner.build_k8s_job_manifest(
+        mcfg, GIT_JOB, ["python", "train.py"], None, local_commit="sha1")
+    pod_spec = manifest["spec"]["template"]["spec"]
+    volume_names = {v["name"] for v in pod_spec["volumes"]}
+    assert "git-creds" not in volume_names
+    init = pod_spec["initContainers"][0]
+    mount_names = {m["name"] for m in init["volumeMounts"]}
+    assert "git-creds" not in mount_names
+
+
+def test_k8s_manifest_git_sync_with_secret_mounts_readonly_init_container_only():
+    mcfg = {**BASE_MCFG, "git_sync_repo_url": "git@github.com:bjoernellens1/splatograph.git",
+           "git_sync_secret_name": "splatograph-git-readonly"}
+    manifest = runner.build_k8s_job_manifest(
+        mcfg, GIT_JOB, ["python", "train.py"], None, local_commit="sha1")
+    pod_spec = manifest["spec"]["template"]["spec"]
+    volumes_by_name = {v["name"]: v for v in pod_spec["volumes"]}
+    creds_vol = volumes_by_name["git-creds"]
+    assert creds_vol["secret"]["secretName"] == "splatograph-git-readonly"
+    assert creds_vol["secret"]["defaultMode"] == 0o400
+
+    init = pod_spec["initContainers"][0]
+    init_mount_names = {m["name"] for m in init["volumeMounts"]}
+    assert "git-creds" in init_mount_names
+    # The secret must NEVER be mounted into the trainer container.
+    trainer = pod_spec["containers"][0]
+    trainer_mount_names = {m["name"] for m in trainer["volumeMounts"]}
+    assert "git-creds" not in trainer_mount_names
+
+    ssh_cmd = next(e["value"] for e in init["env"] if e["name"] == "GIT_SSH_COMMAND")
+    assert "/etc/git-creds/ssh-privatekey" in ssh_cmd
+
+
+def test_k8s_manifest_git_sync_pins_head_when_no_local_commit():
+    """No local_commit resolved (e.g. git not available on dispatcher) ->
+    falls back to fetching HEAD of the default branch rather than crashing
+    manifest construction; a degraded-but-safe path, not a silent SHA
+    substitution."""
+    mcfg = {**BASE_MCFG, "git_sync_repo_url": "git@github.com:x/y.git"}
+    manifest = runner.build_k8s_job_manifest(
+        mcfg, GIT_JOB, ["python", "train.py"], None, local_commit=None)
+    script = manifest["spec"]["template"]["spec"]["initContainers"][0]["command"][-1]
+    assert "git fetch --depth 1 origin HEAD" in script

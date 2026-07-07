@@ -613,7 +613,7 @@ def _kubectl(args: list[str], input_text: str | None = None,
 
 
 def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
-                          cwd: str | None) -> dict:
+                          cwd: str | None, local_commit: str | None = None) -> dict:
     """Build the Job manifest dict for one job on a k8s-backend machine.
 
     Mounts: `pvc_persistent` (read-only, subPath'd to the job's real dataset
@@ -623,11 +623,108 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     so the command's own `ln -sfn .../output output/scratch` step, and
     ablator's own status/collect reading the shared queue.jsonl under that
     same tree, both work identically to a bare-metal job).
+
+    Git-sync init container (OPT-IN, gated on `git_sync_repo_url` being set
+    in mcfg -- absent by default, so this is a no-op / byte-identical
+    manifest for every machine that hasn't configured it):
+
+    The cuda-dev image's /workspace/splatograph source tree is COPY'd at
+    image-build time, so it silently goes stale relative to the dispatching
+    host's actual checkout (this is the gap commit 2e173b2's drift-WARNING
+    flags but doesn't fix). Instead of trusting the baked source, an
+    `alpine/git`-based init container clones the repo at the EXACT commit
+    SHA the dispatching host was at when the job was submitted (not just a
+    branch head, which could itself move between queueing and scheduling)
+    into a shared `emptyDir` volume, and the trainer container mounts that
+    SAME emptyDir OVER /workspace/splatograph -- overlaying the fresh
+    checkout on top of (replacing, for that one path) the baked copy,
+    rather than introducing a second parallel path the trainer would need
+    to know about. This is safe because the heavy compiled deps
+    (gsplat/fused-ssim/simple-knn wheels, torch, CUDA toolchain) install
+    into /opt/venv's site-packages, never under /workspace/splatograph
+    (verified against Dockerfile: COPY targets there are only source dirs
+    like arguments/, scene/, utils/, train.py, etc.) -- so overlaying only
+    ever replaces the .py/.json/config source tree the image install step
+    the wheels are already built.
+
+    KNOWN LIMITATION (out of scope to solve here): overlaying source
+    without rebuilding the image means a freshly-pulled commit that
+    requires an incompatible/newer gsplat, fused-ssim, or simple-knn wheel
+    version than what's actually baked into `mcfg["image"]` will fail or
+    misbehave at runtime with no compatibility check performed -- this
+    decouples "source freshness" from "environment freshness" by design,
+    and that tradeoff is deliberate (rebuilding the heavy wheels per job
+    would be far too slow), but it does reintroduce a (much narrower,
+    dependency-shaped rather than arbitrary-code-shaped) drift risk that
+    provenance.py's drift-WARNING doesn't cover and this feature doesn't
+    add new detection for.
     """
     name = _k8s_job_name(job["id"])
     scene = job.get("scene", "")
     persistent_root = "/mnt/cps_persistent1_shared"
     sub_path = scene[len(persistent_root):].lstrip("/") if scene.startswith(persistent_root) else ""
+    git_sync_repo_url = mcfg.get("git_sync_repo_url")
+    git_sync_enabled = bool(git_sync_repo_url)
+    trainer_volume_mounts = [
+        {"name": "dataset", "mountPath": "/data/scene",
+         "subPath": sub_path, "readOnly": True},
+        {"name": "scratch", "mountPath": "/mnt/cps_scratch1_tmp"},
+    ]
+    volumes = [
+        {"name": "dataset",
+         "persistentVolumeClaim": {"claimName": mcfg["pvc_persistent"],
+                                   "readOnly": True}},
+        {"name": "scratch",
+         "persistentVolumeClaim": {"claimName": mcfg["pvc_scratch"]}},
+    ]
+    init_containers: list[dict] = []
+    if git_sync_enabled:
+        workspace_path = cwd or "/workspace/splatograph"
+        volumes.append({"name": "repo-src", "emptyDir": {}})
+        trainer_volume_mounts.append(
+            {"name": "repo-src", "mountPath": workspace_path})
+        sha = local_commit or "HEAD"
+        # git init + fetch-by-sha + checkout (rather than `git clone
+        # --branch`) is the only way to pin an EXACT commit rather than a
+        # moving branch head -- the whole point of this feature is running
+        # the precise code the dispatching host had at submit time, which
+        # may have since moved on the branch by the time the cluster
+        # actually schedules the pod.
+        clone_script = (
+            "set -eu; "
+            f"git init -q {workspace_path}; "
+            f"cd {workspace_path}; "
+            f"git remote add origin {git_sync_repo_url}; "
+            f"git fetch --depth 1 origin {sha}; "
+            "git checkout -q FETCH_HEAD; "
+            f"echo \"git-sync: checked out {sha} from {git_sync_repo_url}\""
+        )
+        init_container: dict = {
+            "name": "git-sync",
+            "image": mcfg.get("git_sync_image", "alpine/git:2.45.2"),
+            "command": ["sh", "-c", clone_script],
+            "volumeMounts": [{"name": "repo-src", "mountPath": workspace_path}],
+        }
+        git_sync_secret_name = mcfg.get("git_sync_secret_name")
+        if git_sync_secret_name:
+            # SSH deploy-key secret, mounted READ-ONLY into the init
+            # container ONLY -- the trainer container never needs git
+            # access and must never see it. Mirrors the existing
+            # image_pull_secret pattern but as its own, narrower-scoped
+            # secret (registry pull != repo read access).
+            volumes.append({
+                "name": "git-creds",
+                "secret": {"secretName": git_sync_secret_name,
+                          "defaultMode": 0o400},
+            })
+            init_container["volumeMounts"].append(
+                {"name": "git-creds", "mountPath": "/etc/git-creds", "readOnly": True})
+            init_container["env"] = [
+                {"name": "GIT_SSH_COMMAND",
+                 "value": "ssh -i /etc/git-creds/ssh-privatekey "
+                          "-o StrictHostKeyChecking=no -o IdentitiesOnly=yes"},
+            ]
+        init_containers.append(init_container)
     return {
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -665,6 +762,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                         mcfg.get("termination_grace_period_s", 150),
                     "restartPolicy": "Never",
                     "imagePullSecrets": [{"name": mcfg["image_pull_secret"]}],
+                    **({"initContainers": init_containers} if init_containers else {}),
                     "containers": [{
                         "name": "trainer",
                         "image": mcfg["image"],
@@ -681,19 +779,9 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                             "limits": {"cpu": "8", "memory": "32Gi",
                                       "nvidia.com/gpu": str(mcfg.get("gpu_count", 1))},
                         },
-                        "volumeMounts": [
-                            {"name": "dataset", "mountPath": "/data/scene",
-                             "subPath": sub_path, "readOnly": True},
-                            {"name": "scratch", "mountPath": "/mnt/cps_scratch1_tmp"},
-                        ],
+                        "volumeMounts": trainer_volume_mounts,
                     }],
-                    "volumes": [
-                        {"name": "dataset",
-                         "persistentVolumeClaim": {"claimName": mcfg["pvc_persistent"],
-                                                   "readOnly": True}},
-                        {"name": "scratch",
-                         "persistentVolumeClaim": {"claimName": mcfg["pvc_scratch"]}},
-                    ],
+                    "volumes": volumes,
                 },
             },
         },
@@ -808,13 +896,13 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
         print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
         return "failed", None
 
-    manifest = build_k8s_job_manifest(mcfg, job, argv, cwd)
+    local_commit = _dispatch_host_commit(cfg, job)
+    manifest = build_k8s_job_manifest(mcfg, job, argv, cwd, local_commit)
     name = manifest["metadata"]["name"]
     ns = mcfg["namespace"]
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
           f"(k8s Job {ns}/{name}, log {log_path})", flush=True)
 
-    local_commit = _dispatch_host_commit(cfg, job)
     image_prov = provmod.check_image_drift(mcfg["image"], local_commit)
     if image_prov.get("warning"):
         print(f"[ablator] {image_prov['warning']}", flush=True)
