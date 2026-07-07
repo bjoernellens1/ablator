@@ -16,6 +16,18 @@ runner claims a job:
    busy if its output contains a substring (empty contains = any
    non-empty output). This expresses "podman ps shows splat_train",
    "pgrep -f chain.sh", etc., without ablator knowing any names.
+
+3. GPU memory guard — reads the machine's actual GTT/VRAM usage from
+   sysfs (paths configured per-machine under [resources.mem_budgets.<m>])
+   and treats the machine as busy if usage is at/above
+   [resources] mem_dispatch_busy_pct. This is deliberately a LOWER,
+   more conservative threshold than the kill-threshold used by
+   supervise()'s memory guard (mem_kill_danger_pct) -- it exists to stop
+   a NEW job from being dispatched onto a machine that is already
+   sitting dangerously close to its memory ceiling (e.g. a leaked
+   container from a crashed prior job silently holding GTT memory for
+   hours, invisible to `podman ps`/`free -h`). See runner.supervise()
+   for the in-flight kill-threshold check.
 """
 from __future__ import annotations
 
@@ -116,12 +128,66 @@ def guard_busy(guard: dict) -> bool:
 
 
 def machine_busy(cfg: dict, machine: str, sampler=sample_gpu_util,
-                 sleep=time.sleep) -> bool:
-    """Combined busy check for this machine (GPU util OR any config guard)."""
+                 sleep=time.sleep, mem_sampler=None) -> bool:
+    """Combined busy check for this machine (GPU util OR any config guard OR
+    GPU memory usage already above the pre-dispatch danger threshold)."""
     if gpu_util_busy(cfg, sampler=sampler, sleep=sleep):
         return True
     guards = cfg.get("machines", {}).get(machine, {}).get("busy_guards", [])
-    return any(guard_busy(g) for g in guards)
+    if any(guard_busy(g) for g in guards):
+        return True
+    return gpu_mem_busy(cfg, machine, mem_sampler=mem_sampler)
+
+
+# ------------------------------------------------------------ GPU memory
+
+DEFAULT_MEM_DISPATCH_BUSY_PCT = 70.0
+DEFAULT_MEM_KILL_DANGER_PCT = 90.0
+DEFAULT_MEM_KILL_GRACE_CYCLES = 3
+
+
+def _read_sysfs_int(path: str) -> int | None:
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def sample_gpu_mem_pct(cfg: dict, machine: str, reader=_read_sysfs_int) -> float | None:
+    """Current GPU memory usage for `machine` as a percentage of its
+    configured budget, or None if unconfigured/unreadable.
+
+    Budgets are per-machine under [resources.mem_budgets.<machine>]:
+      used_path  = sysfs path to the current-usage counter (bytes)
+      total_path = sysfs path to the total-budget counter (bytes), or
+      total_bytes = a literal fallback if no live total_path exists.
+    A machine with no [resources.mem_budgets.<machine>] entry (e.g. a
+    k8s-backend cluster where GPU isolation is per-pod, not host-level)
+    always returns None -- callers must treat None as "unknown", never
+    as "not busy"/"safe" by assumption.
+    """
+    budgets = cfg.get("resources", {}).get("mem_budgets", {}).get(machine)
+    if not budgets:
+        return None
+    used = reader(budgets.get("used_path", ""))
+    total = reader(budgets.get("total_path", "")) if budgets.get("total_path") else None
+    if total is None:
+        total = budgets.get("total_bytes")
+    if used is None or not total:
+        return None
+    return 100.0 * used / total
+
+
+def gpu_mem_busy(cfg: dict, machine: str, mem_sampler=None) -> bool:
+    """True if current GPU memory usage is at/above mem_dispatch_busy_pct."""
+    mem_sampler = mem_sampler or (lambda: sample_gpu_mem_pct(cfg, machine))
+    pct = mem_sampler()
+    if pct is None:
+        return False
+    threshold = cfg.get("resources", {}).get(
+        "mem_dispatch_busy_pct", DEFAULT_MEM_DISPATCH_BUSY_PCT)
+    return pct >= threshold
 
 
 # ---------------------------------------------------------- capabilities

@@ -33,6 +33,7 @@ SUGGESTED_ACTION = {
     "network_transient": "requeue_backoff_2min",
     "code_error": "quarantine_code_fix_needed",
     "unknown": "retry_once_then_quarantine",
+    "gpu_memory_exhaustion": "quarantine_no_retry",
 }
 
 DEFAULT_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -101,6 +102,18 @@ def _result(category: str, evidence: str, confidence: float) -> dict:
         "confidence": confidence,
         "suggested_action": SUGGESTED_ACTION[category],
     }
+
+
+def gpu_memory_exhaustion_result(mem_pct: float | None = None) -> dict:
+    """Result for a job killed in-flight by runner.supervise()'s own GPU
+    memory-danger guard (sustained usage above the configured kill
+    threshold for the required grace period). This bypasses log-tail
+    heuristics entirely -- the guard already knows definitively why the
+    job died, so there is nothing to classify from evidence."""
+    evidence = "runner GPU-memory guard: sustained usage above danger threshold"
+    if mem_pct is not None:
+        evidence += f" ({mem_pct:.1f}%)"
+    return _result("gpu_memory_exhaustion", evidence, 0.99)
 
 
 def classify_failure(job: dict, log_tail: str, exit_code: int | None,

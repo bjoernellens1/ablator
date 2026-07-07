@@ -277,6 +277,21 @@ def test_machine_busy_config_guards(tmp_path, monkeypatch):
     assert resources.machine_busy(cfg, "main", sampler=idle) is True
 
 
+def test_sample_gpu_mem_pct_reads_configured_budget():
+    cfg = {"resources": {"mem_budgets": {"main": {
+        "used_path": "/fake/used", "total_path": "/fake/total"}}}}
+    reader = lambda p: {"/fake/used": 90, "/fake/total": 100}.get(p)
+    assert resources.sample_gpu_mem_pct(cfg, "main", reader=reader) == 90.0
+    assert resources.sample_gpu_mem_pct(cfg, "r9700", reader=reader) is None
+
+
+def test_gpu_mem_busy_threshold(monkeypatch):
+    cfg = {"resources": {"mem_dispatch_busy_pct": 70}}
+    assert resources.gpu_mem_busy(cfg, "main", mem_sampler=lambda: 75.0) is True
+    assert resources.gpu_mem_busy(cfg, "main", mem_sampler=lambda: 69.9) is False
+    assert resources.gpu_mem_busy(cfg, "main", mem_sampler=lambda: None) is False
+
+
 # ------------------------------------------------------- template rendering
 
 JOB = {"id": "abl_ctrl", "type": "replay", "scene": "/data/fr3",

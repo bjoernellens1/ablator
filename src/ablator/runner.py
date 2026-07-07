@@ -387,17 +387,30 @@ def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
               record=None,
               control=None,
               preempt=None,
-              argv: list[str] | None = None) -> str | None:
+              argv: list[str] | None = None,
+              machine: str | None = None,
+              mem_sampler=None) -> str | None:
     """Watch a running job until its process exits or intervention is needed.
 
     Returns None when the process exited on its own (caller reads
     returncode), or an override status: 'failed_no_retry' (manual stop),
     'cancelled' (manual skip), 'requeue' (manual requeue), 'preempted'
     (lane-1 job yielding to a pending lane-3 job), 'failed'
-    (hung/crashed — normal retry->quarantine path applies).
+    (hung/crashed OR sustained GPU-memory danger — normal retry->quarantine
+    path applies either way; the memory case additionally stamps
+    job['_gpu_memory_exhausted'] so handle_failure()/classify_and_record()
+    record the definitive category instead of guessing from the log tail).
 
     Health comes ONLY from the run's own artifacts (health module); the run
     itself stays fully standalone and never talks to the runner.
+
+    The GPU-memory guard below is memory-based, not progress-based: it
+    samples actual GTT/VRAM usage every poll_s regardless of whether the
+    job's own health state looks fine. This means it also naturally covers
+    Incident 1's pattern (a process hung/leaking memory post-crash but not
+    yet reaped, health state possibly still "ok"/"hung" ambiguous) — a
+    stuck process that is still holding a lot of GPU memory keeps tripping
+    this guard even if `hung`/`crashed` health detection is inconclusive.
     """
     if sleep is None:
         def sleep(s):  # returns as soon as the process exits
@@ -413,6 +426,12 @@ def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
     control = control or (lambda: read_control(cfg, job["id"]))
     preempt = preempt or (lambda: q.preemption_due(job, cfgmod.machine_name(cfg))
                           if q is not None else False)
+    mem_sampler = mem_sampler or (
+        (lambda: resources.sample_gpu_mem_pct(cfg, machine)) if machine else (lambda: None))
+    rcfg = cfg.get("resources", {})
+    mem_danger_pct = rcfg.get("mem_kill_danger_pct", resources.DEFAULT_MEM_KILL_DANGER_PCT)
+    mem_grace_cycles = rcfg.get("mem_kill_grace_cycles", resources.DEFAULT_MEM_KILL_GRACE_CYCLES)
+    mem_breach_streak = 0
     while True:
         if proc.poll() is not None:
             record(health_fn(None))  # final snapshot; exit code judges result
@@ -433,6 +452,23 @@ def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
             return "preempted"
         if not alive:
             continue  # exited during the sleep; loop back to reap returncode
+        mem_pct = mem_sampler()
+        if mem_pct is not None and mem_pct >= mem_danger_pct:
+            mem_breach_streak += 1
+            print(f"[GPU MEMORY DANGER] {time.strftime('%Y-%m-%dT%H:%M:%S')} "
+                  f"host={machine} pid={proc.pid} model_path={job.get('model_path')} "
+                  f"usage={mem_pct:.1f}% threshold={mem_danger_pct}% "
+                  f"consecutive_breaches={mem_breach_streak}/{mem_grace_cycles}",
+                  flush=True)
+            if mem_breach_streak >= mem_grace_cycles:
+                print(f"[ablator] {job['id']} GPU memory danger threshold sustained "
+                      f"for {mem_breach_streak} consecutive polls — killing", flush=True)
+                job["_gpu_memory_exhausted"] = True
+                job["_gpu_memory_pct"] = mem_pct
+                kill()
+                return "failed"
+        else:
+            mem_breach_streak = 0
         if h["state"] in ("hung", "crashed"):
             print(f"[ablator] {job['id']} unhealthy ({h['state']}, "
                   f"log_age={h.get('log_age_s')}s) — killing", flush=True)
@@ -494,11 +530,22 @@ def _job_log_tail(cfg: dict, job: dict) -> str:
 
 def classify_and_record(cfg: dict, job: dict, exit_code: int | None,
                         base_dir: str, q: Queue | None = None) -> dict:
-    """Classify a failed job's log/exit-code and persist error_* fields."""
-    tail = _job_log_tail(cfg, job)
-    ctx = machine_context_snapshot(job, base_dir)
-    patterns = errormod.patterns_from_config(cfg)
-    result = errormod.classify_failure(job, tail, exit_code, ctx, patterns=patterns)
+    """Classify a failed job's log/exit-code and persist error_* fields.
+
+    If runner.supervise()'s GPU-memory guard already killed this job
+    in-flight (job['_gpu_memory_exhausted']), that verdict is definitive —
+    skip log-tail heuristics entirely and record 'gpu_memory_exhaustion'
+    directly, still through this same function so the ledger bookkeeping
+    (q.update of error_category/evidence/confidence/suggested_action) is
+    identical to every other failure path.
+    """
+    if job.get("_gpu_memory_exhausted"):
+        result = errormod.gpu_memory_exhaustion_result(job.get("_gpu_memory_pct"))
+    else:
+        tail = _job_log_tail(cfg, job)
+        ctx = machine_context_snapshot(job, base_dir)
+        patterns = errormod.patterns_from_config(cfg)
+        result = errormod.classify_failure(job, tail, exit_code, ctx, patterns=patterns)
     if q is not None:
         q.update(job["id"],
                 error_category=result["category"],
@@ -963,7 +1010,8 @@ def run_job(cfg: dict, job: dict, machine: str,
             proc = subprocess.Popen(argv, env=env, cwd=cwd,
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
-            override = supervise(cfg, job, proc, cwd or os.getcwd(), q, argv=argv)
+            override = supervise(cfg, job, proc, cwd or os.getcwd(), q, argv=argv,
+                                 machine=machine)
         rc = proc.returncode
         if override is not None:
             # Control-triggered stop/skip/requeue (or a lane preemption)

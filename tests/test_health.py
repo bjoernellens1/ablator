@@ -129,16 +129,85 @@ def H(state, **kw):
             "log_age_s": kw.get("log_age_s")}
 
 
-def drive(cfg, proc, healths, controls=None):
+def drive(cfg, proc, healths, controls=None, mem_values=None, job=None):
     hi, ci = iter(healths), iter(controls or [])
+    mi = iter(mem_values) if mem_values is not None else None
     recorded, kills = [], []
+    job = job if job is not None else {"id": "j"}
     result = runner.supervise(
-        cfg, {"id": "j"}, proc, ".", sleep=lambda s: None,
+        cfg, job, proc, ".", sleep=lambda s: None,
         health_fn=lambda alive: next(hi),
         control=lambda: next(ci, None),
         kill=lambda: kills.append(True),
-        record=recorded.append)
+        record=recorded.append,
+        mem_sampler=(lambda: next(mi, None)) if mi is not None else None)
     return result, recorded, kills
+
+
+# --------------------------------------------------------- GPU memory guard
+
+def test_supervise_kills_after_sustained_memory_danger(cfg):
+    """3 consecutive polls >= mem_kill_danger_pct (default 90) triggers a
+    kill, and stamps the job so classify_and_record() records the
+    definitive category rather than guessing from the log tail."""
+    job = {"id": "j", "model_path": "output/scratch/j"}
+    result, _, kills = drive(cfg, FakePopen(), [H("training")] * 5,
+                             mem_values=[95.0, 96.0, 97.0], job=job)
+    assert result == "failed"
+    assert kills == [True]
+    assert job["_gpu_memory_exhausted"] is True
+    assert job["_gpu_memory_pct"] == 97.0
+
+
+def test_supervise_does_not_kill_on_brief_memory_spike(cfg):
+    """A single poll above the danger threshold, followed by usage
+    dropping back down, must not trigger a kill (grace period resets)."""
+    job = {"id": "j", "model_path": "output/scratch/j"}
+    result, _, kills = drive(cfg, FakePopen(exits_after=5), [H("training")] * 6,
+                             mem_values=[95.0, 10.0, 12.0, 11.0, 13.0], job=job)
+    assert result is None
+    assert kills == []
+    assert "_gpu_memory_exhausted" not in job
+
+
+def test_memory_kill_lands_terminal_with_error_category(tmp_path, monkeypatch):
+    """End-to-end: a job killed by the memory guard must land in a
+    terminal ledger state (not stuck 'running') with
+    error_category == 'gpu_memory_exhaustion', via the SAME
+    handle_failure()/classify_and_record() path normal crash detection
+    uses -- not a separate ad-hoc kill call bypassing ledger bookkeeping."""
+    cfg = {"_path": "x", "queue": {"path": str(tmp_path / "queue.jsonl")},
+          "machines": {"m": {}}, "types": {"replay": {"command": ["true"]}},
+          "resources": {}}
+    q = Queue(cfg["queue"]["path"])
+    q.append([{"id": "j1", "status": "pending", "machine": "any",
+               "type": "replay", "model_path": str(tmp_path / "run")}])
+
+    def fake_supervise(cfg, job, proc, base_dir, q=None, **kw):
+        job["_gpu_memory_exhausted"] = True
+        job["_gpu_memory_pct"] = 96.0
+        return "failed"
+
+    monkeypatch.setattr(runner, "supervise", fake_supervise)
+    monkeypatch.setattr(runner.cfgmod, "machine_name", lambda c: "m")
+    monkeypatch.setattr(runner.resources, "machine_busy", lambda c, m: False)
+    runner.run_loop(cfg, once=True)
+
+    j = q.read()[0]
+    assert j["status"] == "quarantined"
+    assert j["error_category"] == "gpu_memory_exhaustion"
+
+
+def test_machine_busy_treats_high_memory_as_busy(monkeypatch):
+    from ablator import resources
+    cfg = {"resources": {"mem_dispatch_busy_pct": 70,
+                        "mem_budgets": {"main": {"used_path": "u", "total_path": "t"}}},
+          "machines": {"main": {}}}
+    idle = lambda: 0.0
+    assert resources.machine_busy(cfg, "main", sampler=idle,
+                                  mem_sampler=lambda: 75.0) is True
+    assert resources.machine_busy(cfg, "main", sampler=idle,
+                                  mem_sampler=lambda: 40.0) is False
 
 
 def test_supervise_normal_exit(cfg):
