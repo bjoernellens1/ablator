@@ -27,6 +27,7 @@ import time
 from . import config as cfgmod
 from . import error as errormod
 from . import health as healthmod
+from . import provenance as provmod
 from . import resources
 from .queue import Queue, pause_flag_path, write_pause_flag
 
@@ -100,6 +101,103 @@ def find_latest_checkpoint(model_path: str, base_dir: str) -> tuple[str, int] | 
     except OSError:
         return None
     return best
+
+
+def _git_state_path(cfg: dict, machine: str) -> str:
+    """Shared-storage status file one runner writes and another reads, so
+    the r9700-vs-main drift check works across two SEPARATE ablator
+    processes (each machine runs its own `ablator run`) without any
+    SSH-specific plumbing: queue.jsonl (and therefore log_dir) already
+    lives on shared NFS (/mnt/cps_scratch1_tmp), so this file is visible
+    to both machines the moment either one writes it."""
+    return os.path.join(cfgmod.log_dir(cfg), f"git_state_{machine}.json")
+
+
+def write_git_state_file(cfg: dict, machine: str, state: dict) -> None:
+    try:
+        with open(_git_state_path(cfg, machine), "w") as f:
+            json.dump({**state, "written_at": time.time()}, f)
+    except OSError as e:
+        print(f"[ablator] write_git_state_file({machine}) failed: {e!r}", flush=True)
+
+
+def read_git_state_file(cfg: dict, machine: str) -> dict | None:
+    try:
+        with open(_git_state_path(cfg, machine)) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def capture_and_record_provenance(cfg: dict, job: dict, machine: str,
+                                  cwd: str, q: Queue | None) -> dict:
+    """Bare-metal code-provenance capture at job-dispatch time.
+
+    Runs identically wherever `ablator run` actually executes (main or
+    r9700's own separate process) — each runner captures its OWN local git
+    state at the job type's configured `cwd`, since bare-metal jobs execute
+    via a live bind-mount of that SAME checkout. Recorded into (a) the
+    job's ledger entry, so `queue.jsonl` durably answers "what code ran
+    this job", and (b) a cross-machine status file other runners can read
+    for drift comparison (see check_r9700_drift below).
+    """
+    state = provmod.capture_local_git_state(cwd)
+    if q is not None:
+        q.update(job["id"], provenance=state)
+    write_git_state_file(cfg, machine, state)
+    return state
+
+
+def check_r9700_drift(cfg: dict, job: dict, machine: str, state: dict,
+                      q: Queue | None) -> None:
+    """Proactive, loud (WARN-not-refuse) check: is r9700's actual git
+    commit the same as main's most-recently-observed commit?
+
+    Only meaningful when THIS dispatch is happening on r9700 (each machine
+    runs its own ablator process — main never directly dispatches a
+    bare-metal job onto r9700 over SSH, so there is no single call site
+    where "before dispatching to r9700" can compare live processes
+    directly). Instead: r9700's own runner, right before running one of
+    its own jobs, reads the shared git_state_main.json file main's runner
+    last wrote and compares. This is necessarily best-effort (stale if
+    main hasn't run a bare-metal job recently) but requires zero
+    SSH-specific plumbing and needs no reachability from r9700 to main.
+
+    WARN, never refuse: a user may deliberately want different code on
+    r9700 (e.g. testing a branch there only) — a loud warning in both the
+    runner log and the job's ledger entry is enough to make the drift
+    impossible to miss without blocking a job the user may have wanted to
+    run exactly as-is.
+    """
+    if machine != "r9700":
+        return
+    main_state = read_git_state_file(cfg, "main")
+    if not main_state or not main_state.get("commit") or not state.get("commit"):
+        return
+    if main_state["commit"] == state["commit"]:
+        return
+    warning = (f"CODE PROVENANCE DRIFT: r9700 is executing job {job['id']!r} at "
+              f"commit {state['commit'][:12]} (branch {state.get('branch')}) but "
+              f"main's checkout was last observed at commit "
+              f"{main_state['commit'][:12]} — these two machines' checkouts have "
+              f"diverged. If intentional (e.g. testing a branch on r9700 only), "
+              f"ignore; otherwise sync the checkouts before trusting cross-machine "
+              f"comparisons.")
+    print(f"[ablator] {warning}", flush=True)
+    if q is not None:
+        q.update(job["id"], drift_warning=warning,
+                main_commit_at_check=main_state["commit"])
+
+
+def _dispatch_host_commit(cfg: dict, job: dict) -> str | None:
+    """The current git commit of the checkout on THIS host (whichever host
+    is running `ablator run` right now, main or r9700 acting as a k8s
+    dispatcher) — used as the reference point for k8s image-drift checks.
+    Uses the base (non-machine-overridden) type cwd, i.e. the real
+    bare-metal repo path, never a container path."""
+    cwd = cfg.get("types", {}).get(job.get("type", ""), {}).get("cwd") or os.getcwd()
+    state = provmod.capture_local_git_state(cwd)
+    return state.get("commit")
 
 
 def _job_vars(job: dict, machine: str) -> dict:
@@ -202,9 +300,67 @@ def read_control(cfg: dict, job_id: str) -> str | None:
     return action if action in CONTROL_STATUS else None
 
 
-def kill_job(proc: subprocess.Popen, job: dict) -> None:
-    """Kill the job's process group (SIGTERM, then SIGKILL)."""
+_CONTAINER_RUNTIMES = ("podman", "docker")
+
+
+def container_name_from_argv(argv: list[str]) -> str | None:
+    """Extract the `--name X` / `--name=X` value from a rendered command,
+    if the command is a podman/docker `run` invocation. Returns None for
+    non-container commands or container commands with no explicit name
+    (in which case guaranteed-teardown-by-name is not possible and only
+    the process-group signal path applies)."""
+    if not argv or argv[0] not in _CONTAINER_RUNTIMES:
+        return None
+    if "run" not in argv[:2]:
+        return None
+    for i, tok in enumerate(argv):
+        if tok == "--name" and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith("--name="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def force_remove_container(runtime: str, name: str) -> None:
+    """Best-effort, idempotent `stop` then `rm -f` by name. Safe to call
+    whether or not the container exists — never raises. This is the
+    guaranteed teardown path: unlike signalling the local `podman run`
+    client process (which only forwards SIGTERM, and does nothing on
+    SIGKILL since an uncatchable signal can't be proxied), this acts on
+    the container itself regardless of whether the local client process
+    responded to signals or was already reaped."""
+    for args, timeout in (([runtime, "stop", "-t", "10", name], 20),
+                          ([runtime, "rm", "-f", name], 15)):
+        try:
+            subprocess.run(args, capture_output=True, timeout=timeout, check=False)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            print(f"[ablator] force_remove_container {args}: {e!r}", flush=True)
+
+
+def kill_job(proc: subprocess.Popen, job: dict, argv: list[str] | None = None) -> None:
+    """Kill the job's process group (SIGTERM, then SIGKILL), AND — if this
+    is a podman/docker `run` command with a `--name` — forcibly stop/rm the
+    container by name regardless of whether the signals reaped the local
+    client process.
+
+    Why both: `podman run <fg>` proxies SIGTERM to the container, but a
+    SIGKILL to the *local client* process is uncatchable and therefore
+    cannot be proxied to anything — it just kills our view into the run
+    while the container (and the training process inside it) keeps going,
+    orphaned. This is exactly what happened with job spp39f3_ctrl on
+    2026-07-06: OOM crashed inside the container, our health check called
+    kill_job(), SIGTERM didn't reap the hung post-OOM process within 30s,
+    SIGKILL reaped the *client* fine (so ablator's ledger correctly moved
+    on to 'quarantined') but the actual container ran for another ~13h
+    leaking GPU GTT memory (114GB) with nothing left tracking it.
+    """
     print(f"[ablator] killing {job['id']} (pid {proc.pid})", flush=True)
+    name = container_name_from_argv(argv) if argv else None
+    if name:
+        print(f"[ablator] {job['id']}: also force-tearing-down container "
+              f"'{name}' by name (guaranteed, independent of client signals)",
+              flush=True)
+        force_remove_container(argv[0], name)
     for sig, wait_s in ((signal.SIGTERM, 30), (signal.SIGKILL, 10)):
         try:
             os.killpg(proc.pid, sig)
@@ -212,9 +368,14 @@ def kill_job(proc: subprocess.Popen, job: dict) -> None:
             pass
         try:
             proc.wait(timeout=wait_s)
-            return
+            break
         except subprocess.TimeoutExpired:
             continue
+    if name:
+        # Belt-and-suspenders: repeat after signal escalation in case the
+        # container was (re)created or missed by the first pass (e.g. name
+        # not yet visible to `podman ps` at the time of the first call).
+        force_remove_container(argv[0], name)
 
 
 def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
@@ -225,7 +386,8 @@ def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
               kill=None,
               record=None,
               control=None,
-              preempt=None) -> str | None:
+              preempt=None,
+              argv: list[str] | None = None) -> str | None:
     """Watch a running job until its process exits or intervention is needed.
 
     Returns None when the process exited on its own (caller reads
@@ -246,7 +408,7 @@ def supervise(cfg: dict, job: dict, proc: subprocess.Popen, base_dir: str,
     qcfg = cfg.get("queue", {})
     health_fn = health_fn or (lambda alive: healthmod.job_health(
         job, base_dir, qcfg, process_alive=alive))
-    kill = kill or (lambda: kill_job(proc, job))
+    kill = kill or (lambda: kill_job(proc, job, argv))
     record = record or (lambda h: q and q.update(job["id"], health=h))
     control = control or (lambda: read_control(cfg, job["id"]))
     preempt = preempt or (lambda: q.preemption_due(job, cfgmod.machine_name(cfg))
@@ -652,6 +814,14 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
           f"(k8s Job {ns}/{name}, log {log_path})", flush=True)
 
+    local_commit = _dispatch_host_commit(cfg, job)
+    image_prov = provmod.check_image_drift(mcfg["image"], local_commit)
+    if image_prov.get("warning"):
+        print(f"[ablator] {image_prov['warning']}", flush=True)
+    if q is not None:
+        q.update(job["id"], image_provenance=image_prov,
+                dispatch_host_commit=local_commit)
+
     apply = _kubectl(["apply", "-f", "-"], input_text=json.dumps(manifest))
     if apply.returncode != 0:
         print(f"[ablator] {job['id']} k8s apply failed: {apply.stderr}", flush=True)
@@ -660,6 +830,7 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
     with open(log_path, "w") as lf:
         lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']} "
                  f"(k8s Job {ns}/{name})\n# {shlex.join(argv)}\n")
+        lf.write(provmod.format_banner("k8s", image_prov) + "\n")
     return _poll_k8s_job(cfg, job, machine, mcfg, tcfg, name, ns, log_path,
                         append=True)
 
@@ -684,15 +855,27 @@ def run_job(cfg: dict, job: dict, machine: str,
         return "failed", None
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} (log {log_path})",
           flush=True)
+    prov_state = capture_and_record_provenance(cfg, job, machine, cwd or os.getcwd(), q)
+    check_r9700_drift(cfg, job, machine, prov_state, q)
+    container_name = container_name_from_argv(argv)
+    if container_name:
+        # Pre-launch safety net: if a prior attempt for this same job id
+        # leaked a container under this name (e.g. crashed before this fix,
+        # or a future bug reintroduces the gap), `podman run --name X` would
+        # otherwise fail loudly with "name already in use" and the job would
+        # spuriously fail every retry. Force-clear it first so retries never
+        # collide, and log loudly so a real leak doesn't pass silently.
+        force_remove_container(argv[0], container_name)
     try:
         with open(log_path, "w") as lf:
             lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']}\n"
                      f"# cwd={cwd or os.getcwd()}\n# {shlex.join(argv)}\n")
+            lf.write(provmod.format_banner("bare-metal", prov_state) + "\n")
             lf.flush()
             proc = subprocess.Popen(argv, env=env, cwd=cwd,
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
-            override = supervise(cfg, job, proc, cwd or os.getcwd(), q)
+            override = supervise(cfg, job, proc, cwd or os.getcwd(), q, argv=argv)
         rc = proc.returncode
         if override is not None:
             # Control-triggered stop/skip/requeue (or a lane preemption)
@@ -764,6 +947,61 @@ def _k8s_job_still_active(mcfg: dict, name: str) -> tuple[bool, bool]:
     if st.get("succeeded", 0) >= 1 or st.get("failed", 0) >= 1:
         return True, False
     return True, True
+
+
+_ABLATOR_CONTAINER_RE = re.compile(r"^ablator-(?P<job_id>.+)$")
+
+# Defense-in-depth, independent of any specific job's own supervise() path
+# (found necessary live 2026-07-06: spp39f3_ctrl's container leaked for
+# ~13h after ablator's own ledger had already marked it 'quarantined',
+# because the targeted kill_job() teardown had a gap — see kill_job()'s
+# docstring). This reaper does not assume that gap is fully closed by the
+# name-based teardown above; it independently audits *every* container
+# named 'ablator-<job_id>' against the ledger's current terminal/non-
+# terminal state on every loop tick, regardless of which code path was
+# supposed to have cleaned it up. Loud logging on every find, per this
+# project's established taste for visible telemetry over silent failure
+# (see CLAUDE.md run-contracts banner precedent).
+def reap_orphaned_containers(cfg: dict, q: Queue, runtime: str = "podman") -> int:
+    """Scan `podman ps -a` for ablator-managed containers whose job is no
+    longer genuinely running per the ledger, and force-remove them.
+
+    A container is orphaned if its name matches 'ablator-<job_id>' and the
+    ledger entry for that job_id is missing or not status=='running'. (A
+    'running' job might legitimately still be claimed-and-supervised by
+    THIS OR ANOTHER machine's live runner process — bare-metal job ids are
+    unique across the queue so name collisions across machines can't
+    happen; leave those alone.) Returns the number of containers reaped.
+    """
+    try:
+        out = subprocess.run(
+            [runtime, "ps", "-a", "--format", "{{.Names}}\t{{.Status}}"],
+            capture_output=True, text=True, timeout=15, check=False,
+        ).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"[ablator] reap_orphaned_containers: {runtime} ps failed: {e!r}",
+              flush=True)
+        return 0
+    by_id = {j["id"]: j for j in q.read()}
+    reaped = 0
+    for line in out.splitlines():
+        parts = line.split("\t", 1)
+        name = parts[0].strip()
+        status = parts[1].strip() if len(parts) > 1 else "?"
+        m = _ABLATOR_CONTAINER_RE.match(name)
+        if not m:
+            continue
+        job_id = m.group("job_id")
+        job = by_id.get(job_id)
+        if job is not None and job.get("status") == "running":
+            continue  # legitimately in flight (this or another machine)
+        print(f"[ablator] REAPER: orphaned container '{name}' (podman status: "
+              f"{status!r}) found, ledger status: "
+              f"{job.get('status') if job else '<no such job>'!r} — force-removing",
+              flush=True)
+        force_remove_container(runtime, name)
+        reaped += 1
+    return reaped
 
 
 def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
