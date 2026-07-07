@@ -152,7 +152,13 @@ def launch(config_path: str | None = None) -> None:
         ]
 
         def on_mount(self) -> None:
-            self.action_show_queue()
+            # push_screen, not switch_screen, for the very first screen --
+            # switch_screen() pops a result callback off the CURRENT top
+            # screen, but at initial mount there's only the App's implicit
+            # default screen, which was never push_screen()'d and so has
+            # no result callback to pop (IndexError: pop from empty list).
+            # Found live via a headless run_test() smoke test.
+            self.push_screen(QueueScreen())
 
         def action_show_queue(self) -> None:
             self.switch_screen(QueueScreen())
