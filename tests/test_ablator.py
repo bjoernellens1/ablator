@@ -1,6 +1,8 @@
 """CPU-only tests for ablator (spec expansion, queue, resources, templates)."""
 import json
 import os
+import threading
+import time
 
 import pytest
 
@@ -636,3 +638,149 @@ def test_pause_cli_requires_machine_arg(tmp_path):
     cfg = make_cfg(tmp_path)
     with pytest.raises(SystemExit):
         cli.cmd_pause(cfg, None)
+
+
+# --------------------------------------------------- concurrent k8s dispatch
+
+def make_k8s_cfg(tmp_path, max_concurrent=2):
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    cfg["machines"]["a100cluster"] = {"backend": "k8s",
+                                      "max_concurrent": max_concurrent}
+    return cfg
+
+
+def _k8s_jobs(n, prefix="kjob"):
+    return [{"id": f"{prefix}{i}", "machine": "a100cluster", "type": "replay",
+            "scene": "/s", "model_path": f"m{i}", "status": "pending"}
+           for i in range(n)]
+
+
+def test_k8s_jobs_dispatched_concurrently_up_to_cap(tmp_path, monkeypatch):
+    """Multiple k8s-targeted jobs run overlapping in time, not serially."""
+    cfg = make_k8s_cfg(tmp_path, max_concurrent=3)
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, _k8s_jobs(3))
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+
+    lock = threading.Lock()
+    state = {"concurrent": 0, "max_concurrent": 0}
+
+    def fake_run_job_k8s(cfg, job, machine, mcfg, q=None):
+        with lock:
+            state["concurrent"] += 1
+            state["max_concurrent"] = max(state["max_concurrent"], state["concurrent"])
+        time.sleep(0.2)
+        with lock:
+            state["concurrent"] -= 1
+        return "done", 0
+
+    monkeypatch.setattr(runner, "run_job_k8s", fake_run_job_k8s)
+    runner.run_loop(cfg, once=True)
+
+    # The real assertion is about overlap in run_job_k8s calls, not overall
+    # wall-clock (three threads finishing ~simultaneously then all racing
+    # for the queue file's flock to record "done" adds its own — unrelated
+    # — contention overhead on top of the concurrent dispatch itself).
+    assert state["max_concurrent"] >= 2, "jobs never overlapped in time"
+    jobs = read_queue(q.path)
+    assert all(j["status"] == "done" for j in jobs)
+
+
+def test_bare_metal_job_not_blocked_by_inflight_k8s(tmp_path, monkeypatch):
+    """A bare-metal job must be claimed/run promptly even while a slow k8s
+    job is in flight — the bare-metal path must never wait on it."""
+    cfg = make_k8s_cfg(tmp_path, max_concurrent=2)
+    cfg["types"]["replay"] = {"cwd": str(tmp_path), "command": ["true"]}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, _k8s_jobs(1) + [
+        {"id": "baremetal1", "machine": "any", "type": "replay",
+         "scene": "/s", "model_path": "m", "status": "pending"},
+    ])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+
+    bare_metal_started_at = {}
+
+    def fake_run_job_k8s(cfg, job, machine, mcfg, q=None):
+        time.sleep(0.3)
+        return "done", 0
+
+    real_run_job = runner.run_job
+
+    def spying_run_job(cfg, job, machine, q=None):
+        if job["id"] == "baremetal1":
+            bare_metal_started_at["t"] = time.monotonic()
+        return real_run_job(cfg, job, machine, q)
+
+    monkeypatch.setattr(runner, "run_job_k8s", fake_run_job_k8s)
+    monkeypatch.setattr(runner, "run_job", spying_run_job)
+    t0 = time.monotonic()
+    runner.run_loop(cfg, once=True)
+
+    assert "t" in bare_metal_started_at
+    # The bare-metal job must have started almost immediately, well before
+    # the 0.3s the k8s job takes to "finish" in the background.
+    assert bare_metal_started_at["t"] - t0 < 0.15
+    jobs = {j["id"]: j for j in read_queue(q.path)}
+    assert jobs["baremetal1"]["status"] == "done"
+    assert jobs["kjob0"]["status"] == "done"  # join_all() waits before once=True returns
+
+
+def test_k8s_concurrency_cap_respected_and_resumes(tmp_path, monkeypatch):
+    """Only `max_concurrent` k8s jobs are claimed per pass; the remainder
+    stays pending and is picked up once slots free on the next pass."""
+    cfg = make_k8s_cfg(tmp_path, max_concurrent=2)
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, _k8s_jobs(3))
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+
+    seen_concurrent = []
+    lock = threading.Lock()
+    state = {"concurrent": 0}
+
+    def fake_run_job_k8s(cfg, job, machine, mcfg, q=None):
+        with lock:
+            state["concurrent"] += 1
+            seen_concurrent.append(state["concurrent"])
+        time.sleep(0.1)
+        with lock:
+            state["concurrent"] -= 1
+        return "done", 0
+
+    monkeypatch.setattr(runner, "run_job_k8s", fake_run_job_k8s)
+    # once=True joins in-flight threads before returning, so a single pass
+    # only ever claims up to the cap (2 of the 3 pending jobs); the 3rd is
+    # picked up by dispatching once more.
+    runner.run_loop(cfg, once=True)
+    assert max(seen_concurrent) <= 2
+    jobs = read_queue(q.path)
+    done = [j for j in jobs if j["status"] == "done"]
+    pending = [j for j in jobs if j["status"] == "pending"]
+    assert len(done) == 2
+    assert len(pending) == 1
+
+    runner.run_loop(cfg, once=True)  # resumes: claims the remaining job
+    jobs = read_queue(q.path)
+    assert all(j["status"] == "done" for j in jobs)
+
+
+def test_concurrent_k8s_job_failure_bookkeeping(tmp_path, monkeypatch):
+    """A concurrently-dispatched k8s job that fails still goes through the
+    normal retry-once-then-quarantine disposition logic."""
+    cfg = make_k8s_cfg(tmp_path, max_concurrent=2)
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, _k8s_jobs(1))
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+
+    def fake_run_job_k8s(cfg, job, machine, mcfg, q=None):
+        return "failed", 1
+
+    monkeypatch.setattr(runner, "run_job_k8s", fake_run_job_k8s)
+    runner.run_loop(cfg, once=True)
+    jobs = read_queue(q.path)
+    assert jobs[0]["status"] == "quarantined"
+    assert jobs[0]["retried"] is True

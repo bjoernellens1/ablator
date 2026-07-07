@@ -21,6 +21,7 @@ import re
 import shlex
 import signal
 import subprocess
+import threading
 import time
 
 from . import config as cfgmod
@@ -687,6 +688,116 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
                     reconciled_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
 
 
+DEFAULT_K8S_MAX_CONCURRENT = 4
+
+
+def _k8s_max_concurrent(cfg: dict, k8s_name: str) -> int:
+    """Concurrency cap for a k8s-backend dispatch machine.
+
+    KAI Scheduler already queues excess Jobs beyond real cluster capacity on
+    the cluster side, so a slightly-too-high cap here is not dangerous — it
+    just means some submitted Jobs sit Pending in kubectl until a GPU frees
+    up. Defaults conservatively (not "all 8 GPUs are free") since ablator
+    has no visibility into what else might be using the cluster.
+    """
+    mcfg = cfgmod.machine_cfg(cfg, k8s_name)
+    try:
+        return max(1, int(mcfg.get("max_concurrent", DEFAULT_K8S_MAX_CONCURRENT)))
+    except (TypeError, ValueError):
+        return DEFAULT_K8S_MAX_CONCURRENT
+
+
+def _dispatch_and_finalize(cfg: dict, machine: str, job: dict, job_machine: str,
+                           q: Queue) -> str:
+    """Run one job to completion and apply the full success/failure/retry/
+    quarantine/preempt/requeue bookkeeping.
+
+    Shared by the serial bare-metal path and each concurrent k8s dispatch
+    thread in run_loop() — every job, regardless of which machine it targets
+    or whether it runs synchronously or on a background thread, goes through
+    exactly this same disposition logic.
+    """
+    base_dir = _job_base_dir(cfg, job, job_machine)
+    status, exit_code = run_job(cfg, job, job_machine, q)
+    if status == "failed":
+        disposition = handle_failure(cfg, job, exit_code, job_machine, base_dir, q)
+        if disposition == "retry":
+            # unknown category: preserve existing uniform
+            # retry-once-then-quarantine behavior.
+            if not job.get("retried"):
+                job["retried"] = True
+                q.update(job["id"], retried=True)
+                print(f"[ablator] retrying {job['id']} once", flush=True)
+                status, exit_code = run_job(cfg, job, job_machine, q)
+                if status == "failed":
+                    classify_and_record(cfg, job, exit_code, base_dir, q)
+                    status = "quarantined"
+            else:
+                status = "quarantined"
+        elif disposition == "pending":
+            status = "pending"  # already persisted by handle_failure
+        else:
+            status = disposition  # paused_disk_full | quarantined
+    if status == "preempted":
+        # lane-1 job yielded to a lane-3 job: back to pending with the
+        # anti-thrash bookkeeping; the loop claims the lane-3 job next
+        q.update(job["id"], status="pending", health=None,
+                 claimed_by=None, claimed_at=None,
+                 preempt_count=int(job.get("preempt_count", 0)) + 1,
+                 last_preempt_at=time.time())
+    elif status == "requeue":
+        # manual requeue: back to pending, clear claim/health so any
+        # runner (including this one) can retake it fresh
+        q.update(job["id"], status="pending", health=None,
+                 claimed_by=None, claimed_at=None)
+    elif status in ("pending", "paused_disk_full"):
+        pass  # handle_failure() already persisted this status
+    else:
+        if status == "failed_no_retry":  # manual stop: never retried
+            status = "failed"
+        q.finish(job["id"], status)
+    print(f"[ablator] {job['id']} -> {status}", flush=True)
+    return status
+
+
+class _K8sInflight:
+    """Tracks concurrently-dispatched k8s job threads, keyed by k8s machine
+    name, so run_loop can cap concurrency per machine and report a live
+    count in the heartbeat.
+
+    Only ever touched from the main run_loop thread (append when spawning,
+    reap when a thread finishes) — no locking needed for the bookkeeping
+    dict itself, only the Queue file operations inside each thread need
+    (and already have, via flock) their own synchronization.
+    """
+
+    def __init__(self):
+        self._threads: dict[str, list[tuple[threading.Thread, str]]] = {}
+
+    def reap(self) -> None:
+        for name, entries in list(self._threads.items()):
+            alive = [(t, jid) for t, jid in entries if t.is_alive()]
+            if alive:
+                self._threads[name] = alive
+            else:
+                del self._threads[name]
+
+    def count(self, name: str) -> int:
+        return len(self._threads.get(name, []))
+
+    def total(self) -> int:
+        return sum(len(v) for v in self._threads.values())
+
+    def add(self, name: str, thread: threading.Thread, job_id: str) -> None:
+        self._threads.setdefault(name, []).append((thread, job_id))
+
+    def join_all(self) -> None:
+        for entries in self._threads.values():
+            for t, _jid in entries:
+                t.join()
+        self._threads.clear()
+
+
 def run_loop(cfg: dict, once: bool = False) -> None:
     machine = cfgmod.machine_name(cfg)
     q = Queue(cfgmod.queue_path(cfg))
@@ -698,21 +809,38 @@ def run_loop(cfg: dict, once: bool = False) -> None:
     # kubectl (run_job_k8s), on top of claiming its own bare-metal identity's
     # jobs. This is safe to do from every runner (kubectl apply/get are
     # idempotent-ish and Queue.claim_next's file lock already serializes
-    # claims across machines), so no extra "dispatcher" config is needed.
-    dispatch_machines = [machine] + [
+    # claims across machines — flock is per-open-file-description, so it
+    # serializes correctly across threads within this same process too, not
+    # just across separate processes/machines), so no extra "dispatcher"
+    # config is needed.
+    #
+    # Bare-metal dispatch (this runner's own `machine` identity) stays
+    # exactly as serial as before: one job claimed and run to completion per
+    # loop iteration, blocking. k8s-targeted jobs are different: KAI
+    # Scheduler and the cluster's real GPUs provide the actual parallelism,
+    # so this loop must not be the bottleneck — each claimed k8s job is
+    # dispatched via run_job_k8s (through _dispatch_and_finalize) on its own
+    # background thread, up to a configurable per-machine concurrency cap,
+    # so multiple cluster jobs can be in flight at once without blocking
+    # bare-metal claiming/dispatch.
+    k8s_machines = [
         name for name, m in cfg.get("machines", {}).items()
         if m.get("backend") == "k8s"
     ]
+    dispatch_machines = [machine] + k8s_machines
     print(f"[ablator] runner on {machine} watching {q.path} "
           f"(dispatching for: {', '.join(dispatch_machines)})", flush=True)
     reconcile_stale_running(cfg, machine, q)
-    for k8s_name in dispatch_machines[1:]:
+    for k8s_name in k8s_machines:
         reconcile_stale_running(cfg, k8s_name, q, busy=False)
+    inflight = _K8sInflight()
     last_tick = time.monotonic()
     while True:
         # Watchdog: if the previous iteration (probes + sleeps, NOT a job
         # run) took absurdly long, say so loudly — this is the 'stuck loop'
-        # tell.
+        # tell. Background k8s threads run their own blocking polls, so a
+        # long-running k8s job never shows up here (it doesn't hold up the
+        # main loop's own tick).
         now = time.monotonic()
         if now - last_tick > STALL_WARN_S:
             print(f"[ablator] WARNING: loop iteration took {now - last_tick:.0f}s "
@@ -720,69 +848,56 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                   flush=True)
         last_tick = now
         try:
+            inflight.reap()
             if resources.machine_busy(cfg, machine):
-                write_heartbeat(cfg, machine, "busy-wait")
+                write_heartbeat(cfg, machine,
+                                f"busy-wait k8s_inflight={inflight.total()}")
                 if once:
+                    inflight.join_all()
                     return
                 time.sleep(BUSY_POLL_S)
                 continue
-            write_heartbeat(cfg, machine, "idle")
-            job = None
-            job_machine = machine
-            for cand in dispatch_machines:
-                job = q.claim_next(cand, can_run=make_can_run(cfg, cand))
-                if job is not None:
-                    job_machine = cand
-                    break
+            write_heartbeat(cfg, machine, f"idle k8s_inflight={inflight.total()}")
+
+            # 1. Fill k8s concurrency slots — non-blocking: each claimed job
+            # is handed to a background thread and this loop moves straight
+            # on to bare-metal claiming below without waiting for it.
+            for k8s_name in k8s_machines:
+                cap = _k8s_max_concurrent(cfg, k8s_name)
+                can_run = make_can_run(cfg, k8s_name)
+                while inflight.count(k8s_name) < cap:
+                    kjob = q.claim_next(k8s_name, can_run=can_run)
+                    if kjob is None:
+                        break
+                    print(f"[ablator] dispatching {kjob['id']} to {k8s_name} "
+                          f"({inflight.count(k8s_name) + 1}/{cap} in flight)",
+                          flush=True)
+                    t = threading.Thread(
+                        target=_dispatch_and_finalize,
+                        args=(cfg, machine, kjob, k8s_name, q),
+                        daemon=True,
+                        name=f"k8s-{kjob['id']}",
+                    )
+                    t.start()
+                    inflight.add(k8s_name, t, kjob["id"])
+
+            # 2. Claim and run (serially, blocking) at most one bare-metal
+            # job for this runner's own identity — unchanged from before.
+            job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
             if job is None:
                 if once:
+                    inflight.join_all()
                     return
                 time.sleep(IDLE_POLL_S)
                 continue
             write_heartbeat(cfg, machine, f"running:{job['id']}")
-            base_dir = _job_base_dir(cfg, job, job_machine)
-            status, exit_code = run_job(cfg, job, job_machine, q)
-            if status == "failed":
-                disposition = handle_failure(cfg, job, exit_code, job_machine, base_dir, q)
-                if disposition == "retry":
-                    # unknown category: preserve existing uniform
-                    # retry-once-then-quarantine behavior.
-                    if not job.get("retried"):
-                        job["retried"] = True
-                        q.update(job["id"], retried=True)
-                        print(f"[ablator] retrying {job['id']} once", flush=True)
-                        status, exit_code = run_job(cfg, job, job_machine, q)
-                        if status == "failed":
-                            classify_and_record(cfg, job, exit_code, base_dir, q)
-                            status = "quarantined"
-                    else:
-                        status = "quarantined"
-                elif disposition == "pending":
-                    status = "pending"  # already persisted by handle_failure
-                else:
-                    status = disposition  # paused_disk_full | quarantined
-            if status == "preempted":
-                # lane-1 job yielded to a lane-3 job: back to pending with the
-                # anti-thrash bookkeeping; the loop claims the lane-3 job next
-                q.update(job["id"], status="pending", health=None,
-                         claimed_by=None, claimed_at=None,
-                         preempt_count=int(job.get("preempt_count", 0)) + 1,
-                         last_preempt_at=time.time())
-            elif status == "requeue":
-                # manual requeue: back to pending, clear claim/health so any
-                # runner (including this one) can retake it fresh
-                q.update(job["id"], status="pending", health=None,
-                         claimed_by=None, claimed_at=None)
-            elif status in ("pending", "paused_disk_full"):
-                pass  # handle_failure() already persisted this status
-            else:
-                if status == "failed_no_retry":  # manual stop: never retried
-                    status = "failed"
-                q.finish(job["id"], status)
-            write_heartbeat(cfg, machine, f"finished:{job['id']}:{status}")
+            status = _dispatch_and_finalize(cfg, machine, job, machine, q)
+            write_heartbeat(cfg, machine,
+                            f"finished:{job['id']}:{status} "
+                            f"k8s_inflight={inflight.total()}")
             last_tick = time.monotonic()  # job runs are legitimately long
-            print(f"[ablator] {job['id']} -> {status}", flush=True)
             if once:
+                inflight.join_all()
                 return
         except Exception as e:
             import traceback
