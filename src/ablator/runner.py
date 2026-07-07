@@ -72,12 +72,48 @@ def _infer_tum_sequence(scene: str, extra_args: str) -> str:
     return extra_args
 
 
+_CHKPT_RE = re.compile(r"chkpnt(\d+)\.pth$")
+
+
+def find_latest_checkpoint(model_path: str, base_dir: str) -> tuple[str, int] | None:
+    """Return (path, iteration) of the highest-iteration chkpntN.pth under a
+    job's model_path, or None if none exists.
+
+    Used both to decide whether a failed job is resumable (handle_failure)
+    and to thread ``--start_checkpoint`` into a requeued job's command
+    (_job_vars). Splatograph writes checkpoints via a temp-file + os.replace
+    atomic rename (train.py / train_streaming.py), so any chkpntN.pth that
+    exists here is guaranteed to be a complete, loadable file — never a
+    truncated one from a SIGKILL mid-write.
+    """
+    mp = healthmod.resolve_model_path(model_path, base_dir)
+    if not mp or not os.path.isdir(mp):
+        return None
+    best: tuple[str, int] | None = None
+    try:
+        for fn in os.listdir(mp):
+            m = _CHKPT_RE.match(fn)
+            if m:
+                it = int(m.group(1))
+                if best is None or it > best[1]:
+                    best = (os.path.join(mp, fn), it)
+    except OSError:
+        return None
+    return best
+
+
 def _job_vars(job: dict, machine: str) -> dict:
     scene = job.get("scene", "")
+    extra_args = _infer_tum_sequence(scene, job.get("extra_args", ""))
+    resume_checkpoint = job.get("resume_checkpoint")
+    if resume_checkpoint and "--start_checkpoint" not in extra_args:
+        # Threaded in by handle_failure() when a preempted/crashed job has a
+        # resumable checkpoint on durable (NFS-backed) storage — see there.
+        extra_args = f"{extra_args} --start_checkpoint {resume_checkpoint}".strip()
     return {
         "scene": scene,
         "model_path": job.get("model_path", ""),
-        "extra_args": _infer_tum_sequence(scene, job.get("extra_args", "")),
+        "extra_args": extra_args,
         "iterations": str(job.get("iterations", "")),
         "id": job.get("id", ""),
         "machine": machine,
@@ -322,7 +358,41 @@ def handle_failure(cfg: dict, job: dict, exit_code: int | None, machine: str,
     with not_before/needs_review bookkeeping already applied via q.update),
     or "retry" (caller should retry once, existing uniform behavior for
     'unknown').
+
+    Preemption-aware resume: rather than trying to definitively distinguish
+    "was this SIGTERM'd by KAI Scheduler preemption" from "did this crash",
+    which the k8s poll loop cannot reliably tell apart (see
+    build_k8s_job_manifest/_poll_k8s_job — no pod-eviction-reason inspection
+    today), we use a strictly simpler and more robust rule: if a resumable
+    checkpoint exists AND it represents real progress beyond the last resume
+    attempt, resume from it — regardless of why the job died. Either way
+    (preemption or a transient crash after checkpointing) resuming is the
+    right action; re-running from scratch is not. The progress-guard (only
+    resume if checkpoint iteration advanced past job["last_resumed_iter"])
+    prevents infinite resume->immediate-crash->resume loops for jobs with a
+    genuine, reproducible bug that happens to occur just after a checkpoint.
     """
+    ckpt = find_latest_checkpoint(job.get("model_path", ""), base_dir)
+    if ckpt is not None:
+        ckpt_path, ckpt_iter = ckpt
+        last_resumed = job.get("last_resumed_iter")
+        if last_resumed is None or ckpt_iter > last_resumed:
+            print(f"[ablator] {job['id']}: resumable checkpoint at iter={ckpt_iter} "
+                  f"(prior resume point: {last_resumed}) — requeuing with "
+                  f"--start_checkpoint {ckpt_path} instead of restarting from scratch",
+                  flush=True)
+            q.update(job["id"], status="pending", health=None,
+                    claimed_by=None, claimed_at=None,
+                    last_resumed_iter=ckpt_iter, resume_checkpoint=ckpt_path,
+                    error_category="resumable_from_checkpoint",
+                    suggested_action="resume_from_checkpoint")
+            job["last_resumed_iter"] = ckpt_iter
+            job["resume_checkpoint"] = ckpt_path
+            return "pending"
+        print(f"[ablator] {job['id']}: checkpoint exists (iter={ckpt_iter}) but did not "
+              f"advance past the last resume point ({last_resumed}) — treating as a real, "
+              "reproducible failure rather than looping resume attempts.", flush=True)
+
     result = classify_and_record(cfg, job, exit_code, base_dir, q)
     category = result["category"]
     action = result["suggested_action"]
@@ -419,6 +489,18 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                 "spec": {
                     "schedulerName": "kai-scheduler",
                     "priorityClassName": mcfg["priority_class"],
+                    # KAI Scheduler preempts kai-batch-low (lowest priority) pods
+                    # for any higher-priority queue at any time via SIGTERM, then
+                    # SIGKILL after this many seconds. splatograph's SIGTERM
+                    # handler (train.py / train_streaming.py) writes an emergency
+                    # checkpoint SYNCHRONOUSLY before exiting -- anchor this to
+                    # AsyncSaveWorker's own 120s shutdown-join timeout plus margin
+                    # for the synchronous capture()+torch.save() itself, rather
+                    # than k8s's 30s default (too short: SIGKILL would truncate
+                    # the save via os.replace's rename never completing, losing
+                    # the resume point).
+                    "terminationGracePeriodSeconds":
+                        mcfg.get("termination_grace_period_s", 150),
                     "restartPolicy": "Never",
                     "imagePullSecrets": [{"name": mcfg["image_pull_secret"]}],
                     "containers": [{
