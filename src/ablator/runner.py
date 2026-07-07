@@ -710,7 +710,23 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     name = _k8s_job_name(job["id"])
     scene = job.get("scene", "")
     persistent_root = "/mnt/cps_persistent1_shared"
-    sub_path = scene[len(persistent_root):].lstrip("/") if scene.startswith(persistent_root) else ""
+    scratch_root = "/mnt/cps_scratch1_tmp"
+    # Datasets can live under EITHER shared mount (e.g. TUM/floor3 under
+    # persistent, ScanNet++'s cache under scratch) -- the "dataset" volume
+    # must subPath into whichever PVC actually contains the scene, not
+    # always pvc_persistent. Found live: a ScanNet++ job silently mounted
+    # pvc_persistent's ROOT at /data/scene (empty subPath, since the scene
+    # path didn't match persistent_root at all) and crashed with "No
+    # supported RGB-D dataset layout found" -- not a training-code bug.
+    if scene.startswith(persistent_root):
+        dataset_pvc = mcfg["pvc_persistent"]
+        sub_path = scene[len(persistent_root):].lstrip("/")
+    elif scene.startswith(scratch_root):
+        dataset_pvc = mcfg["pvc_scratch"]
+        sub_path = scene[len(scratch_root):].lstrip("/")
+    else:
+        dataset_pvc = mcfg["pvc_persistent"]
+        sub_path = ""
     git_sync_repo_url = mcfg.get("git_sync_repo_url")
     git_sync_enabled = bool(git_sync_repo_url)
     trainer_volume_mounts = [
@@ -720,7 +736,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     ]
     volumes = [
         {"name": "dataset",
-         "persistentVolumeClaim": {"claimName": mcfg["pvc_persistent"],
+         "persistentVolumeClaim": {"claimName": dataset_pvc,
                                    "readOnly": True}},
         {"name": "scratch",
          "persistentVolumeClaim": {"claimName": mcfg["pvc_scratch"]}},

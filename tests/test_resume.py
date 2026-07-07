@@ -185,6 +185,51 @@ def test_k8s_manifest_termination_grace_period_overridable():
     assert pod_spec["terminationGracePeriodSeconds"] == 300
 
 
+# -------------------------------- build_k8s_job_manifest: dataset PVC routing
+
+def test_k8s_manifest_dataset_pvc_persistent_root():
+    mcfg = {"namespace": "jupyterhub", "kai_queue": "kai-batch-low",
+           "priority_class": "kai-batch-low", "image_pull_secret": "regcred",
+           "pvc_persistent": "persist-pvc", "pvc_scratch": "scratch-pvc", "image": "img:1"}
+    job = {"id": "j1", "scene": "/mnt/cps_persistent1_shared/peyman/TUM/fr3"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "train.py"], None)
+    volumes = {v["name"]: v for v in manifest["spec"]["template"]["spec"]["volumes"]}
+    assert volumes["dataset"]["persistentVolumeClaim"]["claimName"] == "persist-pvc"
+    mounts = manifest["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+    dataset_mount = next(m for m in mounts if m["name"] == "dataset")
+    assert dataset_mount["subPath"] == "peyman/TUM/fr3"
+
+
+def test_k8s_manifest_dataset_pvc_scratch_root():
+    # Found live: a ScanNet++ scene under /mnt/cps_scratch1_tmp silently
+    # mounted pvc_persistent's ROOT (empty subPath) at /data/scene, since
+    # the scene path never matched persistent_root at all -- crashed with
+    # "No supported RGB-D dataset layout found", not a training-code bug.
+    mcfg = {"namespace": "jupyterhub", "kai_queue": "kai-batch-low",
+           "priority_class": "kai-batch-low", "image_pull_secret": "regcred",
+           "pvc_persistent": "persist-pvc", "pvc_scratch": "scratch-pvc", "image": "img:1"}
+    job = {"id": "j1", "scene": "/mnt/cps_scratch1_tmp/bjoern/scannetpp_cache/8b5caf3398"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "train.py"], None)
+    volumes = {v["name"]: v for v in manifest["spec"]["template"]["spec"]["volumes"]}
+    assert volumes["dataset"]["persistentVolumeClaim"]["claimName"] == "scratch-pvc"
+    mounts = manifest["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+    dataset_mount = next(m for m in mounts if m["name"] == "dataset")
+    assert dataset_mount["subPath"] == "bjoern/scannetpp_cache/8b5caf3398"
+
+
+def test_k8s_manifest_dataset_pvc_unknown_root_falls_back():
+    mcfg = {"namespace": "jupyterhub", "kai_queue": "kai-batch-low",
+           "priority_class": "kai-batch-low", "image_pull_secret": "regcred",
+           "pvc_persistent": "persist-pvc", "pvc_scratch": "scratch-pvc", "image": "img:1"}
+    job = {"id": "j1", "scene": "/some/other/path/scene"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "train.py"], None)
+    volumes = {v["name"]: v for v in manifest["spec"]["template"]["spec"]["volumes"]}
+    assert volumes["dataset"]["persistentVolumeClaim"]["claimName"] == "persist-pvc"
+    mounts = manifest["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+    dataset_mount = next(m for m in mounts if m["name"] == "dataset")
+    assert dataset_mount["subPath"] == ""
+
+
 # --------------------------------------------- build_k8s_job_manifest: git-sync
 
 BASE_MCFG = {"namespace": "jupyterhub", "kai_queue": "kai-batch-low",
