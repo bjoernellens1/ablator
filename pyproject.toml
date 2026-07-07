@@ -12,6 +12,12 @@ license = { text = "MIT" }
 authors = [{ name = "Björn Ellensohn", email = "bjoern.ellensohn@gmail.com" }]
 dependencies = []
 
+[project.optional-dependencies]
+# Only the optional TUI layer (ablator.tui) needs this -- the host runner
+# stays stdlib-only. `pip install ablator[tui]` for `ablator tui`/bare
+# `ablator` on a TTY.
+tui = ["textual>=0.60"]
+
 [project.scripts]
 ablator = "ablator.cli:main"
 

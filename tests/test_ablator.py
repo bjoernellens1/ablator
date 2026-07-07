@@ -466,6 +466,46 @@ def test_example_config_parses_and_renders(tmp_path):
     assert env["TRAIN_EXTRA_ARGS"].endswith("--streaming_report_final")
 
 
+def test_pytorch_generic_example_config_parses_and_builds_k8s_manifest(tmp_path):
+    """examples/pytorch-generic.toml proves the k8s dispatch path is
+    workload-agnostic: an arbitrary PyTorch job (no scene/opacity_reg/
+    Gaussian-splatting fields anywhere) renders a command and a valid k8s
+    Job manifest through the exact same code path splatograph uses."""
+    pytest.importorskip("tomllib")
+    ex = os.path.join(os.path.dirname(__file__), "..", "examples",
+                      "pytorch-generic.toml")
+    cfg = cfgmod.load_config(ex)
+    mcfg = cfgmod.machine_cfg(cfg, "a100cluster")
+    assert mcfg["backend"] == "k8s"
+
+    job = {"id": "generic_ctrl", "scene": "", "model_path": "output/generic_ctrl",
+          "extra_args": "--lr 0.001", "iterations": 10}
+    tcfg = cfgmod.type_cfg(cfg, "train", "a100cluster")
+    argv, env, cwd = runner.render_command(tcfg, job, "a100cluster")
+    assert argv[:2] == ["python", "train.py"]
+    assert "--lr" in argv and "0.001" in argv
+    assert cwd == "/workspace"
+
+    manifest = runner.build_k8s_job_manifest(mcfg, job, argv, cwd)
+    pod_spec = manifest["spec"]["template"]["spec"]
+    assert manifest["metadata"]["namespace"] == "cps-users"
+    assert manifest["metadata"]["labels"]["kai.scheduler/queue"] == "batch"
+    assert pod_spec["priorityClassName"] == "kai-batch-low"
+    assert pod_spec["schedulerName"] == "kai-scheduler"
+    assert "imagePullSecrets" not in pod_spec  # public image, none configured
+    assert pod_spec["containers"][0]["resources"]["limits"]["nvidia.com/gpu"] == "1"
+    volume_names = {v["name"] for v in pod_spec["volumes"]}
+    assert volume_names == {"checkpoints"}  # extra_volumes only, no dataset/scratch PVC
+
+    # Dispatcher-identity pitfall: this runner's own resolved identity must
+    # be the bare-metal "local" fallback, NOT "a100cluster" itself -- if it
+    # resolved to the k8s machine, jobs pinned to a100cluster would be
+    # claimed through the serial bare-metal path instead of run_loop's
+    # concurrent, thread-pooled k8s dispatch (see [machines.local]'s
+    # comment in the example config).
+    assert cfgmod.machine_name(cfg, hostname="some-random-laptop") == "local"
+
+
 # --------------------------------------------------------------- progress
 
 def test_parse_progress_last_counter_wins():

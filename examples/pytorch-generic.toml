@@ -1,0 +1,77 @@
+# Example ablator config for an arbitrary PyTorch training job dispatched
+# to the CPS GPU cluster (K3s, NVIDIA GPU Operator, KAI Scheduler) as a
+# Kubernetes Job -- no Gaussian-splatting/scene-specific fields anywhere.
+#
+# Install at ~/.config/ablator/config.toml (or pass --config explicitly).
+# See docs/cluster-setup.md for the full walkthrough (Rancher access,
+# kubeconfig, kubectl install, running your first job).
+
+[queue]
+# Any path on a filesystem you can read/write from wherever you run
+# `ablator plan`/`status`/`collect` -- does NOT need to be reachable from
+# inside the cluster, since k8s dispatch only needs `kubectl` on this host.
+path = "/home/YOURUSER/ablator/queue/queue.jsonl"
+model_path_template = "output/{name}_{arm}"
+result_glob = "{model_path}/report.json"
+
+# ------------------------------------------------------------------ machines
+
+# This is the DISPATCHER identity: whichever host you actually run
+# `ablator run`/`ablator start` on (your own laptop/workstation) resolves
+# to "local" (hostname_patterns = ["*"] is the fallback identity, matching
+# every host -- see examples/splatograph.toml's "main" for the same
+# pattern). It has no backend/image/etc. of its own; it exists purely so
+# machine_name() resolves to a bare-metal dispatcher, NOT to a100cluster
+# itself. This matters: if a100cluster were the ONLY [machines.*] entry,
+# it would also become the runner's own identity (the sole fallback), and
+# jobs pinned to it would then be claimed through the serial,
+# one-at-a-time bare-metal claim path instead of the concurrent,
+# thread-pooled k8s dispatch path used below -- silently serializing what
+# should run concurrently up to `k8s_max_concurrent`.
+[machines.local]
+hostname_patterns = ["*"]
+
+[machines.a100cluster]
+# No hostname_patterns -- this "machine" is a pure k8s dispatch TARGET,
+# never this runner's own identity (see comment on `local` above). Jobs
+# are routed here explicitly via `machine = "a100cluster"` in the spec.
+backend = "k8s"
+namespace = "cps-users"
+kai_queue = "batch"                  # KAI Queue CRD name (see queues.yaml)
+priority_class = "kai-batch-low"     # lowest, preemptible priority class
+# scheduler_name defaults to "kai-scheduler" -- this cluster's scheduler.
+gpu_count = 1
+image = "docker.io/pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"
+# image_pull_secret is optional; omit entirely for a public image like
+# this one. Set it if your training image lives on a private registry:
+# image_pull_secret = "my-registry-pull-secret"
+
+# Optional: mount a shared PVC for datasets/checkpoints. Ask the cluster
+# admin for the actual PVC name in the cps-users namespace, or create your
+# own (e.g. backed by the `longhorn` StorageClass).
+extra_volumes = [
+  { name = "checkpoints", claim_name = "my-checkpoints-pvc", mount_path = "/mnt/checkpoints" },
+]
+
+# machine_name() has no non-k8s fallback in this example config -- if you
+# ALSO run bare-metal jobs, add a [machines.<name>] entry with
+# hostname_patterns = ["*"] as the fallback identity (see
+# examples/splatograph.toml).
+
+# ------------------------------------------------------------- type: train
+# One generic job "type": run an arbitrary training script inside the
+# configured container image. `command`/`image`/`args` are entirely
+# user-defined -- nothing here assumes any specific dataset shape,
+# hyperparameter, or workload.
+
+[types.train]
+cwd = "/workspace"
+command = [
+  "python", "train.py",
+  "--epochs", "{iterations}",
+  "--output-dir", "{model_path}",
+  "{extra_args}",
+]
+
+[types.train.env]
+PYTHONUNBUFFERED = "1"

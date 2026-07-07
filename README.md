@@ -128,6 +128,17 @@ fires. Per-job logs land in `<log_dir>/<job id>.log`.
    each remote, skipping machines where one is already running. Logs:
    `<log_dir>/runner_<machine>.log`.
 
+## Kubernetes dispatch
+
+A `[machines.<name>]` entry with `backend = "k8s"` dispatches jobs as
+Kubernetes `Job`s instead of local `podman`/`docker run` (submitted via
+`kubectl apply`, polled via `kubectl get`) — same command-template
+mechanism, same queue semantics, just a different execution backend. See
+`examples/pytorch-generic.toml` for a plain, non-splatting PyTorch config,
+and `docs/cluster-setup.md` for a full walkthrough (Rancher access,
+kubeconfig, kubectl, running a job) against the CPS GPU cluster
+specifically.
+
 ## Tests
 
 ```bash

@@ -6,6 +6,7 @@ import argparse
 import glob
 import json
 import os
+import sys
 import time
 
 from . import config as cfgmod
@@ -430,7 +431,13 @@ def main(argv: list[str] | None = None) -> None:
         description="Cross-machine ablation queue orchestrator (stdlib-only).")
     p.add_argument("--config", help="config file (TOML/JSON); default "
                    "$ABLATOR_CONFIG or ~/.config/ablator/config.toml")
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # Not required: a bare `ablator` with no subcommand, on an interactive
+    # TTY, launches the TUI (guided config setup first, if none exists
+    # yet). Non-interactive invocations (scripts/cron/no TTY) with no
+    # subcommand still get argparse's usual "the following arguments are
+    # required" error below -- the TUI is never forced on a headless
+    # caller.
+    sub = p.add_subparsers(dest="cmd", required=False)
 
     sp = sub.add_parser("plan", help="expand a spec JSON into queue jobs")
     sp.add_argument("spec")
@@ -469,8 +476,21 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("machine")
     sp = sub.add_parser("unpause", help="clear a machine-level pause flag")
     sp.add_argument("machine")
+    sub.add_parser("tui", help="launch the k9s-style TUI (guided setup on "
+                   "first run; needs `pip install ablator[tui]`)")
 
     a = p.parse_args(argv)
+
+    if a.cmd in (None, "tui"):
+        if a.cmd is None and not sys.stdin.isatty():
+            # No subcommand AND no TTY: never silently fall into the TUI
+            # for a scripted/headless caller -- fail the same way argparse
+            # would have with required=True.
+            p.error("the following arguments are required: cmd")
+        from .tui.app import launch  # deferred: only this path needs textual
+        launch(a.config)
+        return
+
     cfg = cfgmod.load_config(a.config)
     if a.cmd == "plan":
         cmd_plan(cfg, a.spec, dry_run=a.dry_run)

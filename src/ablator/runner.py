@@ -696,13 +696,38 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                           cwd: str | None, local_commit: str | None = None) -> dict:
     """Build the Job manifest dict for one job on a k8s-backend machine.
 
-    Mounts: `pvc_persistent` (read-only, subPath'd to the job's real dataset
-    directory so the in-container "/data/scene" path used by the rendered
-    command template resolves correctly) and `pvc_scratch` (read-write, at
-    the SAME absolute path bare-metal machines use, /mnt/cps_scratch1_tmp --
-    so the command's own `ln -sfn .../output output/scratch` step, and
-    ablator's own status/collect reading the shared queue.jsonl under that
-    same tree, both work identically to a bare-metal job).
+    Workload-agnostic: nothing here assumes Gaussian-splatting specifically.
+    All cluster/scheduling/mount specifics are config-driven via `mcfg`, with
+    defaults chosen to keep every existing splatograph-style config
+    byte-identical to pre-generalization behavior:
+
+    - `scheduler_name` (default "kai-scheduler"), `kai_queue`, `priority_class`
+      are plain mcfg fields -- different chair users/teams point these at
+      different KAI queues/priority classes without touching this code.
+    - `pvc_persistent` / `pvc_scratch` are both OPTIONAL now. If neither is
+      set, no dataset/scratch volumes are mounted at all (a plain PyTorch
+      job with no shared-dataset PVC need not configure them). If either is
+      set, the "dataset"/"scratch" volumes below are built as before.
+    - `dataset_mount_path` (default "/data/scene", the splatograph
+      convention) and `persistent_mount_root` / `scratch_mount_root`
+      (default "/mnt/cps_persistent1_shared" / "/mnt/cps_scratch1_tmp") are
+      now config fields, not hardcoded constants, so a generic job can route
+      its own dataset layout/mount path instead of splatograph's.
+    - `image_pull_secret` is optional; omitted -> no `imagePullSecrets` (a
+      public image needs none).
+    - `cpu_request`/`memory_request`/`cpu_limit`/`memory_limit` are
+      overridable (defaults match the prior hardcoded 4/16Gi/8/32Gi).
+    - `extra_volumes`: optional list of
+      `{"name", "claim_name", "mount_path", "read_only"}` dicts for mounting
+      any additional PVC (e.g. a shared checkpoint volume) generically.
+
+    Mounts (when configured): `pvc_persistent` (read-only, subPath'd to the
+    job's real dataset directory so the in-container dataset mount path used
+    by the rendered command template resolves correctly) and `pvc_scratch`
+    (read-write, at the SAME absolute path bare-metal machines use -- so the
+    command's own `ln -sfn .../output output/scratch` step, and ablator's own
+    status/collect reading the shared queue.jsonl under that same tree, both
+    work identically to a bare-metal job).
 
     Git-sync init container (OPT-IN, gated on `git_sync_repo_url` being set
     in mcfg -- absent by default, so this is a no-op / byte-identical
@@ -741,41 +766,64 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     """
     name = _k8s_job_name(job["id"])
     scene = job.get("scene", "")
-    persistent_root = "/mnt/cps_persistent1_shared"
-    scratch_root = "/mnt/cps_scratch1_tmp"
-    # Datasets can live under EITHER shared mount (e.g. TUM/floor3 under
-    # persistent, ScanNet++'s cache under scratch) -- the "dataset" volume
-    # must subPath into whichever PVC actually contains the scene, not
-    # always pvc_persistent. Found live: a ScanNet++ job silently mounted
-    # pvc_persistent's ROOT at /data/scene (empty subPath, since the scene
-    # path didn't match persistent_root at all) and crashed with "No
-    # supported RGB-D dataset layout found" -- not a training-code bug.
-    if scene.startswith(persistent_root):
-        dataset_pvc = mcfg["pvc_persistent"]
-        sub_path = scene[len(persistent_root):].lstrip("/")
-    elif scene.startswith(scratch_root):
-        dataset_pvc = mcfg["pvc_scratch"]
-        sub_path = scene[len(scratch_root):].lstrip("/")
-    else:
-        dataset_pvc = mcfg["pvc_persistent"]
-        sub_path = ""
+    persistent_root = mcfg.get("persistent_mount_root", "/mnt/cps_persistent1_shared")
+    scratch_root = mcfg.get("scratch_mount_root", "/mnt/cps_scratch1_tmp")
+    dataset_mount_path = mcfg.get("dataset_mount_path", "/data/scene")
+    has_persistent_pvc = "pvc_persistent" in mcfg
+    has_scratch_pvc = "pvc_scratch" in mcfg
+    trainer_volume_mounts: list[dict] = []
+    volumes: list[dict] = []
+    if has_persistent_pvc or has_scratch_pvc:
+        # Datasets can live under EITHER shared mount (e.g. TUM/floor3 under
+        # persistent, ScanNet++'s cache under scratch) -- the "dataset"
+        # volume must subPath into whichever PVC actually contains the
+        # scene, not always pvc_persistent. Found live: a ScanNet++ job
+        # silently mounted pvc_persistent's ROOT at /data/scene (empty
+        # subPath, since the scene path didn't match persistent_root at
+        # all) and crashed with "No supported RGB-D dataset layout found"
+        # -- not a training-code bug.
+        if scene.startswith(persistent_root) and has_persistent_pvc:
+            dataset_pvc = mcfg["pvc_persistent"]
+            sub_path = scene[len(persistent_root):].lstrip("/")
+        elif scene.startswith(scratch_root) and has_scratch_pvc:
+            dataset_pvc = mcfg["pvc_scratch"]
+            sub_path = scene[len(scratch_root):].lstrip("/")
+        else:
+            dataset_pvc = mcfg.get("pvc_persistent") or mcfg.get("pvc_scratch")
+            sub_path = ""
+        trainer_volume_mounts.append(
+            {"name": "dataset", "mountPath": dataset_mount_path,
+             "subPath": sub_path, "readOnly": True})
+        volumes.append(
+            {"name": "dataset",
+             "persistentVolumeClaim": {"claimName": dataset_pvc, "readOnly": True}})
+    if has_scratch_pvc:
+        trainer_volume_mounts.append(
+            {"name": "scratch", "mountPath": scratch_root})
+        volumes.append(
+            {"name": "scratch",
+             "persistentVolumeClaim": {"claimName": mcfg["pvc_scratch"]}})
+    # Generic extra PVC mounts (checkpoints, additional shared datasets,
+    # etc.) -- fully config-driven, no assumption about what they're for.
+    for extra in mcfg.get("extra_volumes", []):
+        vol_name = extra["name"]
+        trainer_volume_mounts.append({
+            "name": vol_name,
+            "mountPath": extra["mount_path"],
+            "readOnly": extra.get("read_only", False),
+        })
+        volumes.append({
+            "name": vol_name,
+            "persistentVolumeClaim": {
+                "claimName": extra["claim_name"],
+                "readOnly": extra.get("read_only", False),
+            },
+        })
     git_sync_repo_url = mcfg.get("git_sync_repo_url")
     git_sync_enabled = bool(git_sync_repo_url)
-    trainer_volume_mounts = [
-        {"name": "dataset", "mountPath": "/data/scene",
-         "subPath": sub_path, "readOnly": True},
-        {"name": "scratch", "mountPath": "/mnt/cps_scratch1_tmp"},
-    ]
-    volumes = [
-        {"name": "dataset",
-         "persistentVolumeClaim": {"claimName": dataset_pvc,
-                                   "readOnly": True}},
-        {"name": "scratch",
-         "persistentVolumeClaim": {"claimName": mcfg["pvc_scratch"]}},
-    ]
     init_containers: list[dict] = []
     if git_sync_enabled:
-        workspace_path = cwd or "/workspace/splatograph"
+        workspace_path = cwd or mcfg.get("default_workdir", "/workspace")
         volumes.append({"name": "repo-src", "emptyDir": {}})
         trainer_volume_mounts.append(
             {"name": "repo-src", "mountPath": workspace_path})
@@ -842,7 +890,9 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                 "metadata": {"labels": {"kai.scheduler/queue": mcfg["kai_queue"],
                                         "app": "ablator-job"}},
                 "spec": {
-                    "schedulerName": "kai-scheduler",
+                    # Configurable so a job can target any scheduler; defaults
+                    # to this cluster's KAI Scheduler.
+                    "schedulerName": mcfg.get("scheduler_name", "kai-scheduler"),
                     "priorityClassName": mcfg["priority_class"],
                     # KAI Scheduler preempts kai-batch-low (lowest priority) pods
                     # for any higher-priority queue at any time via SIGTERM, then
@@ -853,11 +903,15 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                     # for the synchronous capture()+torch.save() itself, rather
                     # than k8s's 30s default (too short: SIGKILL would truncate
                     # the save via os.replace's rename never completing, losing
-                    # the resume point).
+                    # the resume point). A generic job with no such graceful-save
+                    # behavior can simply lower this in its own mcfg.
                     "terminationGracePeriodSeconds":
                         mcfg.get("termination_grace_period_s", 150),
                     "restartPolicy": "Never",
-                    "imagePullSecrets": [{"name": mcfg["image_pull_secret"]}],
+                    # Optional: a public image (or one on a registry the
+                    # cluster already trusts) needs no pull secret at all.
+                    **({"imagePullSecrets": [{"name": mcfg["image_pull_secret"]}]}
+                       if mcfg.get("image_pull_secret") else {}),
                     **({"initContainers": init_containers} if init_containers else {}),
                     "containers": [{
                         "name": "trainer",
@@ -868,12 +922,18 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                         # cuda-dev image (fixing a real ModuleNotFoundError) was
                         # ignored by a node that had cached the broken prior build.
                         "imagePullPolicy": "Always",
-                        "workingDir": cwd or "/workspace/splatograph",
+                        "workingDir": cwd or mcfg.get("default_workdir", "/workspace"),
                         "command": argv,
                         "resources": {
-                            "requests": {"cpu": "4", "memory": "16Gi"},
-                            "limits": {"cpu": "8", "memory": "32Gi",
-                                      "nvidia.com/gpu": str(mcfg.get("gpu_count", 1))},
+                            "requests": {
+                                "cpu": mcfg.get("cpu_request", "4"),
+                                "memory": mcfg.get("memory_request", "16Gi"),
+                            },
+                            "limits": {
+                                "cpu": mcfg.get("cpu_limit", "8"),
+                                "memory": mcfg.get("memory_limit", "32Gi"),
+                                "nvidia.com/gpu": str(mcfg.get("gpu_count", 1)),
+                            },
                         },
                         "volumeMounts": trainer_volume_mounts,
                     }],
