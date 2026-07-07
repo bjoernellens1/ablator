@@ -30,6 +30,7 @@ from . import health as healthmod
 from . import provenance as provmod
 from . import resources
 from .queue import Queue, pause_flag_path, write_pause_flag
+from .urgent_fixes import enforce_urgent_fixes
 
 IDLE_POLL_S = 30
 BUSY_POLL_S = 30
@@ -1424,6 +1425,22 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 time.sleep(BUSY_POLL_S)
                 continue
             write_heartbeat(cfg, machine, f"idle k8s_inflight={inflight.total()}")
+
+            # 0. Urgent-fix currency gate: verify this dispatcher's own
+            # checkout has every registered urgent fix before dispatching
+            # ANYTHING this tick -- both the k8s path (git-sync pins to
+            # this host's HEAD SHA) and the bare-metal path (live bind
+            # mount) run whatever is on disk here right now. Only reached
+            # once machine_busy() above already confirmed idle, so an
+            # auto-pull here can never yank code out from under a running
+            # bind-mounted job. See urgent_fixes.py for the full incident
+            # writeup and design rationale.
+            if not enforce_urgent_fixes(cfg, machine, q):
+                if once:
+                    inflight.join_all()
+                    return
+                time.sleep(IDLE_POLL_S)
+                continue
 
             # 1. Fill k8s concurrency slots — non-blocking: each claimed job
             # is handed to a background thread and this loop moves straight
