@@ -485,8 +485,20 @@ def test_parse_progress_sentinel_cap_fallback():
 
 
 def test_parse_progress_sentinel_without_cap():
-    tail = "train: 5000/2147483647"
+    tail = "train: 5000/2147483647 [..]"
     assert progmod.parse_progress(tail, "--foo bar") == "iter 5000/?"
+
+
+def test_parse_progress_ignores_log_timestamp_after_last_tqdm_line():
+    # Regression: "[07/07 18:02:47]" (this project's log-timestamp format,
+    # MM/DD) also matches bare "(\d+)/(\d+)". A save/report-phase line
+    # carrying a timestamp landing in the tail AFTER the last real tqdm
+    # progress line must not be picked up as the iteration counter.
+    tail = (
+        "Streaming training:   3%|2 | 2620/100000 [11:10<8:33:28, 3.16it/s]"
+        "\n[FRAME 5250] Saving Gaussians (iter=2623) [07/07 18:02:55]\n"
+    )
+    assert progmod.parse_progress(tail) == "iter 2620/100000 (2%)"
 
 
 def test_job_progress_reads_configured_log(tmp_path):

@@ -17,7 +17,18 @@ import os
 import re
 
 DEFAULT_LOG = "train.log"
-DEFAULT_REGEX = r"(\d+)/(\d+)"
+# (?<![\[\d]) excludes this project's own log-timestamp format
+# "[07/07 18:02:47]" (MM/DD date), which otherwise also matches bare
+# "(\d+)/(\d+)" (both directly, and mid-number as "7/07" once the direct
+# match is blocked) -- re.findall takes the LAST match in the tail, and a
+# timestamp line landing after the last real tqdm progress line (e.g. a
+# "[FRAME N] Saving Gaussians (iter=...) [MM/DD ...]" report/save line)
+# would silently win, producing a bogus "iter 7/7 (100%)" read as a
+# finished/stalled job. Confirmed live 2026-07-07 on sppgtsanfix_ctrl
+# mid-training. Real tqdm counters are never immediately preceded by '['
+# or another digit, so this excludes only the timestamp shape, not
+# tqdm's own format.
+DEFAULT_REGEX = r"(?<![\[\d])(\d+)/(\d+)"
 DEFAULT_CAP_REGEX = r"--streaming_max_iterations[= ](\d+)"
 TOTAL_SENTINEL = 2**31 - 1
 TAIL_BYTES = 2048
