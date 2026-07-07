@@ -552,6 +552,38 @@ def test_reconcile_ignores_other_machines_claims(tmp_path):
     assert read_queue(q.path)[0].get("claimed_by") == "r9700"
 
 
+def test_run_loop_reconciles_orphan_that_was_busy_at_startup(tmp_path, monkeypatch):
+    """Regression for the 2026-07-07 live incident: a runner restart's
+    startup-only reconcile_stale_running() call correctly deferred (the
+    prior process's job was still genuinely training, busy=True), but
+    nothing ever retried once the machine went idle moments later --
+    frdeskw01main_fr1desk_w01_plus_admission_fix stayed stuck at
+    status="running" for 2h45m with no live supervisor. run_loop() must
+    re-run reconciliation on every idle tick, not just once at startup."""
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    mp = tmp_path / "run_done"
+    (mp / "comparison" / "iter_1000").mkdir(parents=True)
+    (mp / "comparison" / "iter_1000" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main"}])
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    # busy=True at the moment run_loop() calls its own STARTUP reconcile
+    # (mirrors the prior process's job still genuinely training at restart
+    # time); by the time the loop's first idle-tick check runs, it's gone
+    # idle -- exactly the race that orphaned the real job.
+    busy_calls = {"n": 0}
+    def fake_busy(*a, **k):
+        busy_calls["n"] += 1
+        return busy_calls["n"] == 1
+    monkeypatch.setattr(resources, "machine_busy", fake_busy)
+    runner.run_loop(cfg, once=True)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert job["reconciled"] is True
+
+
 # ------------------------------------------------------ hard completion validity
 
 def test_exit_zero_without_artifact_is_failed_when_required(tmp_path, monkeypatch):

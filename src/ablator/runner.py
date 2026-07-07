@@ -1562,6 +1562,22 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 continue
             write_heartbeat(cfg, machine, f"idle k8s_inflight={inflight.total()}")
 
+            # Re-run bare-metal self-heal on every idle tick, not just at
+            # startup. The startup-only call can legitimately skip a job
+            # that predates this process (busy=True because that prior
+            # process's own job was still genuinely training) and then
+            # never get a second chance -- confirmed live 2026-07-07:
+            # frdeskw01main_fr1desk_w01_plus_admission_fix stayed stuck at
+            # status="running" for 2h45m because the runner restarted
+            # 2.5 minutes before that in-flight job actually finished, the
+            # startup call correctly deferred (busy=True at that instant),
+            # and nothing ever retried once the machine went idle seconds
+            # later. reconcile_stale_running() is a no-op once an entry has
+            # already been reconciled (it only touches status=="running"
+            # entries), so calling it every idle tick is cheap in steady
+            # state -- one extra q.read() scan, not a busy-poll.
+            reconcile_stale_running(cfg, machine, q, busy=False)
+
             # 0. Urgent-fix currency gate: verify this dispatcher's own
             # checkout has every registered urgent fix before dispatching
             # ANYTHING this tick -- both the k8s path (git-sync pins to
