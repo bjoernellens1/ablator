@@ -456,41 +456,25 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     }
 
 
-def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
-               q: Queue | None = None) -> tuple[str, int | None]:
-    """Execute one job as a Kubernetes Job on a k8s-backend machine.
+def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
+                  name: str, ns: str, log_path: str,
+                  append: bool = False) -> tuple[str, int | None]:
+    """Poll an existing (already-submitted) k8s Job to completion.
 
-    Submits via `kubectl apply` (stdlib-only, no k8s Python client
-    dependency, matching this project's zero-dependency philosophy), polls
-    completion via `kubectl get job -o json`, tails logs into the same
-    <log_dir>/<id>.log bare-metal jobs use, deletes the Job on exit either
-    way. Honors the same control-file protocol (stop/skip/requeue) as the
-    subprocess path by deleting the Job when one is found.
+    Shared by the initial-submission path (`run_job_k8s`) and the
+    restart-recovery re-attach path (`reconcile_stale_running`): both cases
+    reduce to "there is a k8s Job `ns/name` already out there, watch it
+    until it finishes". `append=True` is used for re-attach, since the
+    Job (and its log history) predates this process and truncating the
+    existing log file would destroy that history.
     """
-    log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
-    try:
-        tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
-        argv, _env, cwd = render_command(tcfg, job, machine)
-    except (KeyError, TemplateError) as e:
-        print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
-        return "failed", None
-
-    manifest = build_k8s_job_manifest(mcfg, job, argv, cwd)
-    name = manifest["metadata"]["name"]
-    ns = mcfg["namespace"]
-    print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
-          f"(k8s Job {ns}/{name}, log {log_path})", flush=True)
-
-    apply = _kubectl(["apply", "-f", "-"], input_text=json.dumps(manifest))
-    if apply.returncode != 0:
-        print(f"[ablator] {job['id']} k8s apply failed: {apply.stderr}", flush=True)
-        return "failed", None
-
     log_proc = None
     try:
-        with open(log_path, "w") as lf:
-            lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']} "
-                     f"(k8s Job {ns}/{name})\n# {shlex.join(argv)}\n")
+        with open(log_path, "a" if append else "w") as lf:
+            if append:
+                lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']} "
+                         f"re-attached to existing k8s Job {ns}/{name} "
+                         "(runner restart)\n")
             lf.flush()
             missing_polls = 0
             while True:
@@ -560,6 +544,42 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
                   flush=True)
             return "failed", rc
     return ("done" if rc == 0 else "failed"), rc
+
+
+def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
+               q: Queue | None = None) -> tuple[str, int | None]:
+    """Execute one job as a Kubernetes Job on a k8s-backend machine.
+
+    Submits via `kubectl apply` (stdlib-only, no k8s Python client
+    dependency, matching this project's zero-dependency philosophy), then
+    delegates to `_poll_k8s_job` for the completion wait, log tailing, and
+    Job teardown. Honors the same control-file protocol (stop/skip/requeue)
+    as the subprocess path by deleting the Job when one is found.
+    """
+    log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
+    try:
+        tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+        argv, _env, cwd = render_command(tcfg, job, machine)
+    except (KeyError, TemplateError) as e:
+        print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
+        return "failed", None
+
+    manifest = build_k8s_job_manifest(mcfg, job, argv, cwd)
+    name = manifest["metadata"]["name"]
+    ns = mcfg["namespace"]
+    print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
+          f"(k8s Job {ns}/{name}, log {log_path})", flush=True)
+
+    apply = _kubectl(["apply", "-f", "-"], input_text=json.dumps(manifest))
+    if apply.returncode != 0:
+        print(f"[ablator] {job['id']} k8s apply failed: {apply.stderr}", flush=True)
+        return "failed", None
+
+    with open(log_path, "w") as lf:
+        lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']} "
+                 f"(k8s Job {ns}/{name})\n# {shlex.join(argv)}\n")
+    return _poll_k8s_job(cfg, job, machine, mcfg, tcfg, name, ns, log_path,
+                        append=True)
 
 
 def run_job(cfg: dict, job: dict, machine: str,
@@ -645,8 +665,28 @@ def _require_result_artifact(cfg: dict, tcfg: dict) -> bool:
     return bool(cfg.get("queue", {}).get("require_result_artifact", False))
 
 
+def _k8s_job_still_active(mcfg: dict, name: str) -> tuple[bool, bool]:
+    """Query real k8s liveness for a Job name: (exists, still_active).
+
+    `exists` is False if `kubectl get job` fails (Job gone / API error).
+    `still_active` is True only when the Job exists and has neither
+    succeeded nor failed yet — i.e. it is genuinely still running (or
+    still pending scheduling), as opposed to a real completion/failure
+    that happened while this runner process was down.
+    """
+    ns = mcfg["namespace"]
+    status = _kubectl(["get", "job", name, "-n", ns, "-o", "json"], timeout=30)
+    if status.returncode != 0:
+        return False, False
+    st = json.loads(status.stdout).get("status", {})
+    if st.get("succeeded", 0) >= 1 or st.get("failed", 0) >= 1:
+        return True, False
+    return True, True
+
+
 def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
-                            busy: bool | None = None) -> None:
+                            busy: bool | None = None,
+                            inflight: "_K8sInflight | None" = None) -> None:
     """Self-heal 'running' jobs this machine claimed but is no longer
     supervising (this runner process just (re)started, so any job still
     marked running-and-claimed-by-us predates this process and has no
@@ -662,14 +702,77 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
     launching a duplicate job against the same model_path. In that case
     the entry is left stuck for now and a warning is printed; the next
     idle poll (once the process/container is gone) reconciles it.
+
+    For a k8s-backend `machine`, in-memory in-flight tracking (thread +
+    _K8sInflight bookkeeping) is necessarily lost across a runner process
+    restart, but the k8s Job itself is NOT — it is a real cluster object
+    outside this process, still executing under kai-scheduler regardless
+    of whether anything here is polling it. Blindly requeuing every
+    'running' k8s-targeted job on restart (the bare-metal-only check
+    above) would falsely mark genuinely-still-running cluster jobs as
+    crashed, and re-dispatching them would depend on lucky `kubectl apply`
+    idempotency against a byte-identical manifest rather than correct
+    behavior (found live 2026-07-07: exactly this happened after a
+    restart). Instead, query the real k8s Job status via `kubectl get job`
+    before assuming anything is dead, and re-attach a polling thread to a
+    genuinely-still-running Job rather than requeuing it.
     """
     if busy is None:
         busy = resources.machine_busy(cfg, machine)
     if busy:
         return
+    is_k8s = cfgmod.machine_cfg(cfg, machine).get("backend") == "k8s"
+    mcfg = cfgmod.machine_cfg(cfg, machine) if is_k8s else None
     for job in q.read():
         if job.get("status") != "running" or job.get("claimed_by") != machine:
             continue
+
+        if is_k8s:
+            name = _k8s_job_name(job["id"])
+            exists, still_active = _k8s_job_still_active(mcfg, name)
+            if still_active:
+                print(f"[ablator] reconcile: {job['id']} k8s Job "
+                      f"{mcfg['namespace']}/{name} is still genuinely running "
+                      "after a runner restart — re-attaching, not requeuing",
+                      flush=True)
+                try:
+                    tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+                except KeyError:
+                    tcfg = {}
+                log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
+                ns = mcfg["namespace"]
+
+                def run_fn(job=job, tcfg=tcfg, name=name, ns=ns,
+                          log_path=log_path):
+                    return _poll_k8s_job(cfg, job, machine, mcfg, tcfg, name,
+                                        ns, log_path, append=True)
+
+                t = threading.Thread(
+                    target=_dispatch_and_finalize,
+                    args=(cfg, machine, job, machine, q),
+                    kwargs={"run_fn": run_fn},
+                    daemon=True,
+                    name=f"k8s-reattach-{job['id']}",
+                )
+                t.start()
+                if inflight is not None:
+                    inflight.add(machine, t, job["id"])
+                continue
+            if exists:
+                # The Job finished (succeeded or failed) while this runner
+                # process was down. A real completion is not a crash — fall
+                # through to the same artifact-gated done/requeue check
+                # bare-metal jobs get below; only the absence of a live
+                # in-memory process differs, and that's expected here.
+                print(f"[ablator] reconcile: {job['id']} k8s Job "
+                      f"{mcfg['namespace']}/{name} already reached a terminal "
+                      "state while this runner was down — checking for a "
+                      "completion artifact", flush=True)
+            else:
+                print(f"[ablator] reconcile: {job['id']} k8s Job "
+                      f"{mcfg['namespace']}/{name} no longer exists on the "
+                      "cluster — treating as crashed", flush=True)
+
         base_dir = _job_base_dir(cfg, job, machine)
         h = healthmod.job_health(job, base_dir, cfg.get("queue", {}),
                                  process_alive=False)
@@ -708,7 +811,7 @@ def _k8s_max_concurrent(cfg: dict, k8s_name: str) -> int:
 
 
 def _dispatch_and_finalize(cfg: dict, machine: str, job: dict, job_machine: str,
-                           q: Queue) -> str:
+                           q: Queue, run_fn=None) -> str:
     """Run one job to completion and apply the full success/failure/retry/
     quarantine/preempt/requeue bookkeeping.
 
@@ -716,9 +819,16 @@ def _dispatch_and_finalize(cfg: dict, machine: str, job: dict, job_machine: str,
     thread in run_loop() — every job, regardless of which machine it targets
     or whether it runs synchronously or on a background thread, goes through
     exactly this same disposition logic.
+
+    `run_fn` defaults to the normal submit-and-run path (`run_job`), but a
+    caller re-attaching to a k8s Job that was already running before this
+    process started (restart recovery, see `reconcile_stale_running`) can
+    pass a callable that resumes polling that existing Job instead of
+    re-submitting it.
     """
     base_dir = _job_base_dir(cfg, job, job_machine)
-    status, exit_code = run_job(cfg, job, job_machine, q)
+    run_fn = run_fn or (lambda: run_job(cfg, job, job_machine, q))
+    status, exit_code = run_fn()
     if status == "failed":
         disposition = handle_failure(cfg, job, exit_code, job_machine, base_dir, q)
         if disposition == "retry":
@@ -830,10 +940,10 @@ def run_loop(cfg: dict, once: bool = False) -> None:
     dispatch_machines = [machine] + k8s_machines
     print(f"[ablator] runner on {machine} watching {q.path} "
           f"(dispatching for: {', '.join(dispatch_machines)})", flush=True)
+    inflight = _K8sInflight()
     reconcile_stale_running(cfg, machine, q)
     for k8s_name in k8s_machines:
-        reconcile_stale_running(cfg, k8s_name, q, busy=False)
-    inflight = _K8sInflight()
+        reconcile_stale_running(cfg, k8s_name, q, busy=False, inflight=inflight)
     last_tick = time.monotonic()
     while True:
         # Watchdog: if the previous iteration (probes + sleeps, NOT a job

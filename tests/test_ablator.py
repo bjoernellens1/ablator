@@ -1,6 +1,7 @@
 """CPU-only tests for ablator (spec expansion, queue, resources, templates)."""
 import json
 import os
+import subprocess
 import threading
 import time
 
@@ -784,3 +785,162 @@ def test_concurrent_k8s_job_failure_bookkeeping(tmp_path, monkeypatch):
     jobs = read_queue(q.path)
     assert jobs[0]["status"] == "quarantined"
     assert jobs[0]["retried"] is True
+
+
+# --------------------------------------------- k8s restart-recovery reconcile
+
+def make_k8s_reconcile_cfg(tmp_path, max_concurrent=2):
+    cfg = make_k8s_cfg(tmp_path, max_concurrent=max_concurrent)
+    cfg["machines"]["a100cluster"]["namespace"] = "jupyterhub"
+    return cfg
+
+
+def _running_k8s_job(job_id="kjob0", model_path="m0"):
+    return {"id": job_id, "machine": "a100cluster", "type": "replay",
+           "scene": "/s", "model_path": model_path, "status": "running",
+           "claimed_by": "a100cluster"}
+
+
+def test_reconcile_k8s_reattaches_genuinely_running_job(tmp_path, monkeypatch):
+    """A k8s Job that is still genuinely Running on the cluster after a
+    runner restart must be re-attached (polling resumed), never requeued
+    or marked crashed."""
+    cfg = make_k8s_reconcile_cfg(tmp_path)
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [_running_k8s_job()])
+
+    def fake_kubectl(args, input_text=None, timeout=None):
+        assert args[:2] == ["get", "job"]
+        return subprocess.CompletedProcess(args, 0,
+            stdout=json.dumps({"status": {}}), stderr="")
+
+    release = threading.Event()
+
+    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False):
+        release.wait(timeout=5)
+        return "done", 0
+
+    monkeypatch.setattr(runner, "_kubectl", fake_kubectl)
+    monkeypatch.setattr(runner, "_poll_k8s_job", fake_poll)
+
+    inflight = runner._K8sInflight()
+    runner.reconcile_stale_running(cfg, "a100cluster", q, busy=False,
+                                   inflight=inflight)
+
+    # Not touched synchronously: still "running", not pending/crashed.
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
+    assert inflight.count("a100cluster") == 1
+
+    release.set()
+    inflight.join_all()
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+
+
+def test_reconcile_k8s_succeeded_while_down_with_artifact_marks_done(tmp_path, monkeypatch):
+    """The k8s Job reached 'succeeded' while the runner process was down --
+    a real success, not a crash -- and a completion artifact exists."""
+    cfg = make_k8s_reconcile_cfg(tmp_path)
+    mp = tmp_path / "run_done_k8s"
+    (mp / "comparison" / "iter_1000").mkdir(parents=True)
+    (mp / "comparison" / "iter_1000" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [_running_k8s_job(model_path=str(mp))])
+
+    def fake_kubectl(args, input_text=None, timeout=None):
+        return subprocess.CompletedProcess(args, 0,
+            stdout=json.dumps({"status": {"succeeded": 1}}), stderr="")
+
+    monkeypatch.setattr(runner, "_kubectl", fake_kubectl)
+    inflight = runner._K8sInflight()
+    runner.reconcile_stale_running(cfg, "a100cluster", q, busy=False,
+                                   inflight=inflight)
+
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert job["reconciled"] is True
+    assert inflight.count("a100cluster") == 0  # no thread spawned, terminal
+
+
+def test_reconcile_k8s_succeeded_while_down_without_artifact_requeues(tmp_path, monkeypatch):
+    """Succeeded while down but no completion artifact -- a genuine crash
+    (or a wrapper script swallowing a real failure), matches
+    require_result_artifact semantics used elsewhere: not 'done'."""
+    cfg = make_k8s_reconcile_cfg(tmp_path)
+    mp = tmp_path / "run_no_artifact_k8s"
+    mp.mkdir()
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [_running_k8s_job(model_path=str(mp))])
+
+    def fake_kubectl(args, input_text=None, timeout=None):
+        return subprocess.CompletedProcess(args, 0,
+            stdout=json.dumps({"status": {"succeeded": 1}}), stderr="")
+
+    monkeypatch.setattr(runner, "_kubectl", fake_kubectl)
+    inflight = runner._K8sInflight()
+    runner.reconcile_stale_running(cfg, "a100cluster", q, busy=False,
+                                   inflight=inflight)
+
+    job = read_queue(q.path)[0]
+    assert job["status"] == "pending"
+    assert job["claimed_by"] is None
+    assert job["reconciled"] is True
+
+
+def test_reconcile_k8s_job_gone_requeues(tmp_path, monkeypatch):
+    """The k8s Job no longer exists on the cluster at all (real crash while
+    the runner was down, or manually deleted) -- existing crashed/requeue
+    behavior is preserved."""
+    cfg = make_k8s_reconcile_cfg(tmp_path)
+    mp = tmp_path / "run_gone_k8s"
+    mp.mkdir()
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [_running_k8s_job(model_path=str(mp))])
+
+    def fake_kubectl(args, input_text=None, timeout=None):
+        return subprocess.CompletedProcess(args, 1, stdout="", stderr="not found")
+
+    monkeypatch.setattr(runner, "_kubectl", fake_kubectl)
+    inflight = runner._K8sInflight()
+    runner.reconcile_stale_running(cfg, "a100cluster", q, busy=False,
+                                   inflight=inflight)
+
+    job = read_queue(q.path)[0]
+    assert job["status"] == "pending"
+    assert job["claimed_by"] is None
+    assert job["reconciled"] is True
+
+
+def test_reconcile_k8s_reattach_counts_toward_max_concurrent(tmp_path, monkeypatch):
+    """A re-attached job must occupy an in-flight slot so a subsequent
+    dispatch pass correctly sees reduced (not full) spare capacity."""
+    cfg = make_k8s_reconcile_cfg(tmp_path, max_concurrent=1)
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [_running_k8s_job()] + _k8s_jobs(1, prefix="waiting"))
+
+    def fake_kubectl(args, input_text=None, timeout=None):
+        return subprocess.CompletedProcess(args, 0,
+            stdout=json.dumps({"status": {}}), stderr="")
+
+    release = threading.Event()
+
+    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False):
+        release.wait(timeout=5)
+        return "done", 0
+
+    monkeypatch.setattr(runner, "_kubectl", fake_kubectl)
+    monkeypatch.setattr(runner, "_poll_k8s_job", fake_poll)
+
+    inflight = runner._K8sInflight()
+    runner.reconcile_stale_running(cfg, "a100cluster", q, busy=False,
+                                   inflight=inflight)
+
+    cap = runner._k8s_max_concurrent(cfg, "a100cluster")
+    assert cap == 1
+    assert inflight.count("a100cluster") == 1
+    # At cap already -- a dispatch pass must not claim the waiting job.
+    assert inflight.count("a100cluster") >= cap
+
+    release.set()
+    inflight.join_all()
