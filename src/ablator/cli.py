@@ -482,10 +482,12 @@ def main(argv: list[str] | None = None) -> None:
     a = p.parse_args(argv)
 
     if a.cmd in (None, "tui"):
-        if a.cmd is None and not sys.stdin.isatty():
-            # No subcommand AND no TTY: never silently fall into the TUI
-            # for a scripted/headless caller -- fail the same way argparse
-            # would have with required=True.
+        if a.cmd is None and not (sys.stdin.isatty() and sys.stdout.isatty()):
+            # No subcommand AND no real terminal on BOTH ends: never
+            # silently fall into the TUI for a scripted/headless caller,
+            # or one with stdout redirected (textual needs a real terminal
+            # to render into, not just an interactive stdin) -- fail the
+            # same way argparse would have with required=True.
             p.error("the following arguments are required: cmd")
         from .tui.app import launch  # deferred: only this path needs textual
         launch(a.config)
