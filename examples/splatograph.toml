@@ -89,6 +89,14 @@ command = [
 ]
 [types.bag.env]
 TRAIN_EXTRA_ARGS = "{extra_args} --streaming_report_final"
+# Coverage-registry lookups key off SCENE_SOURCE (registry_n_source_frames()
+# in splatograph's utils/partition_eval.py). The bag launch script already
+# re-derives and passes SCENE_SOURCE=${BAG_PATH} into the training
+# container itself, but type:bag had no SCENE_SOURCE of its own here,
+# unlike [types.replay] (which bakes "-e SCENE_SOURCE={scene}" into its
+# command) -- declare it for consistency and so this doesn't silently rely
+# on the launch script continuing to re-derive it.
+SCENE_SOURCE = "{scene}"
 
 # r9700 runs bag jobs only if every stack image is already local (docker);
 # never triggers a 20GB+ build/pull from the runner.
