@@ -871,6 +871,16 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
         trainer_volume_mounts.append(
             {"name": "repo-src", "mountPath": workspace_path})
         sha = local_commit or "HEAD"
+        # git_sync_http_secret_name takes precedence if both are somehow set --
+        # rewrite the remote URL to embed the token as an x-access-token
+        # credential, rather than relying on GIT_SSH_COMMAND (which needs an
+        # ssh:// or git@ URL, not the https:// one this and git_sync_repo_url's
+        # existing SSH path both otherwise assume unchanged).
+        git_sync_http_secret_name = mcfg.get("git_sync_http_secret_name")
+        remote_url_expr = git_sync_repo_url
+        if git_sync_http_secret_name:
+            stripped = git_sync_repo_url.removeprefix("https://")
+            remote_url_expr = f"https://x-access-token:$(cat /etc/git-creds/token)@{stripped}"
         # git init + fetch-by-sha + checkout (rather than `git clone
         # --branch`) is the only way to pin an EXACT commit rather than a
         # moving branch head -- the whole point of this feature is running
@@ -881,7 +891,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
             "set -eu; "
             f"git init -q {workspace_path}; "
             f"cd {workspace_path}; "
-            f"git remote add origin {git_sync_repo_url}; "
+            f"git remote add origin \"{remote_url_expr}\"; "
             f"git fetch --depth 1 origin {sha}; "
             "git checkout -q FETCH_HEAD; "
             f"echo \"git-sync: checked out {sha} from {git_sync_repo_url}\""
@@ -911,6 +921,25 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                  "value": "ssh -i /etc/git-creds/ssh-privatekey "
                           "-o StrictHostKeyChecking=no -o IdentitiesOnly=yes"},
             ]
+        elif git_sync_http_secret_name:
+            # HTTPS token secret (a plain Opaque secret with a single "token"
+            # key) -- found live: some clusters require authenticated git
+            # fetches even for a genuinely public GitHub repo (anonymous
+            # `git fetch` from the cluster's egress got "could not read
+            # Username for 'https://github.com'" while the SAME fetch worked
+            # fine from a dispatching host with a cached `gh` credential
+            # helper -- an ambient-auth difference between hosts, not a
+            # private-repo requirement). A PAT already provisioned for
+            # `image_pull_secret`/GHCR push (scoped to also cover repo read)
+            # can often be reused here instead of provisioning a separate
+            # SSH deploy key.
+            volumes.append({
+                "name": "git-creds",
+                "secret": {"secretName": git_sync_http_secret_name,
+                          "defaultMode": 0o400},
+            })
+            init_container["volumeMounts"].append(
+                {"name": "git-creds", "mountPath": "/etc/git-creds", "readOnly": True})
         init_containers.append(init_container)
     return {
         "apiVersion": "batch/v1",

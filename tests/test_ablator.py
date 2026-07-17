@@ -506,6 +506,49 @@ def test_pytorch_generic_example_config_parses_and_builds_k8s_manifest(tmp_path)
     assert cfgmod.machine_name(cfg, hostname="some-random-laptop") == "local"
 
 
+def test_k8s_manifest_git_sync_ssh_secret_unaffected_by_http_option():
+    """SSH path (git_sync_secret_name) must render exactly as before -- the
+    new HTTPS-token option is purely additive."""
+    mcfg = {"namespace": "ns", "kai_queue": "q", "priority_class": "p",
+            "image": "img:tag", "git_sync_repo_url": "https://github.com/o/r",
+            "git_sync_secret_name": "deploy-key"}
+    job = {"id": "j1", "model_path": "output/j1"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "x.py"], "/workspace", "abc123")
+    init = manifest["spec"]["template"]["spec"]["initContainers"][0]
+    assert init["env"] == [{"name": "GIT_SSH_COMMAND",
+                            "value": "ssh -i /etc/git-creds/ssh-privatekey "
+                                     "-o StrictHostKeyChecking=no -o IdentitiesOnly=yes"}]
+    assert "git remote add origin \"https://github.com/o/r\"" in init["command"][2]
+
+
+def test_k8s_manifest_git_sync_http_token_secret():
+    """git_sync_http_secret_name rewrites the remote URL to embed the token
+    from a mounted secret file, and mounts that secret read-only into the
+    init container only -- no GIT_SSH_COMMAND env var (that's the SSH path's
+    mechanism, not this one)."""
+    mcfg = {"namespace": "ns", "kai_queue": "q", "priority_class": "p",
+            "image": "img:tag", "git_sync_repo_url": "https://github.com/o/r",
+            "git_sync_http_secret_name": "gh-token"}
+    job = {"id": "j1", "model_path": "output/j1"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "x.py"], "/workspace", "abc123")
+    pod_spec = manifest["spec"]["template"]["spec"]
+    init = pod_spec["initContainers"][0]
+    assert "env" not in init
+    creds_volumes = [v for v in pod_spec["volumes"] if v["name"] == "git-creds"]
+    assert creds_volumes == [{"name": "git-creds",
+                              "secret": {"secretName": "gh-token", "defaultMode": 0o400}}]
+    assert {"name": "git-creds", "mountPath": "/etc/git-creds", "readOnly": True} in init["volumeMounts"]
+    # trainer container never gets the git-creds mount
+    trainer_mounts = pod_spec["containers"][0]["volumeMounts"]
+    assert not any(m["name"] == "git-creds" for m in trainer_mounts)
+    script = init["command"][2]
+    assert 'https://x-access-token:$(cat /etc/git-creds/token)@github.com/o/r' in script
+    # the ORIGINAL (credential-free) URL must still appear in the echo, for
+    # readable logs -- the token must never be echoed
+    assert "checked out abc123 from https://github.com/o/r" in script
+    assert "x-access-token" not in script.split("echo")[1]
+
+
 def test_k8s_manifest_omits_mps_wiring_by_default():
     """Byte-identical manifest (no mps-root volume/env/affinity) for every
     machine that hasn't set mcfg["mps"] = true -- the opt-in must be a pure
