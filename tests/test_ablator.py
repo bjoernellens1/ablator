@@ -506,6 +506,70 @@ def test_pytorch_generic_example_config_parses_and_builds_k8s_manifest(tmp_path)
     assert cfgmod.machine_name(cfg, hostname="some-random-laptop") == "local"
 
 
+def test_k8s_manifest_omits_mps_wiring_by_default():
+    """Byte-identical manifest (no mps-root volume/env/affinity) for every
+    machine that hasn't set mcfg["mps"] = true -- the opt-in must be a pure
+    no-op otherwise."""
+    mcfg = {"namespace": "ns", "kai_queue": "q", "priority_class": "p",
+            "image": "img:tag"}
+    job = {"id": "j1", "model_path": "output/j1"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "x.py"], "/workspace")
+    pod_spec = manifest["spec"]["template"]["spec"]
+    volume_names = {v["name"] for v in pod_spec["volumes"]}
+    assert "mps-root" not in volume_names
+    assert "affinity" not in pod_spec
+    assert "env" not in pod_spec["containers"][0]
+
+
+def test_k8s_manifest_adds_mps_wiring_when_enabled():
+    """mcfg["mps"] = true adds the hostPath volume + mount, the
+    CUDA_MPS_PIPE_DIRECTORY/CUDA_MPS_LOG_DIRECTORY env vars, and soft
+    anti-affinity against other ablator-job pods -- all three parts of the
+    documented fix for the Exclusive_Process/no-MPS-arbitration cluster GPU
+    issue (see docs/EVALUATION_RESULTS.md in semantic-gaussian-particles,
+    "CUDA path verified for real: A100 cluster dispatch, MPS wiring
+    required")."""
+    mcfg = {"namespace": "ns", "kai_queue": "q", "priority_class": "p",
+            "image": "img:tag", "mps": True}
+    job = {"id": "j1", "model_path": "output/j1"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "x.py"], "/workspace")
+    pod_spec = manifest["spec"]["template"]["spec"]
+
+    mps_volumes = [v for v in pod_spec["volumes"] if v["name"] == "mps-root"]
+    assert len(mps_volumes) == 1
+    assert mps_volumes[0]["hostPath"] == {"path": "/run/nvidia/mps", "type": "DirectoryOrCreate"}
+
+    trainer = pod_spec["containers"][0]
+    mps_mounts = [m for m in trainer["volumeMounts"] if m["name"] == "mps-root"]
+    assert mps_mounts == [{"name": "mps-root", "mountPath": "/mps"}]
+
+    env_by_name = {e["name"]: e["value"] for e in trainer["env"]}
+    assert env_by_name["CUDA_MPS_PIPE_DIRECTORY"] == "/mps/nvidia.com/gpu/pipe"
+    assert env_by_name["CUDA_MPS_LOG_DIRECTORY"] == "/mps/nvidia.com/gpu/log"
+
+    anti_affinity_terms = pod_spec["affinity"]["podAntiAffinity"][
+        "preferredDuringSchedulingIgnoredDuringExecution"]
+    assert len(anti_affinity_terms) == 1
+    label_selector = anti_affinity_terms[0]["podAffinityTerm"]["labelSelector"]
+    assert label_selector["matchExpressions"] == [
+        {"key": "app", "operator": "In", "values": ["ablator-job"]}]
+    assert anti_affinity_terms[0]["podAffinityTerm"]["topologyKey"] == "kubernetes.io/hostname"
+
+
+def test_k8s_manifest_mps_wiring_coexists_with_extra_volumes():
+    """MPS's hostPath volume must not clobber or be clobbered by
+    extra_volumes' PVC mounts -- both should be present."""
+    mcfg = {"namespace": "ns", "kai_queue": "q", "priority_class": "p",
+            "image": "img:tag", "mps": True,
+            "extra_volumes": [{"name": "checkpoints", "claim_name": "ckpt-pvc",
+                               "mount_path": "/mnt/checkpoints"}]}
+    job = {"id": "j1", "model_path": "output/j1"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "x.py"], "/workspace")
+    pod_spec = manifest["spec"]["template"]["spec"]
+    volume_names = {v["name"] for v in pod_spec["volumes"]}
+    assert volume_names == {"mps-root", "checkpoints"}
+
+
 # --------------------------------------------------------------- progress
 
 def test_parse_progress_last_counter_wins():

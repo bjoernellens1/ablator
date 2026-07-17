@@ -280,3 +280,19 @@ pods is forbidden: User "..." cannot list resource "pods" in API group
   to create a pull-secret in the `cps-users` namespace, then set
   `image_pull_secret = "<secret-name>"` in your `[machines.a100cluster]`
   config block.
+
+**`RuntimeError: CUDA error: CUDA-capable device(s) is/are busy or
+unavailable`, even though `nvidia-smi` shows the GPU completely idle**
+(0% util, no processes):
+- These GPU nodes run in NVIDIA `Exclusive_Process` compute mode with no
+  per-pod permission to change it, and a plain `nvidia.com/gpu: 1`
+  request gets no MPS (Multi-Process Service) arbitration by default. Add
+  `mps = true` to your `[machines.a100cluster]` block (see
+  `examples/pytorch-generic.toml`) — this wires the pod as a client of
+  the cluster's own already-running per-node MPS control daemon.
+- Even with `mps = true`, the FIRST CUDA call in a job can still
+  transiently fail: the control daemon spawns its real server process
+  lazily, on a client's first connection, and that very first connection
+  can itself lose the race while the server is still starting. Wrap your
+  job's first CUDA-touching call in a small retry loop (a few attempts,
+  a few seconds apart) rather than treating one failure as fatal.

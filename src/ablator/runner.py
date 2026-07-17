@@ -720,6 +720,14 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     - `extra_volumes`: optional list of
       `{"name", "claim_name", "mount_path", "read_only"}` dicts for mounting
       any additional PVC (e.g. a shared checkpoint volume) generically.
+    - `mps`: optional bool (default false). When true, wires the trainer
+      container as an MPS (Multi-Process Service) client of the cluster's own
+      per-node MPS control daemon -- needed on GPU nodes left in NVIDIA
+      `Exclusive_Process` compute mode with no per-pod permission to change it,
+      where a plain `nvidia.com/gpu: 1` request can otherwise fail its first
+      CUDA call with "CUDA-capable device(s) is/are busy or unavailable" even
+      on a fully idle GPU. See the `mps_enabled` block below for exactly what
+      this adds (hostPath volume, env vars, soft anti-affinity) and why.
 
     Mounts (when configured): `pvc_persistent` (read-only, subPath'd to the
     job's real dataset directory so the in-container dataset mount path used
@@ -819,6 +827,41 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                 "readOnly": extra.get("read_only", False),
             },
         })
+    # MPS (Multi-Process Service) client wiring -- OPT-IN via mcfg["mps"] = true,
+    # absent/false by default (byte-identical manifest for every machine that
+    # hasn't configured it). Needed on cluster GPU nodes left in NVIDIA
+    # `Exclusive_Process` compute mode with no per-pod permission to change it and
+    # no MPS-sharing arbitration for a plain `nvidia.com/gpu: 1` request -- a pod's
+    # first CUDA call can otherwise fail with `CUDA error: CUDA-capable device(s)
+    # is/are busy or unavailable` even on a fully idle GPU (found live running
+    # semantic-gaussian-particles on this cluster's A100 nodes; same root cause
+    # independently documented in gs-slam-bench's gs_icp_slam/gaus_slam READMEs).
+    # The fix is to wire the pod as a CLIENT of the cluster's own already-running
+    # per-node MPS control daemon -- NOT to start a second, self-hosted daemon
+    # inside the pod, which was tried elsewhere and found to non-deterministically
+    # race the real one. Three parts, all needed together:
+    #   1. A hostPath volume at /run/nvidia/mps (host) mounted at /mps (container).
+    #   2. CUDA_MPS_PIPE_DIRECTORY=/mps/nvidia.com/gpu/pipe and
+    #      CUDA_MPS_LOG_DIRECTORY=/mps/nvidia.com/gpu/log env vars on the trainer
+    #      container, so any CUDA-using process in it becomes an MPS client
+    #      automatically (no application code changes needed).
+    #   3. Soft (preferred, not required) anti-affinity against other
+    #      `app: ablator-job` pods on the same node: the MPS server's startup
+    #      attempt grabs every physical GPU on a node at once and can crash-loop
+    #      if one is legitimately busy from an unrelated job, which would also
+    #      block a brand-new client asking only for the OTHER, idle GPU.
+    # A job's first CUDA call can still transiently fail even with this wiring
+    # correct, because the control daemon spawns its real server process LAZILY on
+    # a client's first connection -- callers should retry the first CUDA call a
+    # few times (this is workload-side, not something the manifest can fix).
+    mps_enabled = bool(mcfg.get("mps"))
+    if mps_enabled:
+        volumes.append({
+            "name": "mps-root",
+            "hostPath": {"path": "/run/nvidia/mps", "type": "DirectoryOrCreate"},
+        })
+        trainer_volume_mounts.append({"name": "mps-root", "mountPath": "/mps"})
+
     git_sync_repo_url = mcfg.get("git_sync_repo_url")
     git_sync_enabled = bool(git_sync_repo_url)
     init_containers: list[dict] = []
@@ -913,6 +956,22 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                     **({"imagePullSecrets": [{"name": mcfg["image_pull_secret"]}]}
                        if mcfg.get("image_pull_secret") else {}),
                     **({"initContainers": init_containers} if init_containers else {}),
+                    # Soft anti-affinity against other ablator-job pods on the same
+                    # node -- see the mps_enabled comment above for why this matters
+                    # specifically for MPS, but it's requested unconditionally
+                    # whenever MPS is on (not itself separately configurable) since
+                    # it has no meaning/benefit without MPS.
+                    **({"affinity": {"podAntiAffinity": {
+                        "preferredDuringSchedulingIgnoredDuringExecution": [{
+                            "weight": 100,
+                            "podAffinityTerm": {
+                                "labelSelector": {"matchExpressions": [
+                                    {"key": "app", "operator": "In", "values": ["ablator-job"]},
+                                ]},
+                                "topologyKey": "kubernetes.io/hostname",
+                            },
+                        }],
+                    }}} if mps_enabled else {}),
                     "containers": [{
                         "name": "trainer",
                         "image": mcfg["image"],
@@ -924,6 +983,10 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                         "imagePullPolicy": "Always",
                         "workingDir": cwd or mcfg.get("default_workdir", "/workspace"),
                         "command": argv,
+                        **({"env": [
+                            {"name": "CUDA_MPS_PIPE_DIRECTORY", "value": "/mps/nvidia.com/gpu/pipe"},
+                            {"name": "CUDA_MPS_LOG_DIRECTORY", "value": "/mps/nvidia.com/gpu/log"},
+                        ]} if mps_enabled else {}),
                         "resources": {
                             "requests": {
                                 "cpu": mcfg.get("cpu_request", "4"),

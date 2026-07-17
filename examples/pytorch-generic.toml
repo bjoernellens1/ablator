@@ -41,6 +41,13 @@ kai_queue = "batch"                  # KAI Queue CRD name (see queues.yaml)
 priority_class = "kai-batch-low"     # lowest, preemptible priority class
 # scheduler_name defaults to "kai-scheduler" -- this cluster's scheduler.
 gpu_count = 1
+# mps = true: opt in if a job's first CUDA call fails with "CUDA-capable
+# device(s) is/are busy or unavailable" even on an idle GPU -- these nodes run
+# in NVIDIA Exclusive_Process compute mode with no per-pod permission to
+# change it, and a plain nvidia.com/gpu request gets no MPS arbitration by
+# default. See runner.build_k8s_job_manifest's docstring for exactly what
+# this wires up and why. Uncomment if you hit that error:
+# mps = true
 image = "docker.io/pytorch/pytorch:2.4.0-cuda12.1-cudnn9-runtime"
 # image_pull_secret is optional; omit entirely for a public image like
 # this one. Set it if your training image lives on a private registry:
