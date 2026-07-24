@@ -862,6 +862,14 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
         })
         trainer_volume_mounts.append({"name": "mps-root", "mountPath": "/mps"})
 
+    shm_size_gb = mcfg.get("shm_size_gb")
+    if shm_size_gb:
+        volumes.append({
+            "name": "dshm",
+            "emptyDir": {"medium": "Memory", "sizeLimit": f"{shm_size_gb}Gi"},
+        })
+        trainer_volume_mounts.append({"name": "dshm", "mountPath": "/dev/shm"})
+
     git_sync_repo_url = mcfg.get("git_sync_repo_url")
     git_sync_enabled = bool(git_sync_repo_url)
     init_containers: list[dict] = []

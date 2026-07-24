@@ -613,6 +613,56 @@ def test_k8s_manifest_mps_wiring_coexists_with_extra_volumes():
     assert volume_names == {"mps-root", "checkpoints"}
 
 
+def test_k8s_manifest_omits_shm_volume_by_default():
+    """Byte-identical manifest (no dshm volume/mount) for every machine that
+    hasn't set mcfg["shm_size_gb"] -- the opt-in must be a pure no-op
+    otherwise, same contract as mps/extra_volumes."""
+    mcfg = {"namespace": "ns", "kai_queue": "q", "priority_class": "p",
+            "image": "img:tag"}
+    job = {"id": "j1", "model_path": "output/j1"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "x.py"], "/workspace")
+    pod_spec = manifest["spec"]["template"]["spec"]
+    volume_names = {v["name"] for v in pod_spec["volumes"]}
+    assert "dshm" not in volume_names
+    trainer = pod_spec["containers"][0]
+    assert not any(m["name"] == "dshm" for m in trainer["volumeMounts"])
+
+
+def test_k8s_manifest_adds_shm_volume_when_configured():
+    """mcfg["shm_size_gb"] adds a medium=Memory emptyDir at /dev/shm sized
+    to the configured value -- k8s's default /dev/shm is too small for
+    zenoh's SHM transport / cv_bridge / PyTorch IPC once every ROS2 process
+    shares one container's IPC namespace (bag-type a100cluster jobs)."""
+    mcfg = {"namespace": "ns", "kai_queue": "q", "priority_class": "p",
+            "image": "img:tag", "shm_size_gb": 2}
+    job = {"id": "j1", "model_path": "output/j1"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "x.py"], "/workspace")
+    pod_spec = manifest["spec"]["template"]["spec"]
+
+    dshm_volumes = [v for v in pod_spec["volumes"] if v["name"] == "dshm"]
+    assert len(dshm_volumes) == 1
+    assert dshm_volumes[0]["emptyDir"] == {"medium": "Memory", "sizeLimit": "2Gi"}
+
+    trainer = pod_spec["containers"][0]
+    dshm_mounts = [m for m in trainer["volumeMounts"] if m["name"] == "dshm"]
+    assert dshm_mounts == [{"name": "dshm", "mountPath": "/dev/shm"}]
+
+
+def test_k8s_manifest_shm_coexists_with_mps_and_extra_volumes():
+    """The dshm volume must not clobber or be clobbered by mps's hostPath
+    volume or extra_volumes' PVC mounts -- all three should be present
+    together."""
+    mcfg = {"namespace": "ns", "kai_queue": "q", "priority_class": "p",
+            "image": "img:tag", "shm_size_gb": 2, "mps": True,
+            "extra_volumes": [{"name": "checkpoints", "claim_name": "ckpt-pvc",
+                               "mount_path": "/mnt/checkpoints"}]}
+    job = {"id": "j1", "model_path": "output/j1"}
+    manifest = runner.build_k8s_job_manifest(mcfg, job, ["python", "x.py"], "/workspace")
+    pod_spec = manifest["spec"]["template"]["spec"]
+    volume_names = {v["name"] for v in pod_spec["volumes"]}
+    assert volume_names == {"dshm", "mps-root", "checkpoints"}
+
+
 # --------------------------------------------------------------- progress
 
 def test_parse_progress_last_counter_wins():
