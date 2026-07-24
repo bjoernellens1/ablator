@@ -693,7 +693,8 @@ def k8s_dispatch_enabled(cfg: dict, machine: str) -> bool:
 
 
 def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
-                          cwd: str | None, local_commit: str | None = None) -> dict:
+                          cwd: str | None, local_commit: str | None = None,
+                          image_override: str | None = None) -> dict:
     """Build the Job manifest dict for one job on a k8s-backend machine.
 
     Workload-agnostic: nothing here assumes Gaussian-splatting specifically.
@@ -715,6 +716,13 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
       its own dataset layout/mount path instead of splatograph's.
     - `image_pull_secret` is optional; omitted -> no `imagePullSecrets` (a
       public image needs none).
+    - `image_override`: optional, lets a caller run a DIFFERENT image than
+      `mcfg["image"]` for this one job (e.g. a job-type-specific image such
+      as a ROS2+CUDA bag-training image, set via `[types.<type>.machines.
+      <machine>].image` in the TOML, vs. the machine's plain CUDA-only
+      default image used by other job types on the same machine). `mcfg`
+      only ever holds ONE image per machine otherwise -- this is the sole
+      per-job image escape hatch.
     - `cpu_request`/`memory_request`/`cpu_limit`/`memory_limit` are
       overridable (defaults match the prior hardcoded 4/16Gi/8/32Gi).
     - `extra_volumes`: optional list of
@@ -773,6 +781,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     add new detection for.
     """
     name = _k8s_job_name(job["id"])
+    image = image_override or mcfg["image"]
     scene = job.get("scene", "")
     persistent_root = mcfg.get("persistent_mount_root", "/mnt/cps_persistent1_shared")
     scratch_root = mcfg.get("scratch_mount_root", "/mnt/cps_scratch1_tmp")
@@ -1011,7 +1020,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                     }}} if mps_enabled else {}),
                     "containers": [{
                         "name": "trainer",
-                        "image": mcfg["image"],
+                        "image": image,
                         # Non-":latest" tags default to imagePullPolicy=IfNotPresent,
                         # which silently reuses a stale cached layer on whatever node
                         # a Job lands on after a fresh push -- found live: a rebuilt
@@ -1153,13 +1162,15 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
         return "failed", None
 
     local_commit = _dispatch_host_commit(cfg, job)
-    manifest = build_k8s_job_manifest(mcfg, job, argv, cwd, local_commit)
+    image_override = tcfg.get("image")
+    manifest = build_k8s_job_manifest(mcfg, job, argv, cwd, local_commit,
+                                       image_override=image_override)
     name = manifest["metadata"]["name"]
     ns = mcfg["namespace"]
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
           f"(k8s Job {ns}/{name}, log {log_path})", flush=True)
 
-    image_prov = provmod.check_image_drift(mcfg["image"], local_commit)
+    image_prov = provmod.check_image_drift(image_override or mcfg["image"], local_commit)
     if image_prov.get("warning"):
         print(f"[ablator] {image_prov['warning']}", flush=True)
     if q is not None:
