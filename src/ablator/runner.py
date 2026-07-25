@@ -1723,57 +1723,74 @@ def run_loop(cfg: dict, once: bool = False) -> None:
             last_self_check = now
         try:
             inflight.reap()
-            if resources.machine_busy(cfg, machine):
+            baremetal_busy = resources.machine_busy(cfg, machine)
+            if baremetal_busy:
+                # Local GPU busy with this machine's own bare-metal job only
+                # blocks steps 1/3 (bare-metal claim/run) below -- it must
+                # NOT block step 2 (k8s-fill). This runner is the sole
+                # dispatcher for every k8s-backend machine (e.g.
+                # a100cluster); k8s dispatch never touches this machine's
+                # own GPU, so gating it behind local GPU busy starved the
+                # cluster of new work for the entire duration of every
+                # bare-metal job this process ran. Found live 2026-07-25:
+                # an a100cluster-pinned job sat "pending" for 10+ minutes
+                # while main ran back-to-back bare-metal jobs, with zero
+                # k8s dispatch log lines the entire time.
                 write_heartbeat(cfg, machine,
                                 f"busy-wait k8s_inflight={inflight.total()}")
-                if once:
-                    inflight.join_all()
-                    return
-                time.sleep(BUSY_POLL_S)
-                continue
-            write_heartbeat(cfg, machine, f"idle k8s_inflight={inflight.total()}")
+            else:
+                write_heartbeat(cfg, machine, f"idle k8s_inflight={inflight.total()}")
 
-            # Re-run bare-metal self-heal on every idle tick, not just at
-            # startup. The startup-only call can legitimately skip a job
-            # that predates this process (busy=True because that prior
-            # process's own job was still genuinely training) and then
-            # never get a second chance -- confirmed live 2026-07-07:
-            # frdeskw01main_fr1desk_w01_plus_admission_fix stayed stuck at
-            # status="running" for 2h45m because the runner restarted
-            # 2.5 minutes before that in-flight job actually finished, the
-            # startup call correctly deferred (busy=True at that instant),
-            # and nothing ever retried once the machine went idle seconds
-            # later. reconcile_stale_running() is a no-op once an entry has
-            # already been reconciled (it only touches status=="running"
-            # entries), so calling it every idle tick is cheap in steady
-            # state -- one extra q.read() scan, not a busy-poll.
-            reconcile_stale_running(cfg, machine, q, busy=False)
+            # Steps 0/1 (bare-metal self-heal, urgent-fix gate, bare-metal
+            # claim) only make sense/are only safe while this machine's own
+            # GPU is idle -- in particular, enforce_urgent_fixes can do a
+            # local git pull, which must never yank code out from under a
+            # running bind-mounted bare-metal job. None of this touches k8s
+            # dispatch (step 2 below), which always runs regardless of
+            # baremetal_busy.
+            job = None
+            if not baremetal_busy:
+                # Re-run bare-metal self-heal on every idle tick, not just at
+                # startup. The startup-only call can legitimately skip a job
+                # that predates this process (busy=True because that prior
+                # process's own job was still genuinely training) and then
+                # never get a second chance -- confirmed live 2026-07-07:
+                # frdeskw01main_fr1desk_w01_plus_admission_fix stayed stuck at
+                # status="running" for 2h45m because the runner restarted
+                # 2.5 minutes before that in-flight job actually finished, the
+                # startup call correctly deferred (busy=True at that instant),
+                # and nothing ever retried once the machine went idle seconds
+                # later. reconcile_stale_running() is a no-op once an entry has
+                # already been reconciled (it only touches status=="running"
+                # entries), so calling it every idle tick is cheap in steady
+                # state -- one extra q.read() scan, not a busy-poll.
+                reconcile_stale_running(cfg, machine, q, busy=False)
 
-            # 0. Urgent-fix currency gate: verify this dispatcher's own
-            # checkout has every registered urgent fix before dispatching
-            # ANYTHING this tick -- both the k8s path (git-sync pins to
-            # this host's HEAD SHA) and the bare-metal path (live bind
-            # mount) run whatever is on disk here right now. Only reached
-            # once machine_busy() above already confirmed idle, so an
-            # auto-pull here can never yank code out from under a running
-            # bind-mounted job. See urgent_fixes.py for the full incident
-            # writeup and design rationale.
-            if not enforce_urgent_fixes(cfg, machine, q):
-                if once:
-                    inflight.join_all()
-                    return
-                time.sleep(IDLE_POLL_S)
-                continue
+                # 0. Urgent-fix currency gate: verify this dispatcher's own
+                # checkout has every registered urgent fix before dispatching
+                # ANYTHING this tick -- both the k8s path (git-sync pins to
+                # this host's HEAD SHA) and the bare-metal path (live bind
+                # mount) run whatever is on disk here right now. Only reached
+                # once machine_busy() above already confirmed idle, so an
+                # auto-pull here can never yank code out from under a running
+                # bind-mounted job. See urgent_fixes.py for the full incident
+                # writeup and design rationale.
+                if not enforce_urgent_fixes(cfg, machine, q):
+                    if once:
+                        inflight.join_all()
+                        return
+                    time.sleep(IDLE_POLL_S)
+                    continue
 
-            # 1. Claim (non-blocking) this runner's own bare-metal job FIRST,
-            # before k8s claiming — this is what actually gives an idle
-            # bare-metal machine first shot at machine="any" jobs instead
-            # of losing every race to whichever process's k8s-fill loop
-            # happens to run first. Running it is deferred to step 3 (it's
-            # blocking) so it doesn't starve k8s concurrency in the
-            # meantime — see the design comment above for why that split
-            # matters.
-            job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
+                # 1. Claim (non-blocking) this runner's own bare-metal job
+                # FIRST, before k8s claiming — this is what actually gives an
+                # idle bare-metal machine first shot at machine="any" jobs
+                # instead of losing every race to whichever process's
+                # k8s-fill loop happens to run first. Running it is deferred
+                # to step 3 (it's blocking) so it doesn't starve k8s
+                # concurrency in the meantime — see the design comment above
+                # for why that split matters.
+                job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
 
             # 2. Fill k8s concurrency slots — non-blocking: each claimed job
             # is handed to a background thread and this loop moves straight
