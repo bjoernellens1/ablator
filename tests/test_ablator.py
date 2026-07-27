@@ -1433,3 +1433,71 @@ def test_claim_next_only_pinned_skips_any_jobs(tmp_path):
     job = q.claim_next("a100cluster", only_pinned=True)
     assert job["id"] == "b"  # "any" job skipped, pinned job claimed
     assert q.claim_next("a100cluster", only_pinned=True) is None
+
+
+def test_log_stall_tracker_detects_never_growing_log():
+    """A pod stuck in Pending/Init forever never reaches Job succeeded/failed
+    -- confirmed live 2026-07-27 (a real job sat at Init:0/1 for 4h54m with
+    zero runner-side detection). _poll_k8s_job kills it via this tracker
+    once the job's own log has been stale for hung_after_min, exactly like
+    the bare-metal supervise() path already does for hung processes."""
+    check = runner._log_stall_tracker(stall_after_s=300)
+    t0 = 1_000_000.0
+
+    # Log never grows past its initial size (0 -> 0 -> 0 ...): stuck pod,
+    # nothing ever gets written beyond the banner line.
+    assert check(0, t0) is None
+    assert check(0, t0 + 60) is None
+    assert check(0, t0 + 240) is None
+    result = check(0, t0 + 300)
+    assert result is not None and result >= 300
+
+    # Also true when the size read fails entirely (log not yet created).
+    check2 = runner._log_stall_tracker(stall_after_s=300)
+    assert check2(None, t0) is None
+    assert check2(None, t0 + 301) is not None
+
+
+def test_log_stall_tracker_resets_on_growth():
+    """A genuinely progressing job (log keeps growing) must never trip the
+    stall detector, no matter how long the run takes overall."""
+    check = runner._log_stall_tracker(stall_after_s=300)
+    t0 = 1_000_000.0
+    size = 0
+    for i in range(20):
+        size += 100  # log keeps growing every poll
+        assert check(size, t0 + i * 250) is None  # 250s < 300s threshold each step
+
+
+def test_poll_k8s_job_kills_pod_stalled_forever_at_init(tmp_path, monkeypatch):
+    """Integration-level check that _poll_k8s_job actually wires the tracker
+    in: force it to report "stalled" on the very first check so the loop
+    exits after exactly one iteration (avoids driving many fake polls
+    through the real while-loop, which proved flaky under pytest's
+    monkeypatch + real time module interaction in this environment)."""
+    cfg = make_k8s_reconcile_cfg(tmp_path)
+    job = _running_k8s_job()
+    log_path = tmp_path / "kjob0.log"
+
+    calls = []
+
+    def fake_kubectl(args, input_text=None, timeout=None):
+        calls.append(args)
+        if args[:2] == ["delete", "job"]:
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+        raise AssertionError(f"unexpected kubectl call (loop should exit "
+                             f"before reaching this): {args}")
+
+    monkeypatch.setattr(runner, "_kubectl", fake_kubectl)
+    monkeypatch.setattr(runner, "_log_stall_tracker",
+                        lambda stall_after_s: (lambda size, now: 999.0))
+
+    status, rc = runner._poll_k8s_job(cfg, job, "a100cluster",
+                                      cfg["machines"]["a100cluster"],
+                                      {}, "kjob0-job", "jupyterhub", str(log_path))
+
+    assert status == "failed"
+    assert rc is None
+    assert job.get("_k8s_pod_stalled") is True
+    delete_calls = [c for c in calls if c[:2] == ["delete", "job"]]
+    assert len(delete_calls) >= 1

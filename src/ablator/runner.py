@@ -1053,6 +1053,35 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     }
 
 
+def _log_stall_tracker(stall_after_s: float):
+    """Return a `check(size, now) -> float | None` closure for detecting a
+    stalled log file (pure decision logic, no I/O -- kept separate from
+    _poll_k8s_job's real polling loop so it's directly unit-testable without
+    mocking subprocess calls or the time module).
+
+    Call `check(current_log_size_or_None, current_time)` on every poll:
+    - Returns None (not stalled) whenever size has grown since the last
+      call, or hasn't been observed long enough yet.
+    - Returns the number of seconds since the log last grew, once that
+      duration reaches `stall_after_s`.
+    A None size (log unreadable, e.g. not yet created) never counts as
+    growth -- treated the same as "no change" for stall-timing purposes.
+    """
+    state = {"last_size": -1, "last_growth_ts": None}
+
+    def check(size, now):
+        if state["last_growth_ts"] is None:
+            state["last_growth_ts"] = now
+        if size is not None and size > state["last_size"]:
+            state["last_size"] = size
+            state["last_growth_ts"] = now
+            return None
+        elapsed = now - state["last_growth_ts"]
+        return elapsed if elapsed >= stall_after_s else None
+
+    return check
+
+
 def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
                   name: str, ns: str, log_path: str,
                   append: bool = False) -> tuple[str, int | None]:
@@ -1066,6 +1095,25 @@ def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
     existing log file would destroy that history.
     """
     log_proc = None
+    # Zombie-pod stall detection (2026-07-27): st.get("succeeded"/"failed") is
+    # a JOB-level signal that only fires once a pod actually starts and then
+    # finishes/fails -- a pod stuck forever in Pending/Init (e.g. the node's
+    # kubelet/container-runtime wedged, an image-pull hang with no
+    # ImagePullBackOff yet) never reaches either state, so this loop
+    # previously spun forever (confirmed live: a splatograph scannetpp job
+    # sat at Init:0/1 for 4h54m with zero runner-side detection, discovered
+    # only by a human `kubectl get pods` check). Reuses the exact same
+    # hung_after_min config knob and staleness semantics as the bare-metal
+    # supervise() path (health.hung_after_s): if the job's own log file
+    # (banner line already written above) hasn't grown in that long AND the
+    # Job hasn't reached a terminal state, treat it as stuck regardless of
+    # WHY (Init hang, image-pull hang, a training process that silently
+    # wedged post-start) and kill it -- one general staleness check instead
+    # of enumerating every specific k8s failure mode. Decision logic lives in
+    # _log_stall_tracker (pure, no I/O) so it's directly unit-testable
+    # without driving this function's real polling loop.
+    _stall_after_s = healthmod.hung_after_s(cfg.get("queue", {}), job)
+    _stall_tracker = _log_stall_tracker(_stall_after_s)
     try:
         with open(log_path, "a" if append else "w") as lf:
             if append:
@@ -1079,6 +1127,24 @@ def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
                     _kubectl(["delete", "job", name, "-n", ns, "--ignore-not-found",
                              "--wait=false"])
                     return "requeue", None
+                try:
+                    _cur_size = os.path.getsize(log_path)
+                except OSError:
+                    _cur_size = None
+                _now = time.time()
+                _stalled_s = _stall_tracker(_cur_size, _now)
+                if _stalled_s is not None:
+                    print(f"[ablator] {job['id']} k8s Job {ns}/{name} stalled: "
+                          f"log has not grown in {_stalled_s / 60:.1f}min "
+                          f"(threshold {_stall_after_s / 60:.1f}min) with no terminal "
+                          f"Job status -- likely a stuck pod (Init/image-pull hang or "
+                          f"a wedged process). Killing and reporting failed so the "
+                          f"queue retries/quarantines it instead of hanging forever.",
+                          flush=True)
+                    job["_k8s_pod_stalled"] = True
+                    _kubectl(["delete", "job", name, "-n", ns, "--ignore-not-found",
+                             "--wait=false"])
+                    return "failed", None
                 status = _kubectl(["get", "job", name, "-n", ns, "-o", "json"],
                                   timeout=30)
                 if status.returncode != 0:
