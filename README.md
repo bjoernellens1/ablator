@@ -1,7 +1,5 @@
 # ablator
 
-Full documentation: **https://bjoernellens1.github.io/ablator/**
-
 Cross-machine ablation/experiment queue orchestrator. One shared flock'd
 JSONL queue on any shared filesystem (NFS works), one host runner per
 machine, and **containerized workloads defined entirely by command
@@ -146,3 +144,22 @@ specifically.
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=src python3 -m pytest tests/ -q
 ```
+
+## Documentation
+
+This README covers the essentials. The full docs site (built from
+[`docs/`](docs/) with MkDocs, published via
+[`.github/workflows/docs.yml`](.github/workflows/docs.yml)) goes into
+more detail:
+
+**https://bjoernellens1.github.io/ablator/**
+
+- [Quickstart](https://bjoernellens1.github.io/ablator/quickstart/)
+- [Spec reference](https://bjoernellens1.github.io/ablator/spec-reference/)
+- [Config reference](https://bjoernellens1.github.io/ablator/config-reference/)
+- [Queue semantics](https://bjoernellens1.github.io/ablator/queue-semantics/)
+- [Multi-machine setup](https://bjoernellens1.github.io/ablator/multi-machine/)
+- [Kubernetes dispatch](https://bjoernellens1.github.io/ablator/kubernetes/)
+- [CPS cluster walkthrough](https://bjoernellens1.github.io/ablator/cluster-setup/)
+- [CLI reference](https://bjoernellens1.github.io/ablator/cli-reference/)
+- [Health & error classification](https://bjoernellens1.github.io/ablator/health/)
