@@ -1,5 +1,7 @@
 # ablator
 
+Full documentation: **https://bjoernellens1.github.io/ablator/**
+
 Cross-machine ablation/experiment queue orchestrator. One shared flock'd
 JSONL queue on any shared filesystem (NFS works), one host runner per
 machine, and **containerized workloads defined entirely by command

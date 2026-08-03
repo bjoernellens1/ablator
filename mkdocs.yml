@@ -1,0 +1,52 @@
+site_name: ablator
+site_description: Cross-machine ablation/experiment queue orchestrator
+repo_url: https://github.com/bjoernellens1/ablator
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.top
+    - navigation.sections
+    - content.code.copy
+    - content.action.edit
+    - toc.follow
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Quickstart: quickstart.md
+  - Spec reference: spec-reference.md
+  - Config reference: config-reference.md
+  - Queue semantics: queue-semantics.md
+  - Multi-machine setup: multi-machine.md
+  - Kubernetes dispatch: kubernetes.md
+  - CPS cluster walkthrough: cluster-setup.md
+  - CLI reference: cli-reference.md
+  - Health & error classification: health.md
