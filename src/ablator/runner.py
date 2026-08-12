@@ -229,6 +229,43 @@ def _fmt(s: str, vars: dict) -> str:
         raise TemplateError(f"unknown template variable in {s!r}: {e}")
 
 
+def _sanitize_container_name(raw: str) -> str:
+    """docker/podman container names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*."""
+    out = "".join(c if c.isalnum() or c in "_.-" else "_" for c in raw)
+    return out if out and (out[0].isalnum()) else f"j_{out}"
+
+
+def _ensure_container_name(argv: list[str], job: dict) -> list[str]:
+    """Inject `--name splat_train_<job_id>` into a rendered docker/podman
+    `run` command if the template didn't already set one.
+
+    Every busy-guard in this project's configs (see [[machines.*.busy_guards]]
+    in configs/ablator.toml / configs/ablator.json) checks `docker ps
+    --format {{.Names}}` for the substring "splat_train" to tell "GPU is
+    genuinely occupied by a training job" apart from leftover viewer/router
+    containers. That guard can only ever work if the launched container's
+    name actually contains that substring -- but no command template here
+    ever passed `--name`, so every job ran under Docker's random
+    adjective-scientist name generator and the guard silently never matched
+    anything. The direct consequence (found live 2026-08-12): `busy` always
+    read False for a machine with a real training container running, so
+    `reconcile_stale_running()`'s `if busy: return` early-out never fired,
+    and a job that was simply slow to write its first health-check artifact
+    got requeued to pending and picked up by a second launch -- two
+    processes training the identical job, each holding a full share of GPU
+    memory, on a real run. This centralizes the fix at the one place every
+    docker/podman command is assembled, rather than requiring every current
+    and future command template to remember `--name` itself.
+    """
+    if not argv or argv[0] not in _CONTAINER_RUNTIMES or "run" not in argv[:2]:
+        return argv
+    if container_name_from_argv(argv) is not None:
+        return argv  # template already set an explicit name -- respect it
+    name = f"splat_train_{_sanitize_container_name(str(job.get('id', 'job')))}"
+    run_idx = argv.index("run")
+    return argv[: run_idx + 1] + ["--name", name] + argv[run_idx + 1 :]
+
+
 def render_command(tcfg: dict, job: dict, machine: str) -> tuple[list[str], dict, str | None]:
     """Render (argv, env, cwd) for a job from its merged type config."""
     vars = _job_vars(job, machine)
@@ -240,6 +277,7 @@ def render_command(tcfg: dict, job: dict, machine: str) -> tuple[list[str], dict
             argv.append(_fmt(tok, vars))
     if not argv:
         raise TemplateError(f"job type for {job.get('id')} has empty command template")
+    argv = _ensure_container_name(argv, job)
     env = os.environ.copy()
     for k, v in (tcfg.get("env") or {}).items():
         env[k] = _fmt(str(v), vars)
@@ -507,6 +545,54 @@ def _docker_storage_free_bytes() -> int | None:
         if os.path.isdir(candidate):
             return _disk_free_bytes(candidate)
     return None
+
+
+def _measure_write_speed_mb_s(path: str, size_mb: int = 16) -> float | None:
+    """Write ``size_mb`` of random data to a throwaway file under ``path``,
+    fsync, time it, delete it. Best-effort: any OSError (permissions,
+    read-only mount, path doesn't exist yet) returns None rather than
+    raising -- this must never be able to fail a job on its own.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe_path = os.path.join(path, f".ablator_speedtest_{os.getpid()}.tmp")
+        chunk = os.urandom(1024 * 1024)
+        t0 = time.monotonic()
+        with open(probe_path, "wb") as f:
+            for _ in range(size_mb):
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+        elapsed = time.monotonic() - t0
+        os.remove(probe_path)
+        if elapsed <= 0:
+            return None
+        return size_mb / elapsed
+    except OSError:
+        return None
+
+
+def output_folder_preflight(model_path: str, cwd: str | None) -> str:
+    """Mandatory pre-dispatch check: resolve a job's output folder to a real
+    host filesystem path and report free space + measured write speed.
+
+    Always runs, for every job, informational only -- never blocks
+    dispatch. This project has been bitten repeatedly by silent NFS
+    disk-full/write-stall incidents that were only noticed well after a job
+    had been silently degraded or a queue file corrupted (a scratch1
+    disk-full incident truncated queue.jsonl; a separate NFS write-queue
+    stall on the same mount degraded a live training run's iteration rate
+    for tens of minutes before it was caught). Surfacing both numbers in
+    every job's own log up front, before training starts, catches this
+    class of problem at dispatch time instead of only after a stall is
+    already suspected.
+    """
+    resolved = model_path if os.path.isabs(model_path) else os.path.join(cwd or os.getcwd(), model_path)
+    free = _disk_free_bytes(resolved)
+    speed = _measure_write_speed_mb_s(resolved)
+    free_str = f"{free / (1024 ** 3):.1f}GB" if free is not None else "unknown"
+    speed_str = f"{speed:.1f}MB/s" if speed is not None else "unknown"
+    return f"[ablator] output folder preflight: path={resolved} free={free_str} write_speed={speed_str}"
 
 
 def machine_context_snapshot(job: dict, base_dir: str) -> dict:
@@ -1292,6 +1378,9 @@ def run_job(cfg: dict, job: dict, machine: str,
             lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']}\n"
                      f"# cwd={cwd or os.getcwd()}\n# {shlex.join(argv)}\n")
             lf.write(provmod.format_banner("bare-metal", prov_state) + "\n")
+            preflight_line = output_folder_preflight(str(job.get("model_path", "")), cwd)
+            lf.write(preflight_line + "\n")
+            print(preflight_line, flush=True)
             lf.flush()
             proc = subprocess.Popen(argv, env=env, cwd=cwd,
                                     stdout=lf, stderr=subprocess.STDOUT,
