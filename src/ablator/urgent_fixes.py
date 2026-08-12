@@ -32,6 +32,19 @@ gate is about code currency, not experimental configuration, so a job
 that deliberately pins old behavior (e.g.
 `--no-streaming_offload_camera_images`) is completely unaffected --
 nothing here can silently corrupt an ablation arm's intended comparison.
+
+Second incident (2026-08-12): a bare-metal job was claimed by a machine
+whose checkout predated a merged PR that added a new CLI flag entirely
+(`train.py: error: unrecognized arguments`), because nobody had added
+that commit's SHA to `[[urgent_fixes.fixes]]` -- the pinned-SHA list only
+protects against drift a human remembered to register, and in practice
+that registration was made once (2026-07-07) and never kept current.
+`auto_sync_ref` (optional, alongside or instead of `fixes`) generalizes
+the same safe fetch/fast-forward/pause machinery to "this checkout must
+not be behind <ref>" (e.g. `origin/main`), so every future commit is
+covered automatically with no per-fix bookkeeping. Same safety contract
+as the pinned-SHA path exactly: only ever fast-forwards on an idle,
+clean tree; anything else pauses the machine for a human, never forces.
 """
 from __future__ import annotations
 
@@ -40,14 +53,16 @@ import subprocess
 from .provenance import _run_git
 
 
-def load_urgent_fixes(cfg: dict) -> tuple[str | None, list[dict]]:
-    """Returns (repo_cwd, fixes). Empty/missing config -> (None, [])."""
+def load_urgent_fixes(cfg: dict) -> tuple[str | None, list[dict], str | None]:
+    """Returns (repo_cwd, fixes, auto_sync_ref).
+    Empty/missing config -> (None, [], None)."""
     uf = cfg.get("urgent_fixes") or {}
     repo_cwd = uf.get("repo_cwd")
     fixes = uf.get("fixes") or []
-    if not repo_cwd or not fixes:
-        return None, []
-    return repo_cwd, fixes
+    auto_sync_ref = uf.get("auto_sync_ref") or None
+    if not repo_cwd or (not fixes and not auto_sync_ref):
+        return None, [], None
+    return repo_cwd, fixes, auto_sync_ref
 
 
 def _is_ancestor(repo_cwd: str, sha: str) -> bool | None:
@@ -69,8 +84,31 @@ def _is_ancestor(repo_cwd: str, sha: str) -> bool | None:
     return None  # sha unknown to this checkout, or other git error
 
 
-def missing_fixes(repo_cwd: str, fixes: list[dict]) -> list[dict]:
-    """Fixes whose sha is NOT (yet) an ancestor of HEAD in repo_cwd."""
+def _resolve_ref(repo_cwd: str, ref: str) -> str | None:
+    """Resolves `ref` (e.g. "origin/main") to a commit sha in repo_cwd,
+    using whatever remote-tracking data is currently on disk -- callers
+    that need this to reflect the true remote state must `_fetch()`
+    first. None on any git error/unknown ref."""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", ref], cwd=repo_cwd,
+            capture_output=True, text=True, timeout=10.0, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
+def missing_fixes(
+    repo_cwd: str, fixes: list[dict], auto_sync_ref: str | None = None,
+) -> list[dict]:
+    """Fixes whose sha is NOT (yet) an ancestor of HEAD in repo_cwd, plus
+    (if `auto_sync_ref` given) a synthetic entry when HEAD is behind that
+    ref's current commit -- same "missing" contract, so callers that
+    already know how to fetch/pull/pause on a nonempty result need no
+    changes to handle this generalized case."""
     missing = []
     for fx in fixes:
         sha = fx.get("sha")
@@ -78,6 +116,13 @@ def missing_fixes(repo_cwd: str, fixes: list[dict]) -> list[dict]:
             continue
         if _is_ancestor(repo_cwd, sha) is not True:
             missing.append(fx)
+    if auto_sync_ref:
+        ref_sha = _resolve_ref(repo_cwd, auto_sync_ref)
+        if ref_sha is None or _is_ancestor(repo_cwd, ref_sha) is not True:
+            missing.append({
+                "sha": ref_sha or auto_sync_ref,
+                "subject": f"auto_sync_ref {auto_sync_ref} (checkout currency)",
+            })
     return missing
 
 
@@ -132,15 +177,15 @@ def enforce_urgent_fixes(cfg: dict, machine: str, q) -> bool:
         # do; caller's existing claim_next() calls already no-op.
         return False
 
-    repo_cwd, fixes = load_urgent_fixes(cfg)
+    repo_cwd, fixes, auto_sync_ref = load_urgent_fixes(cfg)
     if repo_cwd is None:
         return True  # feature not configured -- pure no-op
 
-    missing = missing_fixes(repo_cwd, fixes)
+    missing = missing_fixes(repo_cwd, fixes, auto_sync_ref)
     if not missing:
         return True
 
-    shas = ", ".join(fx["sha"][:12] for fx in fixes if fx.get("sha"))
+    shas = ", ".join(fx["sha"][:12] for fx in missing if fx.get("sha"))
     print(f"[ablator] urgent-fix gate: {machine}'s checkout at {repo_cwd} "
           f"is missing {len(missing)} registered urgent fix(es) "
           f"({shas}) -- checking whether a safe fast-forward sync closes "
@@ -167,14 +212,14 @@ def enforce_urgent_fixes(cfg: dict, machine: str, q) -> bool:
 
     # Re-check after fetch: the sha may now be reachable without a pull
     # (e.g. HEAD already includes it once remote-tracking refs update).
-    missing = missing_fixes(repo_cwd, fixes)
+    missing = missing_fixes(repo_cwd, fixes, auto_sync_ref)
     if not missing:
         print(f"[ablator] urgent-fix gate: {repo_cwd} already current "
               f"after fetch (no pull needed)", flush=True)
         return True
 
     ok, out = _ff_pull(repo_cwd)
-    missing_after = missing_fixes(repo_cwd, fixes)
+    missing_after = missing_fixes(repo_cwd, fixes, auto_sync_ref)
     if ok and not missing_after:
         print(f"[ablator] urgent-fix gate: auto fast-forward-pulled "
               f"{repo_cwd} to sync {len(missing)} registered urgent "
