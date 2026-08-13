@@ -342,7 +342,7 @@ def cmd_rerun(cfg: dict, job_id: str, lane_str: str | None = None) -> None:
         target["rerun_count"] = int(target.get("rerun_count", 0)) + 1
         target["rerun_of_status"] = prev_status
         for k in ("claimed_by", "claimed_at", "finished_at", "health",
-                  "retried", "note"):
+                  "retried", "note", "resume_checkpoint", "last_resumed_iter"):
             target.pop(k, None)
         if lane_str is not None:
             target["lane"] = int(lane_str)
