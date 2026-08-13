@@ -109,7 +109,7 @@ def find_latest_checkpoint(model_path: str, base_dir: str) -> tuple[str, int] | 
 
 def _git_state_path(cfg: dict, machine: str) -> str:
     """Shared-storage status file one runner writes and another reads, so
-    the r9700-vs-main drift check works across two SEPARATE ablator
+    the satellite-vs-main drift check works across two SEPARATE ablator
     processes (each machine runs its own `ablator run`) without any
     SSH-specific plumbing: queue.jsonl (and therefore log_dir) already
     lives on shared NFS (/mnt/cps_scratch1_tmp), so this file is visible
@@ -143,7 +143,7 @@ def capture_and_record_provenance(cfg: dict, job: dict, machine: str,
     via a live bind-mount of that SAME checkout. Recorded into (a) the
     job's ledger entry, so `queue.jsonl` durably answers "what code ran
     this job", and (b) a cross-machine status file other runners can read
-    for drift comparison (see check_r9700_drift below).
+    for drift comparison (see check_checkout_drift below).
     """
     state = provmod.capture_local_git_state(cwd)
     if q is not None:
@@ -152,45 +152,109 @@ def capture_and_record_provenance(cfg: dict, job: dict, machine: str,
     return state
 
 
-def check_r9700_drift(cfg: dict, job: dict, machine: str, state: dict,
-                      q: Queue | None) -> None:
-    """Proactive, loud (WARN-not-refuse) check: is r9700's actual git
-    commit the same as main's most-recently-observed commit?
+def expected_branch(cfg: dict) -> str:
+    """The branch a runner's shared checkout is expected to sit on.
 
-    Only meaningful when THIS dispatch is happening on r9700 (each machine
-    runs its own ablator process — main never directly dispatches a
-    bare-metal job onto r9700 over SSH, so there is no single call site
-    where "before dispatching to r9700" can compare live processes
-    directly). Instead: r9700's own runner, right before running one of
-    its own jobs, reads the shared git_state_main.json file main's runner
-    last wrote and compares. This is necessarily best-effort (stale if
-    main hasn't run a bare-metal job recently) but requires zero
-    SSH-specific plumbing and needs no reachability from r9700 to main.
-
-    WARN, never refuse: a user may deliberately want different code on
-    r9700 (e.g. testing a branch there only) — a loud warning in both the
-    runner log and the job's ledger entry is enough to make the drift
-    impossible to miss without blocking a job the user may have wanted to
-    run exactly as-is.
+    Derived from `[urgent_fixes] auto_sync_ref` (the only place the config
+    already states "this checkout must track <ref>"), with the remote
+    prefix stripped: `origin/main` -> `main`. Falls back to `main`, which
+    is what every runner has in practice been assumed to be on.
     """
-    if machine != "r9700":
+    ref = ((cfg.get("urgent_fixes") or {}).get("auto_sync_ref") or "main").strip()
+    return ref.split("/")[-1] or "main"
+
+
+def check_checkout_drift(cfg: dict, job: dict, machine: str, state: dict,
+                         q: Queue | None) -> None:
+    """Proactive, loud (WARN-not-refuse) check on the shared, mutable git
+    checkout this job is about to execute from.
+
+    Runners execute training from a fixed, mutable, shared checkout, so
+    whatever branch/working-tree state that checkout happens to be in at
+    claim time is what the job runs (splatograph#259). Three independent
+    ways that silently changes what ran, all checked here from the git
+    state `capture_and_record_provenance()` already captured — no extra
+    subprocesses, no new config:
+
+    1. **Cross-machine divergence** (any satellite vs. main). Each machine
+       runs its own ablator process, so a satellite's runner reads the
+       shared `git_state_main.json` that main's runner last wrote and
+       compares. Best-effort (stale if main hasn't dispatched a bare-metal
+       job recently), but needs no SSH plumbing or reachability. Note this
+       cannot report "N commits behind": main's commit may not even exist
+       in a stale satellite's object store without a fetch — a real
+       descendant *gate* is deliberately left as follow-up.
+       Previously hardcoded to `machine != "r9700"`, which is why rtx3090
+       executed a job from a 25-commit-stale checkout carrying no warning
+       at all; now every non-main machine checks itself.
+    2. **Dirty working tree**, on every machine including main. Never
+       flagged before, and it is exactly splatograph#259's Instance 2 (a
+       rewound `ablator` submodule pointer showed up only as ` M ablator`).
+       Only `dirty is True` warns — `dirty is None` means git was
+       unreadable, which is reported by `capture_local_git_state`'s own
+       `error` field rather than mislabelled as drift here.
+    3. **Off the expected branch** (see `expected_branch`). A *clean*
+       checkout parked on an agent branch is the headline #259 case and is
+       invisible to both checks above.
+
+    WARN, never refuse: a user may deliberately want different code on a
+    given machine (e.g. testing a branch there only), and a refusal path
+    here would stall a lane exactly as the `urgent_fix_unsynced` pause
+    once did. A loud warning in both the runner log and the job's ledger
+    entry (`drift_warning`, read by splatograph's
+    `scripts/audit_run_drift.py`) makes the drift impossible to miss
+    without blocking a job the user may have wanted to run as-is.
+    """
+    warnings: list[str] = []
+    fields: dict = {}
+    commit = state.get("commit")
+
+    if machine != "main" and commit:
+        main_state = read_git_state_file(cfg, "main")
+        main_commit = (main_state or {}).get("commit")
+        if main_commit and main_commit != commit:
+            warnings.append(
+                f"CODE PROVENANCE DRIFT: {machine} is executing job {job['id']!r} at "
+                f"commit {commit[:12]} (branch {state.get('branch')}) but "
+                f"main's checkout was last observed at commit "
+                f"{main_commit[:12]} — these two machines' checkouts have "
+                f"diverged. If intentional (e.g. testing a branch on {machine} "
+                f"only), ignore; otherwise sync the checkouts before trusting "
+                f"cross-machine comparisons.")
+            fields["main_commit_at_check"] = main_commit
+
+    if state.get("dirty") is True:
+        warnings.append(
+            f"CODE PROVENANCE DRIFT: {machine}'s checkout at "
+            f"{state.get('cwd')!r} has UNCOMMITTED CHANGES while claiming job "
+            f"{job['id']!r} at commit {(commit or '?')[:12]} — the code this job "
+            f"runs is not any commit that exists anywhere, so its results are "
+            f"not reproducible from the recorded SHA alone (a rewound submodule "
+            f"pointer looks exactly like this). Commit or clean the tree before "
+            f"trusting these results.")
+
+    branch = state.get("branch")
+    want = expected_branch(cfg)
+    if branch and branch not in (want, "HEAD") and not state.get("error"):
+        warnings.append(
+            f"CODE PROVENANCE DRIFT: {machine}'s checkout is on branch "
+            f"{branch!r}, not the expected {want!r}, while claiming job "
+            f"{job['id']!r} at commit {(commit or '?')[:12]} — this job runs that "
+            f"branch's code, but nothing downstream attributes it to anything "
+            f"other than {want!r}. If intentional, ignore; otherwise switch the "
+            f"checkout back before trusting these results.")
+
+    if not warnings:
         return
-    main_state = read_git_state_file(cfg, "main")
-    if not main_state or not main_state.get("commit") or not state.get("commit"):
-        return
-    if main_state["commit"] == state["commit"]:
-        return
-    warning = (f"CODE PROVENANCE DRIFT: r9700 is executing job {job['id']!r} at "
-              f"commit {state['commit'][:12]} (branch {state.get('branch')}) but "
-              f"main's checkout was last observed at commit "
-              f"{main_state['commit'][:12]} — these two machines' checkouts have "
-              f"diverged. If intentional (e.g. testing a branch on r9700 only), "
-              f"ignore; otherwise sync the checkouts before trusting cross-machine "
-              f"comparisons.")
+    warning = " | ".join(warnings)
     print(f"[ablator] {warning}", flush=True)
     if q is not None:
-        q.update(job["id"], drift_warning=warning,
-                main_commit_at_check=main_state["commit"])
+        q.update(job["id"], drift_warning=warning, **fields)
+
+
+# Back-compat alias: this check has not been r9700-specific since
+# splatograph#259 (see check_checkout_drift's docstring).
+check_r9700_drift = check_checkout_drift
 
 
 def _dispatch_host_commit(cfg: dict, job: dict) -> str | None:
@@ -1363,7 +1427,7 @@ def run_job(cfg: dict, job: dict, machine: str,
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} (log {log_path})",
           flush=True)
     prov_state = capture_and_record_provenance(cfg, job, machine, cwd or os.getcwd(), q)
-    check_r9700_drift(cfg, job, machine, prov_state, q)
+    check_checkout_drift(cfg, job, machine, prov_state, q)
     container_name = container_name_from_argv(argv)
     if container_name:
         # Pre-launch safety net: if a prior attempt for this same job id
