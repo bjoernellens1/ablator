@@ -1554,8 +1554,34 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
         return
     is_k8s = cfgmod.machine_cfg(cfg, machine).get("backend") == "k8s"
     mcfg = cfgmod.machine_cfg(cfg, machine) if is_k8s else None
+    grace_s = cfg.get("queue", {}).get("reconcile_grace_s", DEFAULT_RECONCILE_GRACE_S)
     for job in q.read():
         if job.get("status") != "running" or job.get("claimed_by") != machine:
+            continue
+
+        # Grace window (issue splatograph#295): a job that was claimed only
+        # moments ago has not necessarily written a log/artifact yet -- a
+        # container can take real wall-clock time to pull/start before its
+        # own health-check artifacts exist. job_health(process_alive=False)
+        # below has no live process handle to consult (this runner process
+        # just (re)started) and, with no log file yet, unconditionally
+        # reports state="crashed" for ANY job with no log -- indistinguishable
+        # from a job seconds into its container start. Confirmed live
+        # 2026-08-12: a job claimed at 18:18:16 was reconciled to pending
+        # and re-claimed/relaunched at 18:21:15 (2m59s later) while its first
+        # attempt's container was still starting, producing two concurrent
+        # training processes that OOM'd each other. `--name`-based busy-guard
+        # detection (see _ensure_container_name) closes most of this window,
+        # but not the sliver between process launch and the container
+        # actually appearing in `docker ps` -- skip reconciling (leave the
+        # job at 'running', untouched) until claimed_at is older than
+        # `[queue] reconcile_grace_s` (default 180s), regardless of health
+        # state or busy-guard result for this tick.
+        age_s = _claimed_age_s(job)
+        if age_s is not None and age_s < grace_s:
+            print(f"[ablator] reconcile: {job['id']} claimed {age_s:.0f}s ago, "
+                  f"still within the {grace_s:.0f}s startup grace window -- "
+                  "not reconciling this tick", flush=True)
             continue
 
         if is_k8s:
@@ -1620,6 +1646,24 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
             q.update(job["id"], status="pending", health=h,
                     claimed_by=None, claimed_at=None, reconciled=True,
                     reconciled_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+
+
+DEFAULT_RECONCILE_GRACE_S = 180.0
+
+
+def _claimed_age_s(job: dict, now: float | None = None) -> float | None:
+    """Seconds since `job['claimed_at']` was stamped, or None if unset/
+    unparseable. `claimed_at` is always written by Queue.claim_next() via
+    `_now()` (`time.strftime('%Y-%m-%dT%H:%M:%S')`, local time, matching
+    `time.strptime` below)."""
+    claimed_at = job.get("claimed_at")
+    if not claimed_at:
+        return None
+    try:
+        claimed_epoch = time.mktime(time.strptime(claimed_at, "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+    return (time.time() if now is None else now) - claimed_epoch
 
 
 DEFAULT_K8S_MAX_CONCURRENT = 4
