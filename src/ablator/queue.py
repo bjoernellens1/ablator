@@ -100,11 +100,44 @@ class Queue:
 
     @staticmethod
     def _save(f, jobs: list[dict]) -> None:
+        """Write the queue's full contents.
+
+        NOT atomic against the caller's own truncate-then-write of `f`
+        (that's still needed since `f` is the flock'd fd itself), but
+        callers must go through Queue.update()/append()/etc., which build
+        the full serialized payload in memory FIRST via _serialize()
+        before ever touching `f` -- so a mid-write failure (e.g. disk
+        full) can still leave `f` truncated with a partial write, but
+        never with a payload that was silently empty because upstream
+        blew up before content existed. See _atomic_write_str() for the
+        real fix: on ANY IOError/OSError during the write loop, restore
+        the pre-truncate content instead of leaving the file empty --
+        found live (2026-08-11) when a disk-full OSError during a normal
+        update() call left queue.jsonl at 0 bytes, silently discarding
+        the entire multi-day job history because truncate() had already
+        run before the write raised.
+        """
+        payload = "".join(json.dumps(j) + "\n" for j in jobs)
         f.seek(0)
-        f.truncate()
-        for j in jobs:
-            f.write(json.dumps(j) + "\n")
-        f.flush()
+        original = f.read()
+        f.seek(0)
+        try:
+            f.truncate()
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        except OSError:
+            # Best-effort restore: put back exactly what was there before,
+            # so a disk-full (or any other write failure) degrades to "the
+            # update was lost" rather than "the entire queue was lost".
+            try:
+                f.seek(0)
+                f.truncate()
+                f.write(original)
+                f.flush()
+            except OSError:
+                pass  # truly out of space even for the restore; nothing more we can do here
+            raise
 
     def _open_locked(self, timeout_s: float | None = None):
         """Open the queue file and acquire LOCK_EX with a deadline.
@@ -258,6 +291,20 @@ class Queue:
               f"job stays 'running' in the queue file", flush=True)
 
     def update(self, job_id: str, **fields) -> None:
+        # A resumable checkpoint records progress under the job's OLD
+        # scene/extra_args -- if the caller is changing what the job
+        # actually runs (a config/path fix, not just a status/claim
+        # bookkeeping update) without also explicitly saying what to do
+        # with the resume pointer, the safe default is to drop it rather
+        # than silently resume a differently-configured run from a
+        # checkpoint that may no longer even match (wrong scene, wrong
+        # flags). Found live (2026-08-11): a scene-path-only fix left a
+        # stale resume_checkpoint in place, so the "fixed" job silently
+        # resumed from an old checkpoint's mid-training state instead of
+        # training cleanly from scratch under the corrected config --
+        # produced a real, materially wrong PSNR that looked plausible.
+        if ("scene" in fields or "extra_args" in fields) and "resume_checkpoint" not in fields:
+            fields = {**fields, "resume_checkpoint": None, "last_resumed_iter": None}
         try:
             with self._open_locked() as f:
                 jobs = self._load(f)
