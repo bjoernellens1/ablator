@@ -753,6 +753,63 @@ def test_reconcile_requeues_when_no_artifact_and_no_process(tmp_path):
     assert job["reconciled"] is True
 
 
+def test_reconcile_skips_recently_claimed_job_within_grace_window(tmp_path):
+    """Regression for splatograph#295: a job claimed moments ago has not
+    necessarily written a log/artifact yet (container still pulling/
+    starting) -- job_health(process_alive=False) with no log file
+    unconditionally reports 'crashed', indistinguishable from a genuine
+    orphan. Must not requeue (and risk a duplicate launch) until claimed_at
+    is older than the grace window."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_starting"
+    mp.mkdir()
+    q = Queue(cfg["queue"]["path"])
+    claimed_at = time.strftime("%Y-%m-%dT%H:%M:%S")  # just now
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": claimed_at}])
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
+    assert job.get("claimed_by") == "main"
+
+
+def test_reconcile_requeues_after_grace_window_elapses(tmp_path):
+    """Once claimed_at is older than the grace window, the existing
+    artifact-gated done/requeue logic applies as before."""
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["reconcile_grace_s"] = 60
+    mp = tmp_path / "run_stale"
+    mp.mkdir()
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "pending"
+    assert job["claimed_by"] is None
+
+
+def test_reconcile_grace_window_configurable(tmp_path):
+    """A custom [queue] reconcile_grace_s is honored."""
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["reconcile_grace_s"] = 1  # effectively no grace
+    mp = tmp_path / "run_stale2"
+    mp.mkdir()
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 5))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "pending"
+
+
 def test_reconcile_skips_while_machine_busy(tmp_path):
     """A still-running process could belong to the stuck job; never touch
     it (and risk a duplicate launch) while busy-guards say something is
