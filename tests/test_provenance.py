@@ -131,6 +131,110 @@ def test_check_r9700_drift_noop_for_main(tmp_path):
     assert "drift_warning" not in entry
 
 
+# ------------------------------------- splatograph#259: generalized drift
+
+def _drift_cfg(tmp_path):
+    qpath = tmp_path / "queue.jsonl"
+    cfg = {"queue": {"path": str(qpath)}, "machines": {}, "types": {}}
+    q = Queue(str(qpath))
+    q.append([{"id": "j1", "type": "replay", "model_path": "output/j1"}])
+    return cfg, q
+
+
+def _warning(q):
+    entry = next(j for j in q.read() if j["id"] == "j1")
+    return entry.get("drift_warning"), entry
+
+
+def test_drift_check_is_not_r9700_specific(tmp_path):
+    """rtx3090 ran a job from a 25-commit-stale checkout with NO warning,
+    because the check returned early for every machine but r9700."""
+    cfg, q = _drift_cfg(tmp_path)
+    _write_state_file(cfg, "main", "commitA")
+    runner.check_checkout_drift(cfg, {"id": "j1"}, "rtx3090",
+                                {"commit": "commitB", "branch": "main",
+                                 "dirty": False}, q)
+    warning, entry = _warning(q)
+    assert warning and "rtx3090" in warning
+    assert entry.get("main_commit_at_check") == "commitA"
+
+
+def test_dirty_tree_warns_even_on_main(tmp_path):
+    """splatograph#259 Instance 2: a rewound submodule pointer on main's
+    own checkout showed up only as ` M ablator` and was never flagged."""
+    cfg, q = _drift_cfg(tmp_path)
+    runner.check_checkout_drift(cfg, {"id": "j1"}, "main",
+                                {"commit": "commitA", "branch": "main",
+                                 "dirty": True, "cwd": "/home/x/splatograph"}, q)
+    warning, entry = _warning(q)
+    assert warning and "UNCOMMITTED CHANGES" in warning
+    # No cross-machine comparison happened, so no misleading reference commit.
+    assert "main_commit_at_check" not in entry
+
+
+def test_off_branch_warns_even_when_clean(tmp_path):
+    """The headline #259 case: a CLEAN main checkout parked on an agent
+    branch, invisible to both the dirty and cross-machine checks."""
+    cfg, q = _drift_cfg(tmp_path)
+    runner.check_checkout_drift(
+        cfg, {"id": "j1"}, "main",
+        {"commit": "commitA", "branch": "agent/report-holdout-hash-field",
+         "dirty": False}, q)
+    warning, _ = _warning(q)
+    assert warning and "agent/report-holdout-hash-field" in warning
+
+
+def test_clean_on_expected_branch_is_silent(tmp_path):
+    cfg, q = _drift_cfg(tmp_path)
+    runner.check_checkout_drift(cfg, {"id": "j1"}, "main",
+                                {"commit": "commitA", "branch": "main",
+                                 "dirty": False}, q)
+    warning, _ = _warning(q)
+    assert warning is None
+
+
+def test_undeterminable_dirty_state_does_not_warn(tmp_path):
+    """dirty=None means git was unreadable, reported via the state's own
+    `error` field — not drift. Warning on it would be pure noise."""
+    cfg, q = _drift_cfg(tmp_path)
+    runner.check_checkout_drift(cfg, {"id": "j1"}, "main",
+                                {"commit": None, "branch": None, "dirty": None,
+                                 "error": "no git repo"}, q)
+    warning, _ = _warning(q)
+    assert warning is None
+
+
+def test_expected_branch_derives_from_auto_sync_ref():
+    assert runner.expected_branch({}) == "main"
+    assert runner.expected_branch(
+        {"urgent_fixes": {"auto_sync_ref": "origin/main"}}) == "main"
+    assert runner.expected_branch(
+        {"urgent_fixes": {"auto_sync_ref": "origin/release"}}) == "release"
+
+
+def test_detached_head_is_not_reported_as_branch_drift(tmp_path):
+    """A pinned/detached checkout (`git rev-parse --abbrev-ref HEAD` ->
+    "HEAD") is the *goal* state of #259's worktree-isolation follow-up —
+    it must not be flagged as drift."""
+    cfg, q = _drift_cfg(tmp_path)
+    runner.check_checkout_drift(cfg, {"id": "j1"}, "main",
+                                {"commit": "commitA", "branch": "HEAD",
+                                 "dirty": False}, q)
+    warning, _ = _warning(q)
+    assert warning is None
+
+
+def test_multiple_conditions_are_combined_into_one_warning(tmp_path):
+    cfg, q = _drift_cfg(tmp_path)
+    _write_state_file(cfg, "main", "commitA")
+    runner.check_checkout_drift(cfg, {"id": "j1"}, "r9700",
+                                {"commit": "commitB", "branch": "feat/x",
+                                 "dirty": True, "cwd": "/repo"}, q)
+    warning, entry = _warning(q)
+    assert warning.count("CODE PROVENANCE DRIFT") == 3
+    assert entry.get("main_commit_at_check") == "commitA"
+
+
 # ---------------------------------------------------------------- k8s image
 
 def _skopeo_ok(revision):
