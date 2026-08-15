@@ -218,6 +218,41 @@ def test_enforce_auto_pulls_via_auto_sync_ref_no_pinned_fixes(tmp_path):
     assert ufmod.missing_fixes(str(clone), [], auto_sync_ref=f"origin/{branch}") == []
 
 
+def test_enforce_detects_gap_when_local_origin_ref_is_stale(tmp_path):
+    """Regression for splatograph#752: the origin advances AFTER the clone
+    was made, with no fetch in between, so the clone's locally-cached
+    refs/remotes/origin/<branch> is stale and still equals local HEAD.
+
+    Before the fix, missing_fixes()'s first call resolved auto_sync_ref
+    from that stale cached ref (identical to HEAD -> "nothing missing")
+    and enforce_urgent_fixes returned True immediately without ever
+    fetching -- permanently blind to the real, growing gap on origin,
+    since fetching only happened as a *consequence* of already believing
+    something was missing. This is a self-reinforcing deadlock on any
+    host that goes idle long enough for its cached remote-tracking ref to
+    go stale relative to the true remote."""
+    origin = tmp_path / "origin"
+    _init_repo(origin)
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
+    branch = _git(clone, "rev-parse", "--abbrev-ref", "HEAD")
+
+    # Clone's cached origin/<branch> == its own HEAD right after cloning --
+    # exactly the "looks current" trap. Now origin moves on without the
+    # clone ever fetching.
+    fix_sha = _commit(origin, "a real fix landed upstream after the clone")
+
+    cfg = _cfg(tmp_path, repo_cwd=str(clone), auto_sync_ref=f"origin/{branch}")
+    q = Queue(str(tmp_path / "queue.jsonl"))
+    result = ufmod.enforce_urgent_fixes(cfg, "main", q)
+    assert result is True
+    assert not is_paused(cfg["queue"]["path"], "main")
+    # The clone must have actually fetched and fast-forwarded -- not just
+    # returned True on stale information.
+    assert _git(clone, "rev-parse", "HEAD") == fix_sha
+
+
 def test_enforce_pauses_on_dirty_tree_via_auto_sync_ref(tmp_path):
     origin = tmp_path / "origin"
     _init_repo(origin)
