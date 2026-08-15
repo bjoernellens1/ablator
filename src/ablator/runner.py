@@ -31,6 +31,7 @@ from . import health as healthmod
 from . import provenance as provmod
 from . import resources
 from . import self_check as selfcheckmod
+from .pause_revalidation import revalidate_pause
 from .queue import Queue, is_paused, pause_flag_path, write_pause_flag
 from .urgent_fixes import enforce_urgent_fixes
 
@@ -2028,6 +2029,20 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 # entries), so calling it every idle tick is cheap in steady
                 # state -- one extra q.read() scan, not a busy-poll.
                 reconcile_stale_running(cfg, machine, q, busy=False)
+
+                # -1. Pause re-validation: if this machine is currently
+                # paused, re-run the SPECIFIC check that caused it (never a
+                # blind timer/TTL -- see pause_revalidation.py and
+                # splatograph issue #629) and clear the flag only if that
+                # check now passes. Human-set pauses (`ablator pause`) and
+                # any category without a registered re-checker are left
+                # untouched. Only reached once machine_busy() above already
+                # confirmed this machine's own GPU is idle -- the same
+                # scoping the urgent-fix gate below relies on -- so
+                # auto-clearing here can never race a foreign or
+                # bind-mounted job for the GPU; it only makes claim_next()
+                # eligible again on a subsequent, still fully-guarded tick.
+                revalidate_pause(cfg, machine, q)
 
                 # 0. Urgent-fix currency gate: verify this dispatcher's own
                 # checkout has every registered urgent fix before dispatching

@@ -33,6 +33,41 @@ def is_paused(queue_path: str, machine: str) -> bool:
     return os.path.exists(pause_flag_path(queue_path, machine))
 
 
+def read_pause_flag(queue_path: str, machine: str) -> dict | None:
+    """Parses an existing pause flag into {'category', 'timestamp',
+    'evidence', ...}. None if there is no flag (or it is unreadable) --
+    callers must treat None the same as "not paused", never as "paused,
+    category unknown"."""
+    path = pause_flag_path(queue_path, machine)
+    info: dict[str, str] = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                if "=" in line:
+                    k, _, v = line.strip().partition("=")
+                    info[k] = v
+    except OSError:
+        return None
+    return info or None
+
+
+def _pause_audit_path(queue_path: str) -> str:
+    return os.path.join(os.path.dirname(queue_path), "pause_audit.log")
+
+
+def _append_pause_audit(queue_path: str, line: str) -> None:
+    """Best-effort durable audit trail of pause set/clear events, separate
+    from the ephemeral flag file itself (which is deleted on clear) and
+    from stdout (which is not always captured/searchable). Never raises --
+    an audit-logging failure must not affect pause/clear/dispatch."""
+    path = _pause_audit_path(queue_path)
+    try:
+        with open(path, "a") as f:
+            f.write(f"{_now()} {line}\n")
+    except OSError as e:
+        print(f"[ablator] could not append pause audit {path}: {e}", flush=True)
+
+
 def write_pause_flag(queue_path: str, machine: str, category: str, evidence: str) -> str:
     path = pause_flag_path(queue_path, machine)
     try:
@@ -42,16 +77,32 @@ def write_pause_flag(queue_path: str, machine: str, category: str, evidence: str
                      f"evidence={evidence}\n")
     except OSError as e:
         print(f"[ablator] could not write pause flag {path}: {e}", flush=True)
+        return path
+    _append_pause_audit(
+        queue_path,
+        f"SET machine={machine} category={category} evidence={evidence!r}")
     return path
 
 
-def clear_pause_flag(queue_path: str, machine: str) -> bool:
+def clear_pause_flag(queue_path: str, machine: str, reason: str | None = None) -> bool:
+    """Removes the pause flag for `machine`. `reason` (e.g.
+    "manual:ablator unpause" or "auto_revalidate:urgent_fix_unsynced: ...")
+    is recorded in the durable audit log alongside the category/evidence
+    the flag carried, so a cleared pause stays auditable after the flag
+    file itself is gone -- never a silent clear."""
     path = pause_flag_path(queue_path, machine)
+    info = read_pause_flag(queue_path, machine)
     try:
         os.remove(path)
-        return True
     except OSError:
         return False
+    was_category = (info or {}).get("category", "?")
+    was_evidence = (info or {}).get("evidence", "?")
+    _append_pause_audit(
+        queue_path,
+        f"CLEAR machine={machine} was_category={was_category} "
+        f"was_evidence={was_evidence!r} reason={reason or 'unspecified'}")
+    return True
 
 
 def not_before_ok(job: dict, now: float | None = None) -> bool:

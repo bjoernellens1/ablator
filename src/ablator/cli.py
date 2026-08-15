@@ -14,7 +14,7 @@ from . import health as healthmod
 from . import progress as progmod
 from . import runner, spec as specmod
 from .queue import (Queue, job_lane, clear_pause_flag, pause_flag_path,
-                    write_pause_flag)
+                    read_pause_flag, write_pause_flag)
 
 
 def _queue(cfg: dict) -> Queue:
@@ -136,15 +136,8 @@ def _pause_flag_lines(cfg: dict) -> list[str]:
         if not (fname.startswith("paused_") and fname.endswith(".txt")):
             continue
         machine = fname[len("paused_"):-len(".txt")]
-        path = os.path.join(qdir, fname)
-        info = {}
-        try:
-            with open(path) as f:
-                for line in f:
-                    if "=" in line:
-                        k, _, v = line.strip().partition("=")
-                        info[k] = v
-        except OSError:
+        info = read_pause_flag(cfgmod.queue_path(cfg), machine)
+        if info is None:
             continue
         lines.append(f"⚠ {machine} is PAUSED ({info.get('category', '?')}) "
                      f"since {info.get('timestamp', '?')} — see {fname}")
@@ -406,16 +399,9 @@ def cmd_unpause(cfg: dict, machine: str | None) -> None:
     path = pause_flag_path(cfgmod.queue_path(cfg), machine)
     if not os.path.exists(path):
         raise SystemExit(f"[unpause] no pause flag for '{machine}' ({path})")
-    info = {}
-    try:
-        with open(path) as f:
-            for line in f:
-                if "=" in line:
-                    k, _, v = line.strip().partition("=")
-                    info[k] = v
-    except OSError:
-        pass
-    cleared = clear_pause_flag(cfgmod.queue_path(cfg), machine)
+    info = read_pause_flag(cfgmod.queue_path(cfg), machine) or {}
+    cleared = clear_pause_flag(cfgmod.queue_path(cfg), machine,
+                               reason="manual:ablator unpause")
     if cleared:
         print(f"[unpause] cleared {path} — was: category={info.get('category', '?')} "
               f"since={info.get('timestamp', '?')} evidence={info.get('evidence', '?')}")
