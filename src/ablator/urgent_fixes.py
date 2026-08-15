@@ -45,12 +45,23 @@ not be behind <ref>" (e.g. `origin/main`), so every future commit is
 covered automatically with no per-fix bookkeeping. Same safety contract
 as the pinned-SHA path exactly: only ever fast-forwards on an idle,
 clean tree; anything else pauses the machine for a human, never forces.
+
+Third incident (splatograph issue #629, 2026-08-14/15): a pause set here
+(category "urgent_fix_unsynced") has no re-check or expiry once written,
+so a transient `git fetch` failure paused a machine for ~9.5 hours after
+the transport problem had already cleared. `_revalidate_urgent_fix_unsynced`
+below (registered with pause_revalidation.py) closes that gap by
+re-running THIS gate's own missing-fixes check on every idle loop tick
+while paused, and auto-clearing only once it genuinely passes -- see
+pause_revalidation.py's module docstring for why a blind TTL, or clearing
+on "the fetch command now succeeds" alone, are both wrong.
 """
 from __future__ import annotations
 
 import subprocess
 
 from .provenance import _run_git
+from .pause_revalidation import register_auto_revalidator
 
 
 def load_urgent_fixes(cfg: dict) -> tuple[str | None, list[dict], str | None]:
@@ -138,6 +149,24 @@ def _fetch(repo_cwd: str) -> bool:
         r = subprocess.run(["git", "fetch"], cwd=repo_cwd,
                            capture_output=True, text=True, timeout=60.0,
                            check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def _ls_remote_ok(repo_cwd: str) -> bool:
+    """Genuinely read-only connectivity probe -- no ref mutation, unlike
+    `git fetch` (which updates remote-tracking refs even when nothing
+    else about it changes). Used only to decide whether transport is back
+    before re-attempting the normal fetch/ff-pull path during
+    re-validation; see the #629 incident note above for why this needs
+    to be a separate step rather than just retrying `git fetch` and
+    reading its exit code."""
+    try:
+        r = subprocess.run(
+            ["git", "ls-remote", "origin", "HEAD"], cwd=repo_cwd,
+            capture_output=True, text=True, timeout=15.0, check=False,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0
@@ -234,3 +263,60 @@ def enforce_urgent_fixes(cfg: dict, machine: str, q) -> bool:
     print(f"[ablator] PAUSING {machine} — urgent_fix_unsynced (auto-pull "
           f"did not resolve): {evidence!r} (flag: {path})", flush=True)
     return False
+
+
+def _revalidate_urgent_fix_unsynced(cfg: dict, machine: str) -> tuple[bool, str]:
+    """Re-checker for pause_revalidation.py, registered against category
+    "urgent_fix_unsynced" below. Called on every idle loop tick while a
+    machine is paused under this category.
+
+    Re-runs the SAME guarded condition enforce_urgent_fixes() uses
+    (missing_fixes' ancestor test), not a blind retry of whatever step
+    happened to fail when the pause was set. Per the #629 incident: a
+    pause evidenced by "git fetch failed" means the currency check could
+    not run -- it is not itself evidence the checkout is behind. So the
+    first, network-free thing this does is re-run the ancestor test
+    against whatever is on disk right now; only if that still reports
+    something missing does it fall through to a genuinely read-only
+    connectivity probe (`git ls-remote`, no ref mutation) and then, if
+    that succeeds, the identical safe fetch/ff-pull path
+    enforce_urgent_fixes() itself uses -- so re-validation can never do
+    anything enforce_urgent_fixes() wouldn't also have done on a fresh
+    idle tick with no pre-existing pause.
+    """
+    repo_cwd, fixes, auto_sync_ref = load_urgent_fixes(cfg)
+    if repo_cwd is None:
+        # Feature has been unconfigured since the pause was set -- the
+        # condition it was guarding no longer applies.
+        return True, "urgent_fixes is no longer configured"
+
+    missing = missing_fixes(repo_cwd, fixes, auto_sync_ref)
+    if not missing:
+        return True, (f"local checkout at {repo_cwd} already has every "
+                       f"registered fix (ancestor test, no network needed)")
+
+    if _clean_tree(repo_cwd) is not True:
+        return False, f"working tree at {repo_cwd} is still dirty/unreadable"
+
+    if not _ls_remote_ok(repo_cwd):
+        return False, ("git ls-remote origin HEAD still fails -- transport "
+                        "not yet restored")
+
+    if not _fetch(repo_cwd):
+        return False, "git fetch still fails despite ls-remote succeeding"
+
+    missing = missing_fixes(repo_cwd, fixes, auto_sync_ref)
+    if not missing:
+        return True, "fetch closed the gap on re-check (no pull needed)"
+
+    ok, out = _ff_pull(repo_cwd)
+    missing_after = missing_fixes(repo_cwd, fixes, auto_sync_ref)
+    if ok and not missing_after:
+        return True, f"fast-forward pull closed the gap on re-check -- {out!r}"
+
+    return False, (
+        f"still missing after fetch/pull (ok={ok}): "
+        f"{[fx.get('sha') for fx in missing_after]}; output: {out!r}")
+
+
+register_auto_revalidator("urgent_fix_unsynced", _revalidate_urgent_fix_unsynced)
