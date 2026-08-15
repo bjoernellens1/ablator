@@ -226,6 +226,27 @@ def enforce_urgent_fixes(cfg: dict, machine: str, q) -> bool:
     if repo_cwd is None:
         return True  # feature not configured -- pure no-op
 
+    # Fetch FIRST, unconditionally, before ever consulting missing_fixes().
+    #
+    # Found 2026-08-15 (issue splatograph#752): missing_fixes() with an
+    # auto_sync_ref resolves that ref from whatever remote-tracking data is
+    # ALREADY on disk (see its own docstring) -- it does not fetch. The old
+    # code only called _fetch() *after* this first check already believed
+    # something was missing. If a host's local `origin/main` ref is itself
+    # stale and happens to already equal local HEAD (e.g. this host hasn't
+    # dispatched in a while, so nothing has triggered a fetch), the first
+    # check reports "nothing missing" and returns True immediately at line
+    # ~231 (old numbering) without ever fetching -- permanently blind to a
+    # real, growing gap. This is a self-reinforcing deadlock: fetching is
+    # the ONLY thing that ever updates that stale ref, and the gate is the
+    # only caller of fetch, but the gate only fetches once it already
+    # (wrongly) suspects a gap. Confirmed live: r9700 fell 44 commits
+    # behind and a full training run there silently landed inside the
+    # (already-fixed-on-main) #646/#647 reportless window before being
+    # caught. A fetch failure here does not by itself pause the machine --
+    # only a genuine, post-fetch missing-fixes gap does, exactly as below.
+    _fetch(repo_cwd)
+
     missing = missing_fixes(repo_cwd, fixes, auto_sync_ref)
     if not missing:
         return True
@@ -246,22 +267,6 @@ def enforce_urgent_fixes(cfg: dict, machine: str, q) -> bool:
               f"tree, cannot auto-pull safely): {evidence!r} (flag: {path})",
               flush=True)
         return False
-
-    if not _fetch(repo_cwd):
-        evidence = f"git fetch failed at {repo_cwd}"
-        path = write_pause_flag(queue_path, machine, "urgent_fix_unsynced",
-                                evidence)
-        print(f"[ablator] PAUSING {machine} — urgent_fix_unsynced (fetch "
-              f"failed): {evidence!r} (flag: {path})", flush=True)
-        return False
-
-    # Re-check after fetch: the sha may now be reachable without a pull
-    # (e.g. HEAD already includes it once remote-tracking refs update).
-    missing = missing_fixes(repo_cwd, fixes, auto_sync_ref)
-    if not missing:
-        print(f"[ablator] urgent-fix gate: {repo_cwd} already current "
-              f"after fetch (no pull needed)", flush=True)
-        return True
 
     ok, out = _ff_pull(repo_cwd)
     missing_after = missing_fixes(repo_cwd, fixes, auto_sync_ref)
