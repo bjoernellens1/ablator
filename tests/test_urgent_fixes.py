@@ -253,3 +253,31 @@ def test_load_urgent_fixes_auto_sync_ref_only_is_configured(tmp_path):
     assert repo_cwd == "/some/repo"
     assert fixes == []
     assert ref == "origin/main"
+
+
+def test_load_urgent_fixes_per_machine_repo_cwd_override(tmp_path):
+    """A machine with a different user/home (e.g. rtx3090 running as
+    bjoern1) or a dedicated worktree must be able to override repo_cwd
+    (and optionally auto_sync_ref) without affecting other machines."""
+    cfg = {
+        "urgent_fixes": {
+            "repo_cwd": "/home/bjoern/git/splatograph",
+            "auto_sync_ref": "origin/main",
+            "machines": {
+                "rtx3090": {"repo_cwd": "/home/bjoern1/git/splatograph"},
+            },
+        }
+    }
+    # Unlisted machine falls back to the global repo_cwd.
+    repo_cwd, _, ref = ufmod.load_urgent_fixes(cfg, "main")
+    assert repo_cwd == "/home/bjoern/git/splatograph"
+    assert ref == "origin/main"
+
+    # Overridden machine gets its own repo_cwd, inherits auto_sync_ref.
+    repo_cwd, _, ref = ufmod.load_urgent_fixes(cfg, "rtx3090")
+    assert repo_cwd == "/home/bjoern1/git/splatograph"
+    assert ref == "origin/main"
+
+    # No machine given (back-compat callers) -> global default.
+    repo_cwd, _, _ = ufmod.load_urgent_fixes(cfg)
+    assert repo_cwd == "/home/bjoern/git/splatograph"

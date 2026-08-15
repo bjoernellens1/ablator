@@ -53,13 +53,29 @@ import subprocess
 from .provenance import _run_git
 
 
-def load_urgent_fixes(cfg: dict) -> tuple[str | None, list[dict], str | None]:
+def load_urgent_fixes(
+    cfg: dict, machine: str | None = None,
+) -> tuple[str | None, list[dict], str | None]:
     """Returns (repo_cwd, fixes, auto_sync_ref).
-    Empty/missing config -> (None, [], None)."""
+    Empty/missing config -> (None, [], None).
+
+    `repo_cwd` and `auto_sync_ref` may be overridden per-machine via
+    `[urgent_fixes.machines.<machine>]` (e.g. a different user's home
+    directory, or a dedicated worktree that machine dispatches jobs
+    from) -- found 2026-08-15: rtx3090 runs as user `bjoern1`
+    (`/home/bjoern1/...`), not `bjoern`, so a single global `repo_cwd`
+    silently pointed at a path that does not exist on that host,
+    permanently no-op'ing the sync gate there. `fixes` (the pinned-SHA
+    list) intentionally has no per-machine override -- the same set of
+    commits must be present everywhere regardless of checkout path."""
     uf = cfg.get("urgent_fixes") or {}
     repo_cwd = uf.get("repo_cwd")
     fixes = uf.get("fixes") or []
     auto_sync_ref = uf.get("auto_sync_ref") or None
+    if machine:
+        override = (uf.get("machines") or {}).get(machine) or {}
+        repo_cwd = override.get("repo_cwd") or repo_cwd
+        auto_sync_ref = override.get("auto_sync_ref") or auto_sync_ref
     if not repo_cwd or (not fixes and not auto_sync_ref):
         return None, [], None
     return repo_cwd, fixes, auto_sync_ref
@@ -177,7 +193,7 @@ def enforce_urgent_fixes(cfg: dict, machine: str, q) -> bool:
         # do; caller's existing claim_next() calls already no-op.
         return False
 
-    repo_cwd, fixes, auto_sync_ref = load_urgent_fixes(cfg)
+    repo_cwd, fixes, auto_sync_ref = load_urgent_fixes(cfg, machine)
     if repo_cwd is None:
         return True  # feature not configured -- pure no-op
 
