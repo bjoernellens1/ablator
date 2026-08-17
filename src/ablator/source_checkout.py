@@ -255,6 +255,34 @@ def _validate_required_fixes(cfg: dict, repo: str, checkout: str,
             )
 
 
+def validate_requested_revision_policy(
+    cfg: dict, job: dict, machine: str, source_cwd: str | None,
+) -> str | None:
+    """Validate a pinned revision without creating a host worktree.
+
+    Used by backends such as Kubernetes whose init container materializes the
+    checkout itself. The dispatch host still verifies that the requested
+    object exists and contains every explicit mandatory urgent fix before any
+    workload object is submitted. Returns the stable repository identity for
+    pinned jobs and ``None`` for legacy jobs.
+    """
+    requested = job.get("requested_git_sha")
+    if not requested:
+        return None
+    root = _cache_root(cfg, machine)
+    repo, identity = _ensure_source_repo(source_cwd, job.get("git_repo"), root)
+    _ensure_commit(repo, requested)
+    for required, subject in _required_fix_shas(cfg):
+        _ensure_commit(repo, required)
+        result = _git(repo, "merge-base", "--is-ancestor", required, requested, timeout=20)
+        if result.returncode != 0:
+            raise SourcePreparationError(
+                f"requested Git SHA {requested} omits mandatory urgent fix "
+                f"{required} ({subject}); refusing this job without pausing the machine"
+            )
+    return identity
+
+
 def _replace_checkout(value, old: str | None, new: str):
     if isinstance(value, str):
         out = value.replace("{repo_cwd}", new)
