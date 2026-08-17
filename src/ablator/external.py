@@ -29,6 +29,11 @@ RESERVED_PARAMS = frozenset(
 TERMINAL_STATES = frozenset(
     {"done", "failed", "quarantined", "cancelled", "failed_no_retry"}
 )
+# Identity of the source tree loaded by this Ablator process. Computing this
+# once at import/startup is both cheaper than hashing on every claim and more
+# semantically correct if the checkout is later edited without restarting the
+# already-running process.
+_PROCESS_SOURCE_SHA256 = package_source_sha256(Path(__file__).resolve().parent)
 
 
 class ExternalJobError(SystemExit):
@@ -261,7 +266,7 @@ def capture_runner_provenance(cfg: dict[str, Any], machine: str) -> dict[str, An
         version = importlib.metadata.version("ablator")
     except importlib.metadata.PackageNotFoundError:
         version = "unknown"
-    source_sha256 = package_source_sha256(module_path.parent)
+    source_sha256 = _PROCESS_SOURCE_SHA256
 
     return {
         "schema": "ablator.runner-provenance/v1",
