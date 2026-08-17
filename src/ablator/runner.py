@@ -350,6 +350,10 @@ def _inject_container_environment(argv: list[str], child_env: dict[str, str]) ->
             key = argv[index + 1].split("=", 1)[0]
             if key in protected:
                 raise TemplateError(f"command template overrides protected env {key}")
+        if token.startswith("-e") and not token.startswith("--") and len(token) > 2:
+            key = token[2:].split("=", 1)[0]
+            if key in protected:
+                raise TemplateError(f"command template overrides protected env {key}")
         if token.startswith("--env="):
             key = token[len("--env="):].split("=", 1)[0]
             if key in protected:

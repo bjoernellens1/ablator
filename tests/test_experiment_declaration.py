@@ -248,6 +248,25 @@ def test_render_command_injects_declaration_into_container_environment():
     assert argv.index("--env") < argv.index("image:tag")
 
 
+@pytest.mark.parametrize("runtime", ["docker", "podman"])
+@pytest.mark.parametrize("name", sorted(declarations.PROTECTED_ENV))
+def test_render_command_rejects_compact_protected_container_env(runtime, name):
+    """Compact ``-eNAME=value`` must not override trusted injected values."""
+    job = specmod.expand_spec(_declared_spec())[0]
+    tcfg = {
+        "command": [
+            runtime,
+            "run",
+            f"-e{name}=evil",
+            "-eUNRELATED=allowed",
+            "image:tag",
+        ]
+    }
+
+    with pytest.raises(runner.TemplateError, match=name):
+        runner.render_command(tcfg, job, "main")
+
+
 def test_render_command_fails_closed_on_tampered_queue_declaration():
     """Manual queue edits after enqueue must not reach a child process."""
     job = specmod.expand_spec(_declared_spec())[0]
