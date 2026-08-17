@@ -37,6 +37,12 @@ def _cfg(tmp_path: Path) -> dict:
     return {**raw, "_path": str(config)}
 
 
+def _last_json(text: str) -> dict:
+    """Parse the command's final JSON line despite unrelated daemon-test output."""
+    lines = [line for line in text.splitlines() if line.strip()]
+    return json.loads(lines[-1])
+
+
 def test_submit_is_idempotent_and_conflicts_fail_closed(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     job = build_job(
@@ -143,15 +149,15 @@ def test_cli_submit_inspect_cancel_json_contract(tmp_path: Path, capsys: pytest.
             '{"scheduler":"snakemake"}',
         ]
     )
-    submitted = json.loads(capsys.readouterr().out)
+    submitted = _last_json(capsys.readouterr().out)
     assert submitted["job_id"] == "cli-job"
     assert submitted["created"] is True
 
     cli.main(["--config", cfg["_path"], "inspect", "--format", "json", "cli-job"])
-    inspected = json.loads(capsys.readouterr().out)
+    inspected = _last_json(capsys.readouterr().out)
     assert inspected["status"] == "pending"
     assert inspected["metadata"]["scheduler"] == "snakemake"
 
     cli.main(["--config", cfg["_path"], "cancel-jobs", "--format", "json", "cli-job"])
-    cancelled = json.loads(capsys.readouterr().out)
+    cancelled = _last_json(capsys.readouterr().out)
     assert cancelled["jobs"][0]["status"] == "cancelled"
