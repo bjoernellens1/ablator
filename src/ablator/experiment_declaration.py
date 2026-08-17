@@ -1,4 +1,4 @@
-"""Immutable, content-addressed experiment declarations."""
+"""Immutable, content-addressed experiment declarations and launch provenance."""
 
 from __future__ import annotations
 
@@ -11,7 +11,17 @@ from typing import Any, Mapping
 DECLARATION_ENV = "ABLATOR_EXPERIMENT_DECLARATION_JSON"
 DECLARATION_SHA_ENV = "ABLATOR_EXPERIMENT_DECLARATION_SHA256"
 JOB_ID_ENV = "ABLATOR_JOB_ID"
-PROTECTED_ENV = frozenset({DECLARATION_ENV, DECLARATION_SHA_ENV, JOB_ID_ENV})
+JOB_JSON_ENV = "ABLATOR_JOB_JSON"
+SUBMISSION_ENV = "ABLATOR_SUBMISSION_JSON"
+PROTECTED_ENV = frozenset(
+    {
+        DECLARATION_ENV,
+        DECLARATION_SHA_ENV,
+        JOB_ID_ENV,
+        JOB_JSON_ENV,
+        SUBMISSION_ENV,
+    }
+)
 
 SUPPORTED_SCHEMA_VERSION = 1
 GRADEABLE_RUN_CLASSES = frozenset({"experiment", "benchmark", "verification"})
@@ -214,31 +224,93 @@ def validate_immutable_update(
             )
 
 
+def _canonical_json(value: Any) -> str:
+    """Canonical JSON used by the generic launch-provenance transport."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def submission_provenance(job: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the exact queue-submission envelope for a job when known.
+
+    ``ablator plan`` freezes its loaded spec into ``submission_provenance``.
+    External ``ablator submit`` jobs predate that field, but already carry all
+    immutable submit inputs in the queue record, so build the equivalent
+    structured envelope here without requiring a queue/schema migration.
+    """
+    recorded = job.get("submission_provenance")
+    if isinstance(recorded, Mapping):
+        return deepcopy(dict(recorded))
+
+    if job.get("external_schema"):
+        return {
+            "schema": "ablator.submission/v1",
+            "surface": "submit",
+            "job_id": str(job.get("id") or ""),
+            "type": job.get("type"),
+            "machine": job.get("machine", "any"),
+            "params": deepcopy(job.get("params") or {}),
+            "metadata": deepcopy(job.get("external_metadata") or {}),
+            "lane": job.get("lane", 2),
+            "depends_on": job.get("depends_on"),
+            "external_schema": job.get("external_schema"),
+            "external_spec_sha256": job.get("external_spec_sha256"),
+        }
+    return None
+
+
 def experiment_environment(job: Mapping[str, Any]) -> dict[str, str]:
-    """Return only the protected child-process declaration environment."""
-    frozen = validate_frozen_job(job)
-    if frozen is None:
-        return {}
+    """Return protected child-process provenance environment.
+
+    Job identity and a canonical queue-record snapshot are transported for
+    *every* Ablator-managed job, including legacy/undeclared jobs. Experiment
+    declaration variables remain conditional on a valid frozen declaration.
+    """
     job_id = job.get("id")
     if not _present(job_id):
-        raise ExperimentDeclarationError("declared job requires a non-empty job id")
-    return {
-        DECLARATION_ENV: frozen["experiment_declaration_json"],
-        DECLARATION_SHA_ENV: frozen["experiment_declaration_sha256"],
+        raise ExperimentDeclarationError("job requires a non-empty job id")
+
+    frozen = validate_frozen_job(job)
+    env = {
         JOB_ID_ENV: str(job_id),
+        JOB_JSON_ENV: _canonical_json(dict(job)),
     }
+
+    submission = submission_provenance(job)
+    if submission is not None:
+        env[SUBMISSION_ENV] = _canonical_json(submission)
+
+    if frozen is not None:
+        env.update(
+            {
+                DECLARATION_ENV: frozen["experiment_declaration_json"],
+                DECLARATION_SHA_ENV: frozen["experiment_declaration_sha256"],
+            }
+        )
+    return env
 
 
 def runner_log_banner(job: Mapping[str, Any]) -> str:
-    """Render the exact frozen declaration transported to the child."""
+    """Render the exact protected provenance transported to the child."""
     env = experiment_environment(job)
-    if not env:
-        return "# experiment declaration: MISSING (NON-GRADEABLE LEGACY JOB)"
-    return "\n".join(
+    lines = [f"# {JOB_ID_ENV}={env[JOB_ID_ENV]}"]
+    lines.append(f"# {JOB_JSON_ENV}={env[JOB_JSON_ENV]}")
+    if SUBMISSION_ENV in env:
+        lines.append(f"# {SUBMISSION_ENV}={env[SUBMISSION_ENV]}")
+
+    if DECLARATION_ENV not in env:
+        lines.insert(0, "# experiment declaration: MISSING (NON-GRADEABLE LEGACY JOB)")
+        return "\n".join(lines)
+
+    lines.insert(0, f"# experiment declaration: {job['gradeability']}")
+    lines.extend(
         [
-            f"# experiment declaration: {job['gradeability']}",
-            f"# {JOB_ID_ENV}={env[JOB_ID_ENV]}",
             f"# {DECLARATION_SHA_ENV}={env[DECLARATION_SHA_ENV]}",
             f"# {DECLARATION_ENV}={env[DECLARATION_ENV]}",
         ]
     )
+    return "\n".join(lines)
