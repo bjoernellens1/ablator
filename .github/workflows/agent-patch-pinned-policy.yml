@@ -1,0 +1,134 @@
+name: Agent patch pinned policy integration
+
+on:
+  push:
+    branches: [agent/issues-29-30-pinned-policy-remote]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/issues-29-30-pinned-policy-remote
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply scheduler and k8s integration
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # Queue: an urgent-fix pause protects mutable jobs, but a validated
+          # immutable job may still be claimed. Manual/unknown pauses remain absolute.
+          qpath = Path('src/ablator/queue.py')
+          q = qpath.read_text()
+          old_sig = '''    def claim_next(self, machine: str,\n                   can_run: Callable[[dict], bool] | None = None,\n                   only_pinned: bool = False) -> dict | None:\n'''
+          new_sig = '''    def claim_next(self, machine: str,\n                   can_run: Callable[[dict], bool] | None = None,\n                   only_pinned: bool = False,\n                   allow_pinned_git_while_paused: bool = False) -> dict | None:\n'''
+          if new_sig not in q:
+              assert q.count(old_sig) == 1, q.count(old_sig)
+              q = q.replace(old_sig, new_sig, 1)
+
+          old_pause = '''        if is_paused(self.path, machine):\n            return None\n        try:\n'''
+          new_pause = '''        paused_pinned_only = False\n        if is_paused(self.path, machine):\n            pause_info = read_pause_flag(self.path, machine) or {}\n            if (allow_pinned_git_while_paused\n                    and pause_info.get("category") == "urgent_fix_unsynced"):\n                paused_pinned_only = True\n            else:\n                return None\n        try:\n'''
+          if new_pause not in q:
+              assert q.count(old_pause) == 1, q.count(old_pause)
+              q = q.replace(old_pause, new_pause, 1)
+
+          old_pending = '''                    if j.get("status") != "pending":\n                        continue\n                    jm = j.get("machine", "any")\n'''
+          new_pending = '''                    if j.get("status") != "pending":\n                        continue\n                    if paused_pinned_only and not j.get("requested_git_sha"):\n                        continue\n                    jm = j.get("machine", "any")\n'''
+          if new_pending not in q:
+              assert q.count(old_pending) == 1, q.count(old_pending)
+              q = q.replace(old_pending, new_pending, 1)
+
+          old_doc = '''        A machine-level pause flag (see pause_flag_path) blocks new claims\n        without disturbing already-running jobs. A queue-flock timeout\n'''
+          new_doc = '''        A machine-level pause flag (see pause_flag_path) normally blocks new\n        claims without disturbing already-running jobs. When\n        ``allow_pinned_git_while_paused`` is true, the one auto-generated\n        ``urgent_fix_unsynced`` category becomes a pinned-Git-only filter:\n        legacy mutable jobs remain blocked, while immutable jobs may be\n        claimed and validate their requested revision independently before\n        launch. Manual and unknown pause categories remain absolute.\n\n        A queue-flock timeout\n'''
+          if new_doc not in q:
+              assert q.count(old_doc) == 1, q.count(old_doc)
+              q = q.replace(old_doc, new_doc, 1)
+          qpath.write_text(q)
+
+          # Source policy: expose a pre-materialization validator for k8s,
+          # where the init container performs the actual checkout.
+          spath = Path('src/ablator/source_checkout.py')
+          s = spath.read_text()
+          anchor = '''def _replace_checkout(value, old: str | None, new: str):\n'''
+          helper = '''def validate_requested_revision_policy(\n    cfg: dict, job: dict, machine: str, source_cwd: str | None,\n) -> str | None:\n    """Validate a pinned revision without creating a host worktree.\n\n    Used by backends such as Kubernetes whose init container materializes the\n    checkout itself. The dispatch host still verifies that the requested\n    object exists and contains every explicit mandatory urgent fix before any\n    workload object is submitted. Returns the stable repository identity for\n    pinned jobs and ``None`` for legacy jobs.\n    """\n    requested = job.get("requested_git_sha")\n    if not requested:\n        return None\n    root = _cache_root(cfg, machine)\n    repo, identity = _ensure_source_repo(source_cwd, job.get("git_repo"), root)\n    _ensure_commit(repo, requested)\n    for required, subject in _required_fix_shas(cfg):\n        _ensure_commit(repo, required)\n        result = _git(repo, "merge-base", "--is-ancestor", required, requested, timeout=20)\n        if result.returncode != 0:\n            raise SourcePreparationError(\n                f"requested Git SHA {requested} omits mandatory urgent fix "\n                f"{required} ({subject}); refusing this job without pausing the machine"\n            )\n    return identity\n\n\n'''
+          if helper not in s:
+              assert s.count(anchor) == 1, s.count(anchor)
+              s = s.replace(anchor, helper + anchor, 1)
+          spath.write_text(s)
+
+          rpath = Path('src/ablator/runner.py')
+          r = rpath.read_text()
+
+          # Mutable checkout drift warnings are irrelevant for exact pinned
+          # worktrees after the hard requested==executed check.
+          drift_anchor = '''    warnings: list[str] = []\n    fields: dict = {}\n'''
+          drift_new = '''    if job.get("requested_git_sha"):\n        return\n\n    warnings: list[str] = []\n    fields: dict = {}\n'''
+          if drift_new not in r:
+              assert r.count(drift_anchor) == 1, r.count(drift_anchor)
+              r = r.replace(drift_anchor, drift_new, 1)
+
+          # K8s can honor a pin only when git-sync is configured. Validate
+          # requested revision policy on the dispatcher before kubectl apply.
+          k8s_old = '''    log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")\n    try:\n        tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)\n        argv, _env, cwd = render_command(tcfg, job, machine)\n    except (KeyError, TemplateError) as e:\n        print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)\n        return "failed", None\n\n    local_commit = _dispatch_host_commit(cfg, job)\n'''
+          k8s_new = '''    log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")\n    try:\n        tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)\n        if job.get("requested_git_sha"):\n            if not mcfg.get("git_sync_repo_url"):\n                raise sourcecheckout.SourcePreparationError(\n                    "pinned k8s job requires machine git_sync_repo_url so the "\n                    "pod can materialize the requested SHA")\n            source_cwd = (cfg.get("types", {}).get(job.get("type", ""), {})\n                          .get("cwd"))\n            source_identity = sourcecheckout.validate_requested_revision_policy(\n                cfg, job, machine, source_cwd)\n            if q is not None:\n                q.update(job["id"], source_repo=source_identity,\n                         requested_git_sha=job.get("requested_git_sha"))\n        argv, _env, cwd = render_command(tcfg, job, machine)\n    except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:\n        print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)\n        if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):\n            q.update(job["id"], source_prepare_error=str(e))\n        return "failed", None\n\n    local_commit = _dispatch_host_commit(cfg, job)\n'''
+          if k8s_new not in r:
+              assert r.count(k8s_old) == 1, r.count(k8s_old)
+              r = r.replace(k8s_old, k8s_new, 1)
+
+          # Do not let a mutable-checkout currency failure globally block a
+          # pinned job. Keep the pause flag and let Queue filter to pinned jobs.
+          gate_old = '''                if not enforce_urgent_fixes(cfg, machine, q):\n                    if once:\n                        inflight.join_all()\n                        return\n                    time.sleep(IDLE_POLL_S)\n                    continue\n\n                # 1. Claim (non-blocking) this runner's own bare-metal job\n'''
+          gate_new = '''                currency_ok = enforce_urgent_fixes(cfg, machine, q)\n\n                # 1. Claim (non-blocking) this runner's own bare-metal job\n'''
+          if gate_new not in r:
+              assert r.count(gate_old) == 1, r.count(gate_old)
+              r = r.replace(gate_old, gate_new, 1)
+
+          claim_old = '''                job = q.claim_next(machine, can_run=make_can_run(cfg, machine))\n'''
+          claim_new = '''                job = q.claim_next(\n                    machine, can_run=make_can_run(cfg, machine),\n                    allow_pinned_git_while_paused=not currency_ok,\n                )\n'''
+          if claim_new not in r:
+              assert r.count(claim_old) == 1, r.count(claim_old)
+              r = r.replace(claim_old, claim_new, 1)
+
+          # Define currency_ok on busy ticks too; the gate is deliberately not
+          # run while a bind-mounted local workload is active.
+          job_old = '''            job = None\n            if not baremetal_busy:\n'''
+          job_new = '''            job = None\n            currency_ok = True\n            if not baremetal_busy:\n'''
+          if job_new not in r:
+              assert r.count(job_old) == 1, r.count(job_old)
+              r = r.replace(job_old, job_new, 1)
+
+          # If local mutable currency is bad, k8s may still accept jobs that
+          # bring their own exact SHA; unpinned k8s jobs remain blocked.
+          kfill_old = '''                cap = _k8s_max_concurrent(cfg, k8s_name)\n                can_run = make_can_run(cfg, k8s_name)\n                while inflight.count(k8s_name) < cap:\n'''
+          kfill_new = '''                cap = _k8s_max_concurrent(cfg, k8s_name)\n                base_can_run = make_can_run(cfg, k8s_name)\n                if currency_ok:\n                    can_run = base_can_run\n                else:\n                    can_run = lambda candidate, inner=base_can_run: (\n                        bool(candidate.get("requested_git_sha")) and inner(candidate)\n                    )\n                while inflight.count(k8s_name) < cap:\n'''
+          if kfill_new not in r:
+              assert r.count(kfill_old) == 1, r.count(kfill_old)
+              r = r.replace(kfill_old, kfill_new, 1)
+
+          rpath.write_text(r)
+          PY
+          python -m compileall -q src/ablator
+          git diff --check
+      - name: Run full test suite
+        run: |
+          python -m pip install -e . pytest
+          pytest -q
+      - name: Commit integration
+        run: |
+          if git diff --quiet; then
+            echo 'No patch needed'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/ablator/queue.py src/ablator/runner.py src/ablator/source_checkout.py
+          git commit -m 'fix(#29,#30): make pinned jobs independent of mutable checkout drift'
+          git push origin HEAD:agent/issues-29-30-pinned-policy-remote
