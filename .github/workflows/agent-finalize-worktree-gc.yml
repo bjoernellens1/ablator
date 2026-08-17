@@ -1,0 +1,104 @@
+name: Agent finalize worktree GC
+
+on:
+  push:
+    branches: [agent/issue-31-worktree-gc]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/issue-31-worktree-gc
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply integration
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('src/ablator/source_checkout.py')
+          s = p.read_text()
+          if '\nimport time\n' not in s:
+              s = s.replace('import subprocess\n', 'import subprocess\nimport time\n', 1)
+          if 'def cache_root(cfg: dict, machine: str)' not in s:
+              s = s.replace(
+                  '\ndef _repo_key(identity: str) -> str:\n',
+                  '\ndef cache_root(cfg: dict, machine: str) -> str:\n'
+                  '    """Public cache-root resolver shared by materialization and GC."""\n'
+                  '    return _cache_root(cfg, machine)\n\n\n'
+                  'def _repo_key(identity: str) -> str:\n',
+                  1,
+              )
+          old_sidecar = 'json.dump({"sha": sha, "repo": identity, "checkout": checkout}, handle)'
+          if old_sidecar in s:
+              s = s.replace(
+                  old_sidecar,
+                  'json.dump({\n'
+                  '                    "sha": sha,\n'
+                  '                    "repo": identity,\n'
+                  '                    "checkout": checkout,\n'
+                  '                    "source_repo_path": repo,\n'
+                  '                    "last_used_at": time.time(),\n'
+                  '                }, handle)',
+                  1,
+              )
+          p.write_text(s)
+
+          p = Path('src/ablator/cli.py')
+          s = p.read_text()
+          if 'from . import source_gc as sourcegc' not in s:
+              s = s.replace(
+                  'from . import source_display as sourcedisplay\n',
+                  'from . import source_display as sourcedisplay\nfrom . import source_gc as sourcegc\n',
+                  1,
+              )
+          if 'def cmd_gc(cfg: dict' not in s:
+              fn = '''\n\n# ------------------------------------------------------------------ git worktree cache GC\ndef cmd_gc(cfg: dict, *, dry_run: bool = False,\n           max_age_days: float | None = None) -> None:\n    machine = cfgmod.machine_name(cfg)\n    result = sourcegc.gc_worktrees(\n        cfg, machine, _queue(cfg).read(), dry_run=dry_run,\n        max_age_days=max_age_days,\n    )\n    verb = "candidate" if dry_run else "removed"\n    paths = result.candidates if dry_run else result.removed\n    for checkout in paths:\n        print(f"[gc] {verb}: {checkout}")\n    for checkout in result.protected:\n        print(f"[gc] protected (running): {checkout}")\n    for error in result.errors:\n        print(f"[gc] ERROR: {error}")\n    print(\n        f"[gc] machine={machine} dry_run={dry_run} "\n        f"candidates={len(result.candidates)} removed={len(result.removed)} "\n        f"protected={len(result.protected)} retained={len(result.retained)} "\n        f"errors={len(result.errors)}"\n    )\n    if result.errors:\n        raise SystemExit(1)\n'''
+              s = s.replace('\n\ndef main(argv: list[str] | None = None) -> None:\n', fn + '\n\ndef main(argv: list[str] | None = None) -> None:\n', 1)
+          if 'sub.add_parser("gc", help="garbage-collect stale immutable Git worktrees")' not in s:
+              s = s.replace(
+                  '    sub.add_parser("tui", help="launch the k9s-style TUI (guided setup on "\n',
+                  '    sp = sub.add_parser("gc", help="garbage-collect stale immutable Git worktrees")\n'
+                  '    sp.add_argument("--dry-run", action="store_true",\n'
+                  '                    help="list stale candidates without removing them")\n'
+                  '    sp.add_argument("--max-age-days", type=float,\n'
+                  '                    help="override [git].gc_max_age_days (default 30)")\n'
+                  '    sub.add_parser("tui", help="launch the k9s-style TUI (guided setup on "\n',
+                  1,
+              )
+          if 'cmd_gc(cfg, dry_run=a.dry_run, max_age_days=a.max_age_days)' not in s:
+              s = s.replace(
+                  '    elif a.cmd == "unpause":\n        cmd_unpause(cfg, a.machine)\n',
+                  '    elif a.cmd == "unpause":\n        cmd_unpause(cfg, a.machine)\n'
+                  '    elif a.cmd == "gc":\n        cmd_gc(cfg, dry_run=a.dry_run, max_age_days=a.max_age_days)\n',
+                  1,
+              )
+          p.write_text(s)
+          PY
+          python -m compileall -q src/ablator tests
+          git diff --check
+      - name: Run full test suite
+        run: |
+          git config --global user.name "Ablator CI"
+          git config --global user.email "ablator-ci@users.noreply.github.com"
+          python -m pip install -e . pytest
+          pytest -q
+      - name: Commit integration
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git diff --quiet; then
+            echo 'No production diff to commit'
+            exit 0
+          fi
+          git add src/ablator/source_checkout.py src/ablator/cli.py
+          git commit -m 'feat(#31): add safe worktree cache garbage collection'
+          git push origin HEAD:agent/issue-31-worktree-gc
