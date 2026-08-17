@@ -34,7 +34,7 @@ from . import resources
 from . import self_check as selfcheckmod
 from .pause_revalidation import revalidate_pause
 from .queue import Queue, is_paused, pause_flag_path, write_pause_flag
-from .urgent_fixes import enforce_urgent_fixes
+from .urgent_fixes import enforce_urgent_fixes, load_urgent_fixes
 
 IDLE_POLL_S = 30
 BUSY_POLL_S = 30
@@ -120,11 +120,24 @@ def _git_state_path(cfg: dict, machine: str) -> str:
 
 
 def write_git_state_file(cfg: dict, machine: str, state: dict) -> None:
+    path = _git_state_path(cfg, machine)
+    temporary_path = (
+        f"{path}.tmp.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}"
+    )
     try:
-        with open(_git_state_path(cfg, machine), "w") as f:
+        fd = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        with os.fdopen(fd, "w") as f:
             json.dump({**state, "written_at": time.time()}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary_path, path)
     except OSError as e:
         print(f"[ablator] write_git_state_file({machine}) failed: {e!r}", flush=True)
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
 
 
 def read_git_state_file(cfg: dict, machine: str) -> dict | None:
@@ -150,6 +163,22 @@ def capture_and_record_provenance(cfg: dict, job: dict, machine: str,
     state = provmod.capture_local_git_state(cwd)
     if q is not None:
         q.update(job["id"], provenance=state)
+    write_git_state_file(cfg, machine, state)
+    return state
+
+
+def refresh_idle_provenance(cfg: dict, machine: str) -> dict | None:
+    """Refresh cross-machine workload state without requiring a job claim.
+
+    The urgent-fix checkout is the runner's canonical live workload checkout,
+    including its per-machine path override.  Refreshing it at runner startup
+    and on the existing self-check cadence prevents an idle machine's shared
+    state from remaining pinned to the last job it happened to dispatch.
+    """
+    repo_cwd, _fixes, _auto_sync_ref = load_urgent_fixes(cfg, machine)
+    if repo_cwd is None:
+        return None
+    state = provmod.capture_local_git_state(repo_cwd)
     write_git_state_file(cfg, machine, state)
     return state
 
@@ -1869,8 +1898,24 @@ def _k8s_max_concurrent(cfg: dict, k8s_name: str) -> int:
         return DEFAULT_K8S_MAX_CONCURRENT
 
 
+def _record_runner_provenance(
+    cfg: dict, job: dict, job_machine: str, q: Queue,
+) -> None:
+    """Persist the Ablator process/config identity that will execute a job."""
+    try:
+        from .external import capture_runner_provenance
+        runner_provenance = capture_runner_provenance(cfg, job_machine)
+    except Exception as exc:
+        runner_provenance = {
+            "schema": "ablator.runner-provenance/v1",
+            "machine": job_machine, "identity_complete": False,
+            "error": repr(exc)}
+    q.update(job["id"], runner_provenance=runner_provenance)
+
+
 def _dispatch_and_finalize(cfg: dict, machine: str, job: dict, job_machine: str,
-                           q: Queue, run_fn=None) -> str:
+                           q: Queue, run_fn=None,
+                           runner_provenance_recorded: bool = False) -> str:
     """Run one job to completion and apply the full success/failure/retry/
     quarantine/preempt/requeue bookkeeping.
 
@@ -1888,15 +1933,8 @@ def _dispatch_and_finalize(cfg: dict, machine: str, job: dict, job_machine: str,
     # Persist the identity of the actual Ablator process/config that
     # executes this job. This is distinct from workload checkout provenance
     # and is required for trustworthy cross-machine experiment comparison.
-    try:
-        from .external import capture_runner_provenance
-        runner_provenance = capture_runner_provenance(cfg, job_machine)
-    except Exception as exc:
-        runner_provenance = {
-            "schema": "ablator.runner-provenance/v1",
-            "machine": job_machine, "identity_complete": False,
-            "error": repr(exc)}
-    q.update(job["id"], runner_provenance=runner_provenance)
+    if not runner_provenance_recorded:
+        _record_runner_provenance(cfg, job, job_machine, q)
     base_dir = _job_base_dir(cfg, job, job_machine)
     run_fn = run_fn or (lambda: run_job(cfg, job, job_machine, q))
     status, exit_code = run_fn()
@@ -2045,6 +2083,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
     # see self_check.py for the never-raises contract.
     def _bg_self_check():
         selfcheckmod.run_self_check(cfg, machine)
+        refresh_idle_provenance(cfg, machine)
     threading.Thread(target=_bg_self_check, daemon=True,
                      name="ablator-self-check").start()
     last_self_check = time.monotonic()
@@ -2150,6 +2189,15 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 # for why that split matters.
                 job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
 
+            # Preserve bare-metal priority through the new runner-provenance
+            # write as well as through queue claiming.  If a k8s thread wins
+            # the queue lock first, its provenance/finalization can otherwise
+            # delay this already-claimed local job until the k8s work ends.
+            baremetal_provenance_recorded = False
+            if job is not None:
+                _record_runner_provenance(cfg, job, machine, q)
+                baremetal_provenance_recorded = True
+
             # 2. Fill k8s concurrency slots — non-blocking: each claimed job
             # is handed to a background thread and this loop moves straight
             # on to running the bare-metal job (if any) below without
@@ -2190,7 +2238,10 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 time.sleep(IDLE_POLL_S)
                 continue
             write_heartbeat(cfg, machine, f"running:{job['id']}")
-            status = _dispatch_and_finalize(cfg, machine, job, machine, q)
+            status = _dispatch_and_finalize(
+                cfg, machine, job, machine, q,
+                runner_provenance_recorded=baremetal_provenance_recorded,
+            )
             write_heartbeat(cfg, machine,
                             f"finished:{job['id']}:{status} "
                             f"k8s_inflight={inflight.total()}")

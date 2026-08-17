@@ -993,6 +993,8 @@ def test_k8s_jobs_dispatched_concurrently_up_to_cap(tmp_path, monkeypatch):
     write_queue(q.path, _k8s_jobs(3))
     monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
     monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    monkeypatch.setattr(runner.selfcheckmod, "run_self_check", lambda *_args: None)
+    monkeypatch.setattr(runner, "_record_runner_provenance", lambda *_args: None)
 
     lock = threading.Lock()
     state = {"concurrent": 0, "max_concurrent": 0}
@@ -1112,29 +1114,48 @@ def test_bare_metal_job_not_blocked_by_inflight_k8s(tmp_path, monkeypatch):
     ])
     monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
     monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    # This test measures k8s-vs-bare-metal dispatch ordering.  Keep the
+    # runner's unrelated network self-check out of that synchronization.
+    monkeypatch.setattr(runner.selfcheckmod, "run_self_check", lambda *_args: None)
+    # Runner provenance hashes installed sources before execution.  That is
+    # required claim-time work, but unrelated to whether an in-flight k8s job
+    # blocks the bare-metal dispatch path this test isolates.
+    monkeypatch.setattr(
+        "ablator.external.capture_runner_provenance",
+        lambda *_args: {"identity_complete": True},
+    )
 
-    bare_metal_started_at = {}
+    bare_metal_started = threading.Event()
+    release_k8s = threading.Event()
+    k8s_released_by_bare_metal = {}
+    provenance_order = []
+
+    real_record_provenance = runner._record_runner_provenance
+
+    def spying_record_provenance(cfg, job, machine, q):
+        provenance_order.append(job["id"])
+        return real_record_provenance(cfg, job, machine, q)
 
     def fake_run_job_k8s(cfg, job, machine, mcfg, q=None):
-        time.sleep(0.3)
+        k8s_released_by_bare_metal["value"] = release_k8s.wait(timeout=2)
         return "done", 0
 
     real_run_job = runner.run_job
 
     def spying_run_job(cfg, job, machine, q=None):
         if job["id"] == "baremetal1":
-            bare_metal_started_at["t"] = time.monotonic()
+            bare_metal_started.set()
+            release_k8s.set()
         return real_run_job(cfg, job, machine, q)
 
+    monkeypatch.setattr(runner, "_record_runner_provenance", spying_record_provenance)
     monkeypatch.setattr(runner, "run_job_k8s", fake_run_job_k8s)
     monkeypatch.setattr(runner, "run_job", spying_run_job)
-    t0 = time.monotonic()
     runner.run_loop(cfg, once=True)
 
-    assert "t" in bare_metal_started_at
-    # The bare-metal job must have started almost immediately, well before
-    # the 0.3s the k8s job takes to "finish" in the background.
-    assert bare_metal_started_at["t"] - t0 < 0.15
+    assert bare_metal_started.is_set()
+    assert k8s_released_by_bare_metal["value"] is True
+    assert provenance_order[0] == "baremetal1"
     jobs = {j["id"]: j for j in read_queue(q.path)}
     assert jobs["baremetal1"]["status"] == "done"
     assert jobs["kjob0"]["status"] == "done"  # join_all() waits before once=True returns
