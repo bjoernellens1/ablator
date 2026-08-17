@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config as cfgmod
+from .identity import package_source_sha256
 from .queue import Queue
 
 SCHEMA = "ablator.external-job/v1"
@@ -260,6 +261,7 @@ def capture_runner_provenance(cfg: dict[str, Any], machine: str) -> dict[str, An
         version = importlib.metadata.version("ablator")
     except importlib.metadata.PackageNotFoundError:
         version = "unknown"
+    source_sha256 = package_source_sha256(module_path.parent)
 
     return {
         "schema": "ablator.runner-provenance/v1",
@@ -267,6 +269,7 @@ def capture_runner_provenance(cfg: dict[str, Any], machine: str) -> dict[str, An
         "machine": machine,
         "hostname": socket.gethostname(),
         "package_version": version,
+        "source_sha256": source_sha256,
         "module_path": str(module_path),
         "git_root": str(root) if root_raw else None,
         "git_commit": commit,
@@ -275,7 +278,10 @@ def capture_runner_provenance(cfg: dict[str, Any], machine: str) -> dict[str, An
         "git_dirty_fingerprint": dirty_fingerprint,
         "config_path": str(config_path) if str(config_path) else None,
         "config_sha256": config_sha256,
-        "identity_complete": bool(commit and config_sha256 and dirty is not None),
+        # Source+config identity is complete even for an installed wheel that
+        # has no Git checkout. Git commit/dirty state remains additional
+        # provenance whenever the runner is an editable checkout.
+        "identity_complete": bool(source_sha256 and config_sha256),
     }
 
 
