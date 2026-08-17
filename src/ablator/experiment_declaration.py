@@ -29,7 +29,7 @@ NON_GRADEABLE_RUN_CLASSES = {
     "developer_smoke": "NON_GRADEABLE_DEVELOPER_SMOKE",
     "debug": "NON_GRADEABLE_DEBUG",
 }
-IMMUTABLE_JOB_FIELDS = frozenset(
+DECLARATION_JOB_FIELDS = frozenset(
     {
         "experiment_declaration",
         "experiment_declaration_json",
@@ -37,10 +37,11 @@ IMMUTABLE_JOB_FIELDS = frozenset(
         "gradeability",
     }
 )
+IMMUTABLE_JOB_FIELDS = DECLARATION_JOB_FIELDS | frozenset({"submission_provenance"})
 
 
 class ExperimentDeclarationError(ValueError):
-    """A declaration is incomplete, ambiguous, or inconsistent."""
+    """A declaration or protected launch-provenance envelope is inconsistent."""
 
 
 def canonical_declaration_json(declaration: Mapping[str, Any]) -> str:
@@ -186,7 +187,7 @@ def freeze_declaration(declaration: Mapping[str, Any]) -> dict[str, Any]:
 def validate_frozen_job(job: Mapping[str, Any]) -> dict[str, Any] | None:
     """Validate the declaration fields stored in a queue job."""
     declaration = job.get("experiment_declaration")
-    present_fields = IMMUTABLE_JOB_FIELDS.intersection(job)
+    present_fields = DECLARATION_JOB_FIELDS.intersection(job)
     if declaration is None:
         if present_fields:
             raise ExperimentDeclarationError(
@@ -244,7 +245,18 @@ def submission_provenance(job: Mapping[str, Any]) -> dict[str, Any] | None:
     """
     recorded = job.get("submission_provenance")
     if isinstance(recorded, Mapping):
-        return deepcopy(dict(recorded))
+        resolved = deepcopy(dict(recorded))
+        if resolved.get("surface") == "plan":
+            spec = resolved.get("spec")
+            expected_hash = resolved.get("spec_sha256")
+            if not isinstance(spec, Mapping) or not _present(expected_hash):
+                raise ExperimentDeclarationError(
+                    "plan submission provenance requires spec and spec_sha256"
+                )
+            actual_hash = hashlib.sha256(_canonical_json(dict(spec)).encode("utf-8")).hexdigest()
+            if actual_hash != expected_hash:
+                raise ExperimentDeclarationError("plan submission spec SHA-256 mismatch")
+        return resolved
 
     if job.get("external_schema"):
         return {
@@ -266,24 +278,32 @@ def submission_provenance(job: Mapping[str, Any]) -> dict[str, Any] | None:
 def experiment_environment(job: Mapping[str, Any]) -> dict[str, str]:
     """Return protected child-process provenance environment.
 
-    Job identity and a canonical queue-record snapshot are transported for
-    *every* Ablator-managed job, including legacy/undeclared jobs. Experiment
-    declaration variables remain conditional on a valid frozen declaration.
+    Queue-backed launch records get job identity and canonical job JSON even
+    without an experiment declaration. Pure in-memory pending jobs keep the
+    historical declaration-only behavior until they carry plan/submit
+    provenance or have actually been claimed (``status == running``). This
+    preserves the library-level rendering contract while ensuring every real
+    runner-launched legacy job receives ``ABLATOR_JOB_ID``.
     """
     job_id = job.get("id")
     if not _present(job_id):
         raise ExperimentDeclarationError("job requires a non-empty job id")
 
     frozen = validate_frozen_job(job)
-    env = {
-        JOB_ID_ENV: str(job_id),
-        JOB_JSON_ENV: _canonical_json(dict(job)),
-    }
-
     submission = submission_provenance(job)
+    queue_backed_launch = bool(
+        submission is not None
+        or job.get("external_schema")
+        or job.get("status") == "running"
+    )
+
+    env: dict[str, str] = {}
+    if frozen is not None or queue_backed_launch:
+        env[JOB_ID_ENV] = str(job_id)
+    if queue_backed_launch:
+        env[JOB_JSON_ENV] = _canonical_json(dict(job))
     if submission is not None:
         env[SUBMISSION_ENV] = _canonical_json(submission)
-
     if frozen is not None:
         env.update(
             {
@@ -297,8 +317,11 @@ def experiment_environment(job: Mapping[str, Any]) -> dict[str, str]:
 def runner_log_banner(job: Mapping[str, Any]) -> str:
     """Render the exact protected provenance transported to the child."""
     env = experiment_environment(job)
-    lines = [f"# {JOB_ID_ENV}={env[JOB_ID_ENV]}"]
-    lines.append(f"# {JOB_JSON_ENV}={env[JOB_JSON_ENV]}")
+    lines: list[str] = []
+    if JOB_ID_ENV in env:
+        lines.append(f"# {JOB_ID_ENV}={env[JOB_ID_ENV]}")
+    if JOB_JSON_ENV in env:
+        lines.append(f"# {JOB_JSON_ENV}={env[JOB_JSON_ENV]}")
     if SUBMISSION_ENV in env:
         lines.append(f"# {SUBMISSION_ENV}={env[SUBMISSION_ENV]}")
 
