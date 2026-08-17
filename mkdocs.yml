@@ -45,6 +45,7 @@ nav:
   - Spec reference: spec-reference.md
   - Config reference: config-reference.md
   - Queue semantics: queue-semantics.md
+  - External scheduler API: external-scheduler.md
   - Multi-machine setup: multi-machine.md
   - Kubernetes dispatch: kubernetes.md
   - CPS cluster walkthrough: cluster-setup.md

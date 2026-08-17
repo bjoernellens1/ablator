@@ -278,14 +278,22 @@ def _job_vars(job: dict, machine: str) -> dict:
         # Threaded in by handle_failure() when a preempted/crashed job has a
         # resumable checkpoint on durable (NFS-backed) storage — see there.
         extra_args = f"{extra_args} --start_checkpoint {resume_checkpoint}".strip()
-    return {
+    params = job.get("params") or {}
+    if not isinstance(params, dict):
+        raise TemplateError(f"job {job.get('id')} params must be a mapping")
+    # External schedulers may provide typed, workload-agnostic template
+    # variables. Legacy queue fields remain authoritative and deliberately
+    # overwrite same-named params for backward compatibility and safety.
+    values = {str(key): str(value) for key, value in params.items()}
+    values.update({
         "scene": scene,
         "model_path": job.get("model_path", ""),
         "extra_args": extra_args,
         "iterations": str(job.get("iterations", "")),
         "id": job.get("id", ""),
         "machine": machine,
-    }
+    })
+    return values
 
 
 def _fmt(s: str, vars: dict) -> str:
@@ -1877,6 +1885,18 @@ def _dispatch_and_finalize(cfg: dict, machine: str, job: dict, job_machine: str,
     pass a callable that resumes polling that existing Job instead of
     re-submitting it.
     """
+    # Persist the identity of the actual Ablator process/config that
+    # executes this job. This is distinct from workload checkout provenance
+    # and is required for trustworthy cross-machine experiment comparison.
+    try:
+        from .external import capture_runner_provenance
+        runner_provenance = capture_runner_provenance(cfg, job_machine)
+    except Exception as exc:
+        runner_provenance = {
+            "schema": "ablator.runner-provenance/v1",
+            "machine": job_machine, "identity_complete": False,
+            "error": repr(exc)}
+    q.update(job["id"], runner_provenance=runner_provenance)
     base_dir = _job_base_dir(cfg, job, job_machine)
     run_fn = run_fn or (lambda: run_job(cfg, job, job_machine, q))
     status, exit_code = run_fn()

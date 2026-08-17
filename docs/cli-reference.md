@@ -7,6 +7,16 @@ ablator [--config CONFIG] <subcommand> ...
 `--config` overrides the config file for this invocation (see
 [config reference](config-reference.md) for resolution order).
 
+## External schedulers
+
+These machine-readable commands are the stable integration surface for workflow schedulers. See [external scheduler API](external-scheduler.md).
+
+| Command | Args | Effect |
+|---|---|---|
+| `ablator submit` | `--id ID --type TYPE [--machine NAME] [--param key=value ...] [--metadata-json JSON] [--lane 1|2|3] [--depends-on ID] [--format json]` | Idempotently enqueue one already-resolved typed job. Same ID + same spec is a no-op; same ID + different spec fails closed. |
+| `ablator inspect` | `[--format json] job_id` | Return the exact job state, scheduler metadata, typed parameters, health/error state, workload provenance, and Ablator runner/config provenance. |
+| `ablator cancel-jobs` | `[--format json] job_id [job_id ...]` | Cancel exact jobs. Pending jobs become cancelled immediately; running jobs use the existing supervised `skip` control path. |
+
 ## Planning & inspecting
 
 | Command | Args | Effect |
@@ -45,4 +55,4 @@ ablator [--config CONFIG] <subcommand> ...
 | `ablator tui` | — | Launch the k9s-style TUI (guided setup on first run). Needs `pip install ablator[tui]`. Bare `ablator` on a TTY also launches it. |
 
 Run any subcommand with `--help` for its exact flags, e.g.
-`ablator promote --help`.
+`ablator submit --help`.

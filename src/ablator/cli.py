@@ -10,6 +10,7 @@ import sys
 import time
 
 from . import config as cfgmod
+from . import external as externalmod
 from . import health as healthmod
 from . import progress as progmod
 from . import runner, spec as specmod
@@ -431,6 +432,22 @@ def main(argv: list[str] | None = None) -> None:
     # caller.
     sub = p.add_subparsers(dest="cmd", required=False)
 
+    sp = sub.add_parser("submit", help="idempotently submit one external typed job")
+    sp.add_argument("--format", choices=["json"], default="json")
+    sp.add_argument("--id", required=True)
+    sp.add_argument("--type", dest="job_type", required=True)
+    sp.add_argument("--machine", default="any")
+    sp.add_argument("--param", action="append", default=[])
+    sp.add_argument("--metadata-json", default="{}")
+    sp.add_argument("--lane", type=int, default=2)
+    sp.add_argument("--depends-on")
+    sp = sub.add_parser("inspect", help="inspect one exact job as structured JSON")
+    sp.add_argument("--format", choices=["json"], default="json")
+    sp.add_argument("job_id")
+    sp = sub.add_parser("cancel-jobs", help="cancel exact external job ids")
+    sp.add_argument("--format", choices=["json"], default="json")
+    sp.add_argument("job_ids", nargs="+")
+
     sp = sub.add_parser("plan", help="expand a spec JSON into queue jobs")
     sp.add_argument("spec")
     sp.add_argument("--dry-run", action="store_true")
@@ -486,7 +503,24 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     cfg = cfgmod.load_config(a.config)
-    if a.cmd == "plan":
+    if a.cmd == "submit":
+        params = externalmod.parse_key_values(a.param)
+        metadata = externalmod.parse_metadata_json(a.metadata_json)
+        job = externalmod.build_job(
+            cfg, job_id=a.id, job_type=a.job_type, machine=a.machine,
+            params=params, metadata=metadata, lane=a.lane, depends_on=a.depends_on)
+        record, created = externalmod.submit_job(cfg, job)
+        externalmod.print_json({
+            "schema": externalmod.SCHEMA, "job_id": record["id"],
+            "status": record.get("status"), "created": created,
+            "external_spec_sha256": record.get("external_spec_sha256")})
+    elif a.cmd == "inspect":
+        externalmod.print_json(externalmod.inspect_job(cfg, a.job_id))
+    elif a.cmd == "cancel-jobs":
+        externalmod.print_json({
+            "schema": "ablator.external-cancel/v1",
+            "jobs": externalmod.cancel_jobs(cfg, a.job_ids)})
+    elif a.cmd == "plan":
         cmd_plan(cfg, a.spec, dry_run=a.dry_run)
     elif a.cmd == "status":
         cmd_status(cfg, a.name)
