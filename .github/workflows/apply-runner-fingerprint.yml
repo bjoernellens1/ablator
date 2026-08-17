@@ -1,0 +1,44 @@
+name: Apply runner fingerprint integration
+on:
+  push:
+    branches: [fix/runner-source-fingerprint]
+    paths: ['.github/workflows/apply-runner-fingerprint.yml']
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/runner-source-fingerprint
+      - name: Wire package fingerprint into provenance
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path=Path('src/ablator/external.py')
+          text=path.read_text()
+          old='from . import config as cfgmod\nfrom .queue import Queue\n'
+          new='from . import config as cfgmod\nfrom .identity import package_source_sha256\nfrom .queue import Queue\n'
+          assert old in text
+          text=text.replace(old,new,1)
+          old='''    try:\n        version = importlib.metadata.version("ablator")\n    except importlib.metadata.PackageNotFoundError:\n        version = "unknown"\n\n    return {\n'''
+          new='''    try:\n        version = importlib.metadata.version("ablator")\n    except importlib.metadata.PackageNotFoundError:\n        version = "unknown"\n    source_sha256 = package_source_sha256(module_path.parent)\n\n    return {\n'''
+          assert old in text
+          text=text.replace(old,new,1)
+          old='''        "package_version": version,\n        "module_path": str(module_path),\n'''
+          new='''        "package_version": version,\n        "source_sha256": source_sha256,\n        "module_path": str(module_path),\n'''
+          assert old in text
+          text=text.replace(old,new,1)
+          old='''        "config_sha256": config_sha256,\n        "identity_complete": bool(commit and config_sha256 and dirty is not None),\n'''
+          new='''        "config_sha256": config_sha256,\n        # Source+config identity is complete even for an installed wheel that\n        # has no Git checkout. Git commit/dirty state remains additional\n        # provenance whenever the runner is an editable checkout.\n        "identity_complete": bool(source_sha256 and config_sha256),\n'''
+          assert old in text
+          text=text.replace(old,new,1)
+          path.write_text(text)
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/ablator/external.py
+          git commit -m 'Include package source hash in runner provenance'
+          git push origin HEAD:fix/runner-source-fingerprint
