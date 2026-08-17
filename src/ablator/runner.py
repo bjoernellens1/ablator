@@ -27,6 +27,7 @@ import time
 
 from . import config as cfgmod
 from . import error as errormod
+from . import experiment_declaration as declarations
 from . import health as healthmod
 from . import provenance as provmod
 from . import resources
@@ -331,6 +332,42 @@ def _ensure_container_name(argv: list[str], job: dict) -> list[str]:
     return argv[: run_idx + 1] + ["--name", name] + argv[run_idx + 1 :]
 
 
+def _inject_container_environment(argv: list[str], child_env: dict[str, str]) -> list[str]:
+    """Inject protected declaration env into a direct Docker/Podman run."""
+    if not argv or argv[0] not in _CONTAINER_RUNTIMES:
+        return argv
+    if "run" not in argv[:2]:
+        return argv
+
+    protected = declarations.PROTECTED_ENV
+    for index, token in enumerate(argv):
+        if child_env and (token == "--env-file" or token.startswith("--env-file=")):
+            raise TemplateError(
+                "declared container job cannot use --env-file because protected "
+                "declaration values could be overridden"
+            )
+        if token in ("-e", "--env") and index + 1 < len(argv):
+            key = argv[index + 1].split("=", 1)[0]
+            if key in protected:
+                raise TemplateError(f"command template overrides protected env {key}")
+        if token.startswith("-e") and not token.startswith("--") and len(token) > 2:
+            key = token[2:].removeprefix("=").split("=", 1)[0]
+            if key in protected:
+                raise TemplateError(f"command template overrides protected env {key}")
+        if token.startswith("--env="):
+            key = token[len("--env="):].split("=", 1)[0]
+            if key in protected:
+                raise TemplateError(f"command template overrides protected env {key}")
+
+    if not child_env:
+        return argv
+    run_index = argv.index("run")
+    flags: list[str] = []
+    for key, value in child_env.items():
+        flags.extend(["--env", f"{key}={value}"])
+    return argv[: run_index + 1] + flags + argv[run_index + 1 :]
+
+
 def render_command(tcfg: dict, job: dict, machine: str) -> tuple[list[str], dict, str | None]:
     """Render (argv, env, cwd) for a job from its merged type config."""
     vars = _job_vars(job, machine)
@@ -342,10 +379,18 @@ def render_command(tcfg: dict, job: dict, machine: str) -> tuple[list[str], dict
             argv.append(_fmt(tok, vars))
     if not argv:
         raise TemplateError(f"job type for {job.get('id')} has empty command template")
+    try:
+        declaration_env = declarations.experiment_environment(job)
+    except declarations.ExperimentDeclarationError as exc:
+        raise TemplateError(str(exc)) from exc
     argv = _ensure_container_name(argv, job)
+    argv = _inject_container_environment(argv, declaration_env)
     env = os.environ.copy()
     for k, v in (tcfg.get("env") or {}).items():
         env[k] = _fmt(str(v), vars)
+    for key in declarations.PROTECTED_ENV:
+        env.pop(key, None)
+    env.update(declaration_env)
     cwd = tcfg.get("cwd")
     return argv, env, (_fmt(cwd, vars) if cwd else None)
 
@@ -931,6 +976,10 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     provenance.py's drift-WARNING doesn't cover and this feature doesn't
     add new detection for.
     """
+    try:
+        declaration_env = declarations.experiment_environment(job)
+    except declarations.ExperimentDeclarationError as exc:
+        raise TemplateError(str(exc)) from exc
     name = _k8s_job_name(job["id"])
     image = image_override or mcfg["image"]
     scene = job.get("scene", "")
@@ -1015,12 +1064,23 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     # a client's first connection -- callers should retry the first CUDA call a
     # few times (this is workload-side, not something the manifest can fix).
     mps_enabled = bool(mcfg.get("mps"))
+    trainer_env = [
+        {"name": key, "value": value}
+        for key, value in declaration_env.items()
+    ]
     if mps_enabled:
         volumes.append({
             "name": "mps-root",
             "hostPath": {"path": "/run/nvidia/mps", "type": "DirectoryOrCreate"},
         })
         trainer_volume_mounts.append({"name": "mps-root", "mountPath": "/mps"})
+        trainer_env.extend([{
+            "name": "CUDA_MPS_PIPE_DIRECTORY",
+            "value": "/mps/nvidia.com/gpu/pipe",
+        }, {
+            "name": "CUDA_MPS_LOG_DIRECTORY",
+            "value": "/mps/nvidia.com/gpu/log",
+        }])
 
     shm_size_gb = mcfg.get("shm_size_gb")
     if shm_size_gb:
@@ -1180,10 +1240,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                         "imagePullPolicy": "Always",
                         "workingDir": cwd or mcfg.get("default_workdir", "/workspace"),
                         "command": argv,
-                        **({"env": [
-                            {"name": "CUDA_MPS_PIPE_DIRECTORY", "value": "/mps/nvidia.com/gpu/pipe"},
-                            {"name": "CUDA_MPS_LOG_DIRECTORY", "value": "/mps/nvidia.com/gpu/log"},
-                        ]} if mps_enabled else {}),
+                        **({"env": trainer_env} if trainer_env else {}),
                         "resources": {
                             "requests": {
                                 "cpu": mcfg.get("cpu_request", "4"),
@@ -1394,15 +1451,17 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
         q.update(job["id"], image_provenance=image_prov,
                 dispatch_host_commit=local_commit)
 
+    with open(log_path, "w") as lf:
+        lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']} "
+                 f"(k8s Job {ns}/{name})\n# {shlex.join(argv)}\n")
+        lf.write(declarations.runner_log_banner(job) + "\n")
+        lf.write(provmod.format_banner("k8s", image_prov) + "\n")
+
     apply = _kubectl(["apply", "-f", "-"], input_text=json.dumps(manifest))
     if apply.returncode != 0:
         print(f"[ablator] {job['id']} k8s apply failed: {apply.stderr}", flush=True)
         return "failed", None
 
-    with open(log_path, "w") as lf:
-        lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']} "
-                 f"(k8s Job {ns}/{name})\n# {shlex.join(argv)}\n")
-        lf.write(provmod.format_banner("k8s", image_prov) + "\n")
     return _poll_k8s_job(cfg, job, machine, mcfg, tcfg, name, ns, log_path,
                         append=True)
 
@@ -1442,6 +1501,7 @@ def run_job(cfg: dict, job: dict, machine: str,
         with open(log_path, "w") as lf:
             lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']}\n"
                      f"# cwd={cwd or os.getcwd()}\n# {shlex.join(argv)}\n")
+            lf.write(declarations.runner_log_banner(job) + "\n")
             lf.write(provmod.format_banner("bare-metal", prov_state) + "\n")
             preflight_line = output_folder_preflight(str(job.get("model_path", "")), cwd)
             lf.write(preflight_line + "\n")

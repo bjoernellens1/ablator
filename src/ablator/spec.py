@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 
+from . import experiment_declaration as declarations
+
 DEFAULT_MODEL_PATH_TEMPLATE = "output/scratch/{name}_{arm}"
 
 
@@ -62,6 +64,14 @@ def expand_spec(spec: dict,
             "lane": lane,
             "status": "pending",
         }
+        try:
+            declaration = declarations.resolve_declaration(
+                spec.get("experiment"), arm.get("declaration"), arm_id
+            )
+        except declarations.ExperimentDeclarationError as exc:
+            raise SystemExit(f"spec '{name}' arm '{arm_id}': {exc}") from exc
+        if declaration is not None:
+            job.update(declarations.freeze_declaration(declaration))
         if not parallel and prev_id is not None:
             job["depends_on"] = prev_id
         jobs.append(job)

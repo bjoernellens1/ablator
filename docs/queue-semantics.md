@@ -90,7 +90,7 @@ Per-job stdout/stderr lands at `<log_dir>/<job id>.log`
 | `ablator errors [name]` | List failed/quarantined/paused jobs with classification. |
 | `ablator health [job_id]` | Artifact-derived job health (progress, staleness). |
 | `ablator promote job_id lane` | Move a **pending** job to another lane. |
-| `ablator rerun job_id [lane]` | Reset a **terminal** (done/failed/quarantined/cancelled) job back to pending, optionally into a new lane. |
+| `ablator rerun job_id [lane]` | Reset a **non-gradeable terminal** job back to pending. Gradeable jobs require a new job/output identity with explicit lineage. |
 | `ablator stop job_id` | Kill a **running** job → `failed`, no retry. |
 | `ablator skip job_id` | Kill a **running** job → `cancelled`. |
 | `ablator requeue job_id` | Kill a **running** job and put it back to `pending`. |

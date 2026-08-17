@@ -326,6 +326,12 @@ def cmd_rerun(cfg: dict, job_id: str, lane_str: str | None = None) -> None:
         target = next((j for j in jobs if j.get("id") == job_id), None)
         if target is None:
             raise SystemExit(f"[rerun] no job with id '{job_id}'")
+        if target.get("gradeability") == "GRADEABLE_DECLARED":
+            raise SystemExit(
+                f"[rerun] gradeable job '{job_id}' cannot be reset in place; "
+                "create a new job identity and output directory with explicit "
+                "rerun_of, replicate_of, or supersedes lineage"
+            )
         if target.get("status") == "running":
             raise SystemExit(
                 f"[rerun] job '{job_id}' is currently running — use "

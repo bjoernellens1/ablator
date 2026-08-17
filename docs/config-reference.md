@@ -90,6 +90,13 @@ Per-machine overrides are **shallow**: any key present under
 value outright; `env` is merged on top of the base `env` dict instead
 of replacing it.
 
+`ABLATOR_EXPERIMENT_DECLARATION_JSON`,
+`ABLATOR_EXPERIMENT_DECLARATION_SHA256`, and `ABLATOR_JOB_ID` are reserved.
+The runner derives them only from a validated immutable declaration in the
+queue; ambient and `[types.*.env]` values with those names are scrubbed. Direct
+Docker/Podman and Kubernetes jobs receive them automatically, so command
+templates must not add their own copies.
+
 ### Template variables
 
 Available in every `command` token and `env` value:
