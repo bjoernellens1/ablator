@@ -250,14 +250,17 @@ def test_render_command_injects_declaration_into_container_environment():
 
 @pytest.mark.parametrize("runtime", ["docker", "podman"])
 @pytest.mark.parametrize("name", sorted(declarations.PROTECTED_ENV))
-def test_render_command_rejects_compact_protected_container_env(runtime, name):
+@pytest.mark.parametrize("env_flag", ["-e{name}=evil", "-e={name}=evil"])
+def test_render_command_rejects_compact_protected_container_env(
+    runtime, name, env_flag
+):
     """Compact ``-eNAME=value`` must not override trusted injected values."""
     job = specmod.expand_spec(_declared_spec())[0]
     tcfg = {
         "command": [
             runtime,
             "run",
-            f"-e{name}=evil",
+            env_flag.format(name=name),
             "-eUNRELATED=allowed",
             "image:tag",
         ]
