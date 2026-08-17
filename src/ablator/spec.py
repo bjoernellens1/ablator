@@ -19,16 +19,60 @@ model_path_template, default "output/scratch/{name}_{arm}").
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+from copy import deepcopy
 
 from . import experiment_declaration as declarations
 
 DEFAULT_MODEL_PATH_TEMPLATE = "output/scratch/{name}_{arm}"
 
 
+class LoadedSpec(dict):
+    """Dict-compatible spec carrying only non-semantic source-path metadata."""
+
+    source_path: str | None = None
+
+
+def _canonical_json(value: dict) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
 def load_spec(path: str) -> dict:
     with open(path) as f:
-        return json.load(f)
+        parsed = json.load(f)
+    spec = LoadedSpec(parsed)
+    spec.source_path = os.path.abspath(path)
+    return spec
+
+
+def _plan_submission(spec: dict) -> dict | None:
+    """Freeze the exact loaded plan input without polluting pure in-memory specs.
+
+    ``expand_spec`` is also used directly in tests and library code. Only a
+    spec that came through ``load_spec`` has an original queue interaction to
+    preserve; arbitrary in-memory dicts therefore keep the historical job
+    shape and do not pretend they were submitted through the CLI.
+    """
+    source_path = getattr(spec, "source_path", None)
+    if not source_path:
+        return None
+    exact_spec = deepcopy(dict(spec))
+    canonical = _canonical_json(exact_spec)
+    return {
+        "schema": "ablator.submission/v1",
+        "surface": "plan",
+        "spec_path": source_path,
+        "spec_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "spec": exact_spec,
+        "ablation": exact_spec.get("name"),
+    }
 
 
 def expand_spec(spec: dict,
@@ -37,6 +81,7 @@ def expand_spec(spec: dict,
     name = spec["name"]
     base = spec.get("base", {})
     parallel = spec.get("parallel", True)
+    submission = _plan_submission(spec)
     jobs: list[dict] = []
     prev_id: str | None = None
     seen_ids: set[str] = set()
@@ -64,6 +109,8 @@ def expand_spec(spec: dict,
             "lane": lane,
             "status": "pending",
         }
+        if submission is not None:
+            job["submission_provenance"] = deepcopy(submission)
         try:
             declaration = declarations.resolve_declaration(
                 spec.get("experiment"), arm.get("declaration"), arm_id
