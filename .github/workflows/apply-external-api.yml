@@ -1,0 +1,56 @@
+name: Apply external scheduler API hooks
+on:
+  push:
+    branches: [feat/external-scheduler-api]
+    paths: ['.github/workflows/apply-external-api.yml']
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/external-scheduler-api
+      - name: Patch CLI and runner hooks
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          cli = Path('src/ablator/cli.py')
+          text = cli.read_text()
+          old = 'from . import config as cfgmod\nfrom . import health as healthmod\n'
+          new = 'from . import config as cfgmod\nfrom . import external as externalmod\nfrom . import health as healthmod\n'
+          assert old in text
+          text = text.replace(old, new, 1)
+
+          marker = '    sub = p.add_subparsers(dest="cmd", required=False)\n\n'
+          insert = '''    sub = p.add_subparsers(dest="cmd", required=False)\n\n    sp = sub.add_parser("submit", help="idempotently submit one external typed job")\n    sp.add_argument("--format", choices=["json"], default="json")\n    sp.add_argument("--id", required=True)\n    sp.add_argument("--type", dest="job_type", required=True)\n    sp.add_argument("--machine", default="any")\n    sp.add_argument("--param", action="append", default=[])\n    sp.add_argument("--metadata-json", default="{}")\n    sp.add_argument("--lane", type=int, default=2)\n    sp.add_argument("--depends-on")\n    sp = sub.add_parser("inspect", help="inspect one exact job as structured JSON")\n    sp.add_argument("--format", choices=["json"], default="json")\n    sp.add_argument("job_id")\n    sp = sub.add_parser("cancel-jobs", help="cancel exact external job ids")\n    sp.add_argument("--format", choices=["json"], default="json")\n    sp.add_argument("job_ids", nargs="+")\n\n'''
+          assert marker in text
+          text = text.replace(marker, insert, 1)
+
+          dispatch = '''    cfg = cfgmod.load_config(a.config)\n    if a.cmd == "plan":\n'''
+          replacement = '''    cfg = cfgmod.load_config(a.config)\n    if a.cmd == "submit":\n        params = externalmod.parse_key_values(a.param)\n        metadata = externalmod.parse_metadata_json(a.metadata_json)\n        job = externalmod.build_job(\n            cfg, job_id=a.id, job_type=a.job_type, machine=a.machine,\n            params=params, metadata=metadata, lane=a.lane, depends_on=a.depends_on)\n        record, created = externalmod.submit_job(cfg, job)\n        externalmod.print_json({\n            "schema": externalmod.SCHEMA, "job_id": record["id"],\n            "status": record.get("status"), "created": created,\n            "external_spec_sha256": record.get("external_spec_sha256")})\n    elif a.cmd == "inspect":\n        externalmod.print_json(externalmod.inspect_job(cfg, a.job_id))\n    elif a.cmd == "cancel-jobs":\n        externalmod.print_json({\n            "schema": "ablator.external-cancel/v1",\n            "jobs": externalmod.cancel_jobs(cfg, a.job_ids)})\n    elif a.cmd == "plan":\n'''
+          assert dispatch in text
+          text = text.replace(dispatch, replacement, 1)
+          cli.write_text(text)
+
+          runner = Path('src/ablator/runner.py')
+          text = runner.read_text()
+          old_vars = '''def _job_vars(job: dict, machine: str) -> dict:\n    scene = job.get("scene", "")\n    extra_args = _infer_tum_sequence(scene, job.get("extra_args", ""))\n    resume_checkpoint = job.get("resume_checkpoint")\n    if resume_checkpoint and "--start_checkpoint" not in extra_args:\n        # Threaded in by handle_failure() when a preempted/crashed job has a\n        # resumable checkpoint on durable (NFS-backed) storage — see there.\n        extra_args = f"{extra_args} --start_checkpoint {resume_checkpoint}".strip()\n    return {\n        "scene": scene,\n        "model_path": job.get("model_path", ""),\n        "extra_args": extra_args,\n        "iterations": str(job.get("iterations", "")),\n        "id": job.get("id", ""),\n        "machine": machine,\n    }\n'''
+          new_vars = '''def _job_vars(job: dict, machine: str) -> dict:\n    scene = job.get("scene", "")\n    extra_args = _infer_tum_sequence(scene, job.get("extra_args", ""))\n    resume_checkpoint = job.get("resume_checkpoint")\n    if resume_checkpoint and "--start_checkpoint" not in extra_args:\n        # Threaded in by handle_failure() when a preempted/crashed job has a\n        # resumable checkpoint on durable (NFS-backed) storage — see there.\n        extra_args = f"{extra_args} --start_checkpoint {resume_checkpoint}".strip()\n    params = job.get("params") or {}\n    if not isinstance(params, dict):\n        raise TemplateError(f"job {job.get('id')} params must be a mapping")\n    # External schedulers may provide typed, workload-agnostic template\n    # variables. Legacy queue fields remain authoritative and deliberately\n    # overwrite same-named params for backward compatibility and safety.\n    values = {str(key): str(value) for key, value in params.items()}\n    values.update({\n        "scene": scene,\n        "model_path": job.get("model_path", ""),\n        "extra_args": extra_args,\n        "iterations": str(job.get("iterations", "")),\n        "id": job.get("id", ""),\n        "machine": machine,\n    })\n    return values\n'''
+          assert old_vars in text
+          text = text.replace(old_vars, new_vars, 1)
+
+          needle = '''    base_dir = _job_base_dir(cfg, job, job_machine)\n    run_fn = run_fn or (lambda: run_job(cfg, job, job_machine, q))\n'''
+          provenance = '''    # Persist the identity of the actual Ablator process/config that\n    # executes this job. This is distinct from workload checkout provenance\n    # and is required for trustworthy cross-machine experiment comparison.\n    try:\n        from .external import capture_runner_provenance\n        runner_provenance = capture_runner_provenance(cfg, job_machine)\n    except Exception as exc:\n        runner_provenance = {\n            "schema": "ablator.runner-provenance/v1",\n            "machine": job_machine, "identity_complete": False,\n            "error": repr(exc)}\n    q.update(job["id"], runner_provenance=runner_provenance)\n    base_dir = _job_base_dir(cfg, job, job_machine)\n    run_fn = run_fn or (lambda: run_job(cfg, job, job_machine, q))\n'''
+          assert needle in text
+          text = text.replace(needle, provenance, 1)
+          runner.write_text(text)
+          PY
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/ablator/cli.py src/ablator/runner.py
+          git commit -m 'Wire external scheduler API into CLI and runner'
+          git push origin HEAD:feat/external-scheduler-api
