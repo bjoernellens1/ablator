@@ -93,14 +93,16 @@ def launch(config_path: str | None = None) -> None:
             job_id, _, _, machine, *_ = row
             mcfg = cfgmod.machine_cfg(cfg, machine)
             detail = self.query_one("#pod_detail", Static)
+            job = next((j for j in qvmod.load_jobs(cfg) if j.get("id") == job_id), {})
+            source_line = qvmod.source_detail(job)
             if mcfg.get("backend") != "k8s":
-                detail.update(f"{job_id}: bare-metal job on {machine} "
+                detail.update(f"{source_line}\n{job_id}: bare-metal job on {machine} "
                              "(no pod status to show)")
                 return
             k8s_name = qvmod.k8s_job_name(job_id)
             status_line = podmod.pod_status_line(mcfg["namespace"], job_id, k8s_name)
             tail = podmod.recent_log_tail(mcfg["namespace"], job_id, k8s_name)
-            detail.update(f"{job_id} pod: {status_line}\n\n{tail}")
+            detail.update(f"{source_line}\n{job_id} pod: {status_line}\n\n{tail}")
 
     class ConfigScreen(Screen):
         def compose(self) -> ComposeResult:
