@@ -18,6 +18,8 @@ import os
 import time
 from typing import Callable
 
+from . import experiment_declaration as declarations
+
 DEFAULT_FLOCK_TIMEOUT_S = 60.0
 
 
@@ -225,6 +227,13 @@ class Queue:
 
     def append(self, new_jobs: list[dict]) -> None:
         """Atomically enqueue jobs; refuses duplicate ids."""
+        for job in new_jobs:
+            try:
+                declarations.validate_frozen_job(job)
+            except declarations.ExperimentDeclarationError as exc:
+                raise SystemExit(
+                    f"refusing to enqueue job {job.get('id')!r}: {exc}"
+                ) from exc
         with self._open_locked() as f:
             jobs = self._load(f)
             existing = {j.get("id") for j in jobs}
@@ -330,6 +339,10 @@ class Queue:
                     jobs = self._load(f)
                     for j in jobs:
                         if j.get("id") == job_id:
+                            try:
+                                declarations.validate_immutable_update(j, extra)
+                            except declarations.ExperimentDeclarationError as exc:
+                                raise SystemExit(str(exc)) from exc
                             j["status"] = status
                             j["finished_at"] = _now()
                             j.update(extra)
@@ -361,6 +374,10 @@ class Queue:
                 jobs = self._load(f)
                 for j in jobs:
                     if j.get("id") == job_id:
+                        try:
+                            declarations.validate_immutable_update(j, fields)
+                        except declarations.ExperimentDeclarationError as exc:
+                            raise SystemExit(str(exc)) from exc
                         j.update(fields)
                 self._save(f, jobs)
         except TimeoutError as e:
