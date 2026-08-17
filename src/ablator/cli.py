@@ -14,6 +14,7 @@ from . import external as externalmod
 from . import health as healthmod
 from . import progress as progmod
 from . import runner, spec as specmod
+from . import source_display as sourcedisplay
 from .queue import (Queue, job_lane, clear_pause_flag, pause_flag_path,
                     read_pause_flag, write_pause_flag)
 
@@ -42,6 +43,8 @@ def cmd_plan(cfg: dict, spec_path: str, dry_run: bool = False) -> None:
         print(f"  {j['id']:<40} machine={j['machine']:<6} type={j['type']:<8} "
               f"-> {j['model_path']}{dep}")
         print(f"  {'':<40} scene={j['scene']}")
+        if j.get("requested_git_sha"):
+            print(f"  {'':<40} git={j['requested_git_sha']}")
 
 
 # ---------------------------------------------------------------- status
@@ -107,7 +110,7 @@ def _error_tag(j: dict) -> str:
 
 
 def _status_lines(cfg: dict, jobs: list[dict]) -> list[str]:
-    lines = [f"{'id':<40} {'lane':<4} {'status':<12} {'machine':<8} {'claimed_by':<10} "
+    lines = [f"{'id':<40} {'lane':<4} {'status':<12} {'machine':<8} {'git':<27} {'claimed_by':<10} "
              f"{'elapsed':<8} {'depends_on':<12} progress"]
     for j in _display_sort(jobs):
         prog = " ".join(x for x in (_progress(cfg, j), _health_note(j)) if x)
@@ -115,9 +118,9 @@ def _status_lines(cfg: dict, jobs: list[dict]) -> list[str]:
         if tag:
             prog = " ".join(x for x in (tag, prog) if x)
         lines.append(f"{(j.get('id') or ''):<40} {job_lane(j):<4} {(j.get('status') or ''):<12} "
-                     f"{(j.get('machine') or ''):<8} {(j.get('claimed_by') or '-'):<10} "
-                     f"{_elapsed(j):<8} {(j.get('depends_on') or '-'):<12} "
-                     f"{prog}")
+                     f"{(j.get('machine') or ''):<8} {sourcedisplay.source_state(j):<27} "
+                     f"{(j.get('claimed_by') or '-'):<10} {_elapsed(j):<8} "
+                     f"{(j.get('depends_on') or '-'):<12} {prog}")
     counts: dict[str, int] = {}
     for j in jobs:
         key = j.get("status") or "?"
