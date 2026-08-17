@@ -3,6 +3,7 @@ paths: git-state capture, r9700-vs-main drift warning, k8s image-commit-
 label drift check, and that provenance data lands in the ledger entry."""
 import json
 import subprocess
+import threading
 from unittest import mock
 
 import pytest
@@ -91,6 +92,94 @@ def test_check_remote_drift_unreachable():
 def _write_state_file(cfg, machine, commit):
     runner.write_git_state_file(cfg, machine, {"commit": commit, "branch": "main",
                                                "dirty": False, "host": machine})
+
+
+def test_git_state_reader_never_sees_partially_written_refresh(tmp_path, monkeypatch):
+    """Concurrent claim/idle writers must publish only complete JSON objects."""
+    cfg = {"queue": {"path": str(tmp_path / "queue.jsonl")}}
+    runner.write_git_state_file(cfg, "main", {"commit": "old"})
+    original_dump = runner.json.dump
+    writer_entered_dump = threading.Event()
+    release_writer = threading.Event()
+
+    def paused_dump(value, handle):
+        writer_entered_dump.set()
+        assert release_writer.wait(timeout=5)
+        original_dump(value, handle)
+
+    monkeypatch.setattr(runner.json, "dump", paused_dump)
+    writer = threading.Thread(
+        target=runner.write_git_state_file,
+        args=(cfg, "main", {"commit": "new"}),
+    )
+    writer.start()
+    assert writer_entered_dump.wait(timeout=5)
+
+    # A truncate-in-place writer exposes empty/malformed JSON here and the
+    # production reader silently degrades it to None, suppressing drift checks.
+    try:
+        assert runner.read_git_state_file(cfg, "main")["commit"] == "old"
+    finally:
+        release_writer.set()
+        writer.join(timeout=5)
+    assert not writer.is_alive()
+    assert runner.read_git_state_file(cfg, "main")["commit"] == "new"
+
+
+def test_idle_runner_refreshes_shared_workload_state_without_claiming(
+    tmp_path, monkeypatch,
+):
+    """A runner restart must replace stale cross-machine state even with no jobs."""
+    repo = tmp_path / "workload"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True,
+                   capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Ablator Test"], cwd=repo,
+                   check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=repo,
+                   check=True)
+    (repo / "tracked.txt").write_text("current\n")
+    subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "current workload"], cwd=repo,
+                   check=True, capture_output=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    queue_path = tmp_path / "queue.jsonl"
+    cfg = {
+        "queue": {"path": str(queue_path), "log_dir": str(tmp_path)},
+        "machines": {"main": {"k8s_dispatch": False}},
+        "types": {},
+        "urgent_fixes": {
+            "repo_cwd": str(repo),
+            "fixes": [{"sha": commit}],
+        },
+    }
+    # The state file models the real incident: main last dispatched from an
+    # older commit, then stayed idle while its checkout advanced.
+    runner.write_git_state_file(
+        cfg, "main", {"commit": "stale-e47", "branch": "main", "dirty": False}
+    )
+    monkeypatch.setattr(runner.cfgmod, "machine_name", lambda _cfg: "main")
+    monkeypatch.setattr(runner.resources, "machine_busy", lambda *_args: True)
+    monkeypatch.setattr(runner.selfcheckmod, "run_self_check", lambda *_args: None)
+    class ImmediateThread:
+        def __init__(self, *, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(runner.threading, "Thread", ImmediateThread)
+
+    runner.run_loop(cfg, once=True)
+
+    refreshed = runner.read_git_state_file(cfg, "main")
+    assert refreshed["commit"] == commit
+    assert refreshed["cwd"] == str(repo)
+    assert refreshed["dirty"] is False
 
 
 def test_check_r9700_drift_warns_on_mismatch(tmp_path):
