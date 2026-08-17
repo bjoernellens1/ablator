@@ -27,6 +27,7 @@ import json
 import os
 import re
 import subprocess
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
@@ -103,6 +104,11 @@ def _cache_root(cfg: dict, machine: str) -> str:
     return os.path.abspath(os.path.expanduser(
         configured or "~/.cache/ablator/worktrees"
     ))
+
+
+def cache_root(cfg: dict, machine: str) -> str:
+    """Public cache-root resolver shared by materialization and GC."""
+    return _cache_root(cfg, machine)
 
 
 def _repo_key(identity: str) -> str:
@@ -220,7 +226,13 @@ def _materialize(repo: str, identity: str, sha: str, cache_root: str) -> str:
         sidecar = f"{checkout}.ablator.json"
         try:
             with open(sidecar, "w") as handle:
-                json.dump({"sha": sha, "repo": identity, "checkout": checkout}, handle)
+                json.dump({
+                    "sha": sha,
+                    "repo": identity,
+                    "checkout": checkout,
+                    "source_repo_path": repo,
+                    "last_used_at": time.time(),
+                }, handle)
         except OSError:
             pass  # provenance safety does not depend on cache metadata
 
