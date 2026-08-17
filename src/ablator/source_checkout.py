@@ -6,8 +6,18 @@ worktree on the machine that will execute the job, rewrites the job type config
 to use that worktree, and provides the hard requested-vs-executed provenance
 check used immediately before workload launch.
 
-The implementation is intentionally stdlib + git only.  Existing mutable jobs
+The implementation is intentionally stdlib + git only. Existing mutable jobs
 remain a no-op and keep their historical behavior.
+
+Pinned-job policy deliberately distinguishes two concepts that the historical
+mutable-checkout gate conflated:
+
+* explicit ``[[urgent_fixes.fixes]]`` SHAs are safety requirements and MUST be
+  ancestors of the requested revision;
+* ``auto_sync_ref`` is a freshness policy for a mutable shared checkout. It is
+  not applied to an explicitly pinned revision, because doing so would turn a
+  user-requested immutable PR/commit validation into an implicit request to run
+  a different, newer commit.
 """
 from __future__ import annotations
 
@@ -19,7 +29,6 @@ import re
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Iterator
 
 try:  # Linux is the production target; keep import failure explicit on others.
@@ -38,6 +47,7 @@ class PreparedSource:
     checkout_path: str | None = None
     requested_git_sha: str | None = None
     source_repo: str | None = None
+    source_repo_path: str | None = None
 
 
 _CONTAINER_RUNTIMES = {"docker", "podman"}
@@ -122,7 +132,7 @@ def _ensure_source_repo(source_cwd: str | None, git_repo: str | None,
     """Return ``(git repo path, stable identity)``.
 
     Prefer the type's already-configured repository so existing SSH/local
-    authentication continues to work.  If that checkout does not exist, a
+    authentication continues to work. If that checkout does not exist, a
     structured ``git.repo`` declaration can bootstrap a local bare mirror.
     """
     if _is_git_repo(source_cwd):
@@ -206,7 +216,7 @@ def _materialize(repo: str, identity: str, sha: str, cache_root: str) -> str:
                 )
 
         # Sidecar metadata lives outside the checkout so it cannot make the
-        # immutable worktree dirty.  #31 can build cache GC/leases on this.
+        # immutable worktree dirty. #31 can build cache GC/leases on this.
         sidecar = f"{checkout}.ablator.json"
         try:
             with open(sidecar, "w") as handle:
@@ -215,6 +225,62 @@ def _materialize(repo: str, identity: str, sha: str, cache_root: str) -> str:
             pass  # provenance safety does not depend on cache metadata
 
     return checkout
+
+
+def _required_fix_shas(cfg: dict) -> list[tuple[str, str]]:
+    """Explicit mandatory fixes for every pinned job.
+
+    ``auto_sync_ref`` is intentionally absent here: it governs freshness of
+    the shared mutable checkout, whereas a pin is an explicit request for one
+    exact historical/review revision. Explicit fix entries remain hard safety
+    requirements for both modes.
+    """
+    out: list[tuple[str, str]] = []
+    for fix in (cfg.get("urgent_fixes") or {}).get("fixes") or []:
+        sha = fix.get("sha")
+        if isinstance(sha, str) and sha:
+            out.append((sha, str(fix.get("subject") or "mandatory urgent fix")))
+    return out
+
+
+def _validate_required_fixes(cfg: dict, repo: str, checkout: str,
+                             requested: str) -> None:
+    for required, subject in _required_fix_shas(cfg):
+        _ensure_commit(repo, required)
+        result = _git(checkout, "merge-base", "--is-ancestor", required, "HEAD", timeout=20)
+        if result.returncode != 0:
+            raise SourcePreparationError(
+                f"requested Git SHA {requested} omits mandatory urgent fix "
+                f"{required} ({subject}); refusing this job without pausing the machine"
+            )
+
+
+def validate_requested_revision_policy(
+    cfg: dict, job: dict, machine: str, source_cwd: str | None,
+) -> str | None:
+    """Validate a pinned revision without creating a host worktree.
+
+    Used by backends such as Kubernetes whose init container materializes the
+    checkout itself. The dispatch host still verifies that the requested
+    object exists and contains every explicit mandatory urgent fix before any
+    workload object is submitted. Returns the stable repository identity for
+    pinned jobs and ``None`` for legacy jobs.
+    """
+    requested = job.get("requested_git_sha")
+    if not requested:
+        return None
+    root = _cache_root(cfg, machine)
+    repo, identity = _ensure_source_repo(source_cwd, job.get("git_repo"), root)
+    _ensure_commit(repo, requested)
+    for required, subject in _required_fix_shas(cfg):
+        _ensure_commit(repo, required)
+        result = _git(repo, "merge-base", "--is-ancestor", required, requested, timeout=20)
+        if result.returncode != 0:
+            raise SourcePreparationError(
+                f"requested Git SHA {requested} omits mandatory urgent fix "
+                f"{required} ({subject}); refusing this job without pausing the machine"
+            )
+    return identity
 
 
 def _replace_checkout(value, old: str | None, new: str):
@@ -246,7 +312,7 @@ def prepare_job_source(cfg: dict, job: dict, machine: str, tcfg: dict) -> Prepar
     """Prepare and wire the immutable checkout for a pinned job.
 
     Unpinned jobs are returned byte-for-byte as a deep copy and perform no Git
-    operations.  Pinned jobs are materialized on *this* runner machine; this is
+    operations. Pinned jobs are materialized on *this* runner machine; this is
     what makes the same mechanism work for main and independently-running SSH
     satellite runners without coordinator-side checkout manipulation.
     """
@@ -264,6 +330,7 @@ def prepare_job_source(cfg: dict, job: dict, machine: str, tcfg: dict) -> Prepar
     root = _cache_root(cfg, machine)
     repo, identity = _ensure_source_repo(source_cwd, job.get("git_repo"), root)
     checkout = _materialize(repo, identity, requested, root)
+    _validate_required_fixes(cfg, repo, checkout, requested)
     rewritten = _replace_checkout(copy.deepcopy(tcfg), source_cwd, checkout)
     rewritten["cwd"] = checkout
     return PreparedSource(
@@ -271,6 +338,7 @@ def prepare_job_source(cfg: dict, job: dict, machine: str, tcfg: dict) -> Prepar
         checkout_path=checkout,
         requested_git_sha=requested,
         source_repo=identity,
+        source_repo_path=repo,
     )
 
 

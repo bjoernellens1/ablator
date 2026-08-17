@@ -245,7 +245,8 @@ class Queue:
 
     def claim_next(self, machine: str,
                    can_run: Callable[[dict], bool] | None = None,
-                   only_pinned: bool = False) -> dict | None:
+                   only_pinned: bool = False,
+                   allow_pinned_git_while_paused: bool = False) -> dict | None:
         """Claim the first runnable pending job for this machine.
 
         can_run(job) is an optional capability predicate (e.g. required
@@ -259,13 +260,26 @@ class Queue:
         _other_idle_baremetal) without touching pinned-job claiming at
         all.
 
-        A machine-level pause flag (see pause_flag_path) blocks new claims
-        without disturbing already-running jobs. A queue-flock timeout
+        A machine-level pause flag (see pause_flag_path) normally blocks new
+        claims without disturbing already-running jobs. When
+        ``allow_pinned_git_while_paused`` is true, the one auto-generated
+        ``urgent_fix_unsynced`` category becomes a pinned-Git-only filter:
+        legacy mutable jobs remain blocked, while immutable jobs may be
+        claimed and validate their requested revision independently before
+        launch. Manual and unknown pause categories remain absolute.
+
+        A queue-flock timeout
         (contended/hung NFS lock) returns None rather than blocking
         forever — the caller retries on its next poll.
         """
+        paused_pinned_only = False
         if is_paused(self.path, machine):
-            return None
+            pause_info = read_pause_flag(self.path, machine) or {}
+            if (allow_pinned_git_while_paused
+                    and pause_info.get("category") == "urgent_fix_unsynced"):
+                paused_pinned_only = True
+            else:
+                return None
         try:
             f = self._open_locked()
         except TimeoutError:
@@ -278,6 +292,8 @@ class Queue:
                     if job_lane(j) != lane:
                         continue
                     if j.get("status") != "pending":
+                        continue
+                    if paused_pinned_only and not j.get("requested_git_sha"):
                         continue
                     jm = j.get("machine", "any")
                     if only_pinned:
