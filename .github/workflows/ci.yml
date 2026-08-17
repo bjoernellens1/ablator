@@ -23,6 +23,10 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           cache: pip
+      - name: Configure Git identity for repository-fixture tests
+        run: |
+          git config --global user.name "Ablator CI"
+          git config --global user.email "ablator-ci@users.noreply.github.com"
       - run: pip install -e . pytest
       - run: python -m compileall -q src tests
       - run: pytest -q
