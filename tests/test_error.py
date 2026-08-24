@@ -87,6 +87,17 @@ def test_unknown():
     assert r["suggested_action"] == "retry_once_then_quarantine"
 
 
+def test_worker_runtime_missing_is_blocked_not_quarantined():
+    r = errormod.classify_failure(
+        _job(),
+        "/home/bjoern/git/researchflow/.venv/bin/python3: No such file or directory",
+        1,
+        {},
+    )
+    assert r["category"] == "worker_runtime_missing"
+    assert r["suggested_action"] == "block_worker_setup"
+
+
 # --- config-driven patterns ---------------------------------------------
 
 def test_patterns_from_config_overrides_category():

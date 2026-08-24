@@ -800,7 +800,7 @@ def handle_failure(cfg: dict, job: dict, exit_code: int | None, machine: str,
                    base_dir: str, q: Queue) -> str:
     """Classify a failure and decide the job's terminal/backoff disposition.
 
-    Returns one of: "paused_disk_full", "quarantined", "pending" (requeued
+    Returns one of: "paused_disk_full", "blocked_worker_setup", "quarantined", "pending" (requeued
     with not_before/needs_review bookkeeping already applied via q.update),
     or "retry" (caller should retry once, existing uniform behavior for
     'unknown').
@@ -854,6 +854,13 @@ def handle_failure(cfg: dict, job: dict, exit_code: int | None, machine: str,
     if action == "skip_permanently_this_machine":
         print(f"[ablator] {job['id']}: {category} — quarantining", flush=True)
         return "quarantined"
+
+    if action == "block_worker_setup":
+        q.update(job["id"], status="blocked_worker_setup", health=None,
+                claimed_by=None, claimed_at=None, needs_review=True,
+                blocked_reason=result["evidence_snippet"])
+        print(f"[ablator] {job['id']}: worker runtime missing — blocked pending setup", flush=True)
+        return "blocked_worker_setup"
 
     if action == "requeue_backoff_5min":
         q.update(job["id"], status="pending", health=None,
@@ -2017,7 +2024,7 @@ def _dispatch_and_finalize(cfg: dict, machine: str, job: dict, job_machine: str,
         # runner (including this one) can retake it fresh
         q.update(job["id"], status="pending", health=None,
                  claimed_by=None, claimed_at=None)
-    elif status in ("pending", "paused_disk_full"):
+    elif status in ("pending", "paused_disk_full", "blocked_worker_setup"):
         pass  # handle_failure() already persisted this status
     else:
         if status == "failed_no_retry":  # manual stop: never retried

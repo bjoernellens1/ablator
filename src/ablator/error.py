@@ -6,7 +6,7 @@ category + evidence + confidence + suggested_action. Callers (runner)
 decide what to actually do about it (requeue/quarantine/pause).
 
 Categories, roughly in priority order when multiple could match:
-  disk_full, image_missing, gpu_busy_conflict, oom_killed, scene_missing,
+  disk_full, image_missing, worker_runtime_missing, gpu_busy_conflict, oom_killed, scene_missing,
   network_transient, code_error, unknown
 
 Marker lists are config-driven: built-in defaults below, overridable per
@@ -27,6 +27,7 @@ import re
 SUGGESTED_ACTION = {
     "disk_full": "pause_queue_alert",
     "image_missing": "skip_permanently_this_machine",
+    "worker_runtime_missing": "block_worker_setup",
     "gpu_busy_conflict": "requeue_backoff_5min",
     "oom_killed": "requeue_once_needs_review",
     "scene_missing": "quarantine_no_retry",
@@ -42,6 +43,11 @@ DEFAULT_PATTERNS: dict[str, tuple[str, ...]] = {
         "manifest unknown",
         "no such image",
         "unable to find image",
+    ),
+    "worker_runtime_missing": (
+        ".venv/bin/python",
+        "no module named snakemake",
+        "researchflow: command not found",
     ),
     "network_transient": (
         "temporary failure in name resolution",
@@ -136,6 +142,7 @@ def classify_failure(job: dict, log_tail: str, exit_code: int | None,
     machine_context = machine_context or {}
     patterns = patterns or DEFAULT_PATTERNS
     image_missing_markers = patterns.get("image_missing", _IMAGE_MISSING_MARKERS)
+    worker_runtime_markers = patterns.get("worker_runtime_missing", ())
     network_markers = patterns.get("network_transient", _NETWORK_MARKERS)
     gpu_oom_markers = patterns.get("gpu_oom", _GPU_OOM_MARKERS)
     disk_full_marker = patterns.get("disk_full", (_DISK_FULL_MARKER,))[0]
@@ -155,6 +162,13 @@ def classify_failure(job: dict, log_tail: str, exit_code: int | None,
     for marker in image_missing_markers:
         if marker in low:
             return _result("image_missing", _snippet(log_tail, marker), 0.95)
+
+    # --- worker runtime missing --------------------------------------------
+    # This is a dispatcher/bootstrap failure, not a missing scene.  It must
+    # win over the broad legacy ``No such file`` scene heuristic below.
+    for marker in worker_runtime_markers:
+        if marker in low:
+            return _result("worker_runtime_missing", _snippet(log_tail, marker), 0.98)
 
     # --- gpu_busy_conflict ---------------------------------------------------
     gpu_oom_hit = any(marker in low for marker in gpu_oom_markers)

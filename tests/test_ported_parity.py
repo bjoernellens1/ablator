@@ -204,3 +204,21 @@ def test_handle_failure_gpu_busy_requeues_with_backoff(cfg, tmp_path):
     rec = q.read()[0]
     assert rec["status"] == "pending"
     assert rec["not_before"] > time.time()
+
+
+def test_handle_failure_missing_worker_runtime_blocks_without_retrying(cfg, tmp_path):
+    from ablator import runner
+    q = Queue(cfg["queue"]["path"])
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    job = {"id": "worker-runtime", "model_path": str(tmp_path / "out"), "scene": "/data/scene"}
+    q.append([{**job, "status": "running", "machine": "m"}])
+    with open(tmp_path / "worker-runtime.log", "w") as f:
+        f.write("/home/bjoern/git/researchflow/.venv/bin/python3: No such file or directory\n")
+
+    disposition = runner.handle_failure(cfg, job, 1, "m", str(tmp_path), q)
+
+    assert disposition == "blocked_worker_setup"
+    rec = q.read()[0]
+    assert rec["status"] == "blocked_worker_setup"
+    assert rec["error_category"] == "worker_runtime_missing"
+    assert rec["needs_review"] is True
