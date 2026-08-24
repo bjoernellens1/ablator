@@ -818,6 +818,23 @@ def handle_failure(cfg: dict, job: dict, exit_code: int | None, machine: str,
     prevents infinite resume->immediate-crash->resume loops for jobs with a
     genuine, reproducible bug that happens to occur just after a checkpoint.
     """
+    # ResearchFlow registers immutable scientific identities before dispatch.
+    # Re-running such a job in the same output directory makes its artifacts
+    # an untraceable mixture of attempts, so it must fail closed even when a
+    # generic queue failure would normally get one automatic retry/resume.
+    metadata = job.get("external_metadata") or {}
+    if metadata.get("retry_policy") == "never":
+        classify_and_record(cfg, job, exit_code, base_dir, q)
+        q.update(
+            job["id"],
+            retry_suppressed=True,
+            suggested_action="retry_suppressed_immutable",
+        )
+        job["retry_suppressed"] = True
+        job["suggested_action"] = "retry_suppressed_immutable"
+        print(f"[ablator] {job['id']}: immutable external run; retry suppressed", flush=True)
+        return "quarantined"
+
     ckpt = find_latest_checkpoint(job.get("model_path", ""), base_dir)
     if ckpt is not None:
         ckpt_path, ckpt_iter = ckpt

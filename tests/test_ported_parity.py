@@ -204,3 +204,21 @@ def test_handle_failure_gpu_busy_requeues_with_backoff(cfg, tmp_path):
     rec = q.read()[0]
     assert rec["status"] == "pending"
     assert rec["not_before"] > time.time()
+
+
+def test_handle_failure_never_retries_an_immutable_external_job(cfg, tmp_path):
+    """A failed ResearchFlow identity must not overwrite its own evidence."""
+    from ablator import runner
+    q = Queue(cfg["queue"]["path"])
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    job = {
+        "id": "immutable", "model_path": str(tmp_path / "out"), "scene": "",
+        "external_metadata": {"retry_policy": "never"},
+    }
+    q.append([{**job, "status": "running", "machine": "m"}])
+    (tmp_path / "immutable.log").write_text("ordinary unclassified failure\n")
+
+    assert runner.handle_failure(cfg, job, 1, "m", str(tmp_path), q) == "quarantined"
+    record = q.read()[0]
+    assert record["retry_suppressed"] is True
+    assert record["suggested_action"] == "retry_suppressed_immutable"
