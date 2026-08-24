@@ -48,6 +48,7 @@ DEFAULT_PATTERNS: dict[str, tuple[str, ...]] = {
         ".venv/bin/python",
         "no module named snakemake",
         "researchflow: command not found",
+        "error: snakefile",
     ),
     "network_transient": (
         "temporary failure in name resolution",

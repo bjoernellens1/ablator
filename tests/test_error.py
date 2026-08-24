@@ -98,6 +98,16 @@ def test_worker_runtime_missing_is_blocked_not_quarantined():
     assert r["suggested_action"] == "block_worker_setup"
 
 
+def test_missing_submitted_snakefile_is_worker_runtime_not_scene_missing():
+    r = errormod.classify_failure(
+        _job(),
+        'Error: Snakefile "/tmp/researchflow/workflow/Snakefile" not found.',
+        1,
+        {},
+    )
+    assert r["category"] == "worker_runtime_missing"
+
+
 # --- config-driven patterns ---------------------------------------------
 
 def test_patterns_from_config_overrides_category():
