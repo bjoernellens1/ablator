@@ -6,7 +6,7 @@ import json
 import pytest
 
 from ablator import experiment_declaration as declarations
-from ablator import external, spec as specmod
+from ablator import external, runner, spec as specmod
 
 
 def _cfg():
@@ -118,3 +118,78 @@ def test_new_transport_variables_are_protected():
     assert declarations.JOB_ID_ENV in declarations.PROTECTED_ENV
     assert declarations.JOB_JSON_ENV in declarations.PROTECTED_ENV
     assert declarations.SUBMISSION_ENV in declarations.PROTECTED_ENV
+
+
+def test_claimed_legacy_direct_child_replaces_stale_protected_environment(monkeypatch):
+    job = {
+        "id": "legacy_direct",
+        "type": "replay",
+        "machine": "main",
+        "status": "running",
+    }
+    stale = {name: "stale" for name in declarations.PROTECTED_ENV}
+    for name, value in stale.items():
+        monkeypatch.setenv(name, value)
+
+    _, env, _ = runner.render_command(
+        {"command": ["true"], "env": stale}, job, "main"
+    )
+
+    assert env[declarations.JOB_ID_ENV] == job["id"]
+    assert json.loads(env[declarations.JOB_JSON_ENV]) == job
+    assert declarations.SUBMISSION_ENV not in env
+    assert declarations.DECLARATION_ENV not in env
+    assert declarations.DECLARATION_SHA_ENV not in env
+
+
+@pytest.mark.parametrize("runtime", ["docker", "podman"])
+def test_claimed_legacy_container_receives_trusted_job_environment(runtime):
+    job = {
+        "id": f"legacy_{runtime}",
+        "type": "replay",
+        "machine": "main",
+        "status": "running",
+    }
+
+    argv, _, _ = runner.render_command(
+        {"command": [runtime, "run", "--rm", "image:tag", "true"]},
+        job,
+        "main",
+    )
+
+    injected = {
+        argv[index + 1] for index, token in enumerate(argv[:-1]) if token == "--env"
+    }
+    assert injected == {
+        f"{declarations.JOB_ID_ENV}={job['id']}",
+        f"{declarations.JOB_JSON_ENV}="
+        f"{json.dumps(job, sort_keys=True, separators=(',', ':'))}",
+    }
+
+
+def test_claimed_legacy_kubernetes_trainer_receives_job_environment():
+    job = {
+        "id": "legacy_k8s",
+        "type": "replay",
+        "machine": "cluster",
+        "status": "running",
+    }
+    machine = {
+        "namespace": "jobs",
+        "kai_queue": "batch",
+        "priority_class": "batch-low",
+        "image": "image:tag",
+    }
+
+    manifest = runner.build_k8s_job_manifest(
+        machine, job, ["python", "train.py"], "/workspace"
+    )
+
+    trainer = manifest["spec"]["template"]["spec"]["containers"][0]
+    env = {item["name"]: item["value"] for item in trainer["env"]}
+    assert env == {
+        declarations.JOB_ID_ENV: job["id"],
+        declarations.JOB_JSON_ENV: json.dumps(
+            job, sort_keys=True, separators=(",", ":")
+        ),
+    }
