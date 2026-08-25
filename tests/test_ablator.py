@@ -832,6 +832,99 @@ def test_reconcile_ignores_other_machines_claims(tmp_path):
     assert read_queue(q.path)[0].get("claimed_by") == "r9700"
 
 
+def test_reconcile_marks_other_machines_job_done_when_artifact_present(tmp_path):
+    """Regression for the pixel10a_champ_champion incident (2026-08-21/22):
+    main's runner process died mid-job with no traceback; the container it
+    had launched kept training independently and finished cleanly with a
+    real completion artifact, but nothing was left running on main to
+    notice -- the ledger entry stayed stuck at status="running" serving an
+    increasingly stale cached health snapshot for over 24h, until a human
+    manually ran `ablator stop`. A DIFFERENT machine's idle-tick
+    reconciliation must be able to mark a job done purely from its
+    completion artifact, regardless of which machine claimed it -- that
+    transition can never race a duplicate dispatch."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_done_foreign"
+    (mp / "comparison" / "iter_1000").mkdir(parents=True)
+    (mp / "comparison" / "iter_1000" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    # r9700's own idle tick reconciles main's orphaned-but-completed job.
+    runner.reconcile_stale_running(cfg, "r9700", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert job["reconciled"] is True
+    assert job.get("claimed_by") == "main"  # untouched -- provenance preserved
+
+
+def test_reconcile_leaves_other_machines_job_running_when_no_artifact(tmp_path):
+    """The cross-machine dead-man's-switch only ever marks a foreign job
+    DONE from a real completion artifact -- it must never requeue a
+    foreign machine's job (that machine might still be genuinely training
+    it; this runner has no way to check that machine's own busy-guards)."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_no_artifact_foreign"
+    mp.mkdir()
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    runner.reconcile_stale_running(cfg, "r9700", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
+    assert job.get("claimed_by") == "main"
+
+
+def test_reconcile_respects_grace_window_for_other_machines_claims(tmp_path):
+    """A foreign job claimed moments ago (its own artifacts may not exist
+    yet -- container still pulling/starting) must not be misread; the
+    grace window applies to the cross-machine pass exactly as it does to
+    the own-claim pass."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_starting_foreign"
+    (mp / "comparison" / "iter_1000").mkdir(parents=True)
+    (mp / "comparison" / "iter_1000" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    claimed_at = time.strftime("%Y-%m-%dT%H:%M:%S")  # just now
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": claimed_at}])
+    runner.reconcile_stale_running(cfg, "r9700", q, busy=False)
+    job = read_queue(q.path)[0]
+    # Even though an artifact already exists (a legitimate fast job could
+    # finish within the grace window), the grace window still simply
+    # defers the check to a later tick rather than acting on it early --
+    # asserting it stays running here is intentionally conservative and
+    # matches the own-claim grace-window test's shape.
+    assert job["status"] == "running"
+
+
+def test_reconcile_other_machines_job_done_ignores_own_busy_state(tmp_path):
+    """The cross-machine dead-man's-switch pass is not gated by THIS
+    machine's own busy-guards -- a foreign machine's completed job can be
+    marked done even while this machine is itself busy running something
+    else, since it never touches this machine's own claim/dispatch."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_done_foreign_while_busy"
+    (mp / "comparison" / "iter_1000").mkdir(parents=True)
+    (mp / "comparison" / "iter_1000" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    runner.reconcile_stale_running(cfg, "r9700", q, busy=True)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+
+
 def test_run_loop_reconciles_orphan_that_was_busy_at_startup(tmp_path, monkeypatch):
     """Regression for the 2026-07-07 live incident: a runner restart's
     startup-only reconcile_stale_running() call correctly deferred (the

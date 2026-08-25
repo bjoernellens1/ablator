@@ -1709,10 +1709,15 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
     marked running-and-claimed-by-us predates this process and has no
     live supervise() loop watching it).
 
-    Only ever touches jobs with claimed_by == machine — a different
-    machine's claim is untouched, it self-heals on its own restart.
+    Requeue/crash handling below is only ever applied to jobs with
+    claimed_by == machine — a different machine's claim is left to that
+    behavior, self-healing on its own restart. But a job with a real
+    completion artifact is marked done regardless of which machine
+    claimed it (see the cross-machine dead-man's-switch pass below) —
+    that transition can never cause a duplicate launch, so it does not
+    need to wait for the owning machine's own runner to restart.
 
-    Never runs while the machine's busy-guards say something is still
+    Never requeues while the machine's busy-guards say something is still
     actually executing (e.g. the training container is still up): we
     cannot tell *which* job that process belongs to, and reconciling
     while it might still be writing results would risk a second runner
@@ -1736,13 +1741,56 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
     """
     if busy is None:
         busy = resources.machine_busy(cfg, machine)
-    if busy:
-        return
     is_k8s = cfgmod.machine_cfg(cfg, machine).get("backend") == "k8s"
     mcfg = cfgmod.machine_cfg(cfg, machine) if is_k8s else None
     grace_s = cfg.get("queue", {}).get("reconcile_grace_s", DEFAULT_RECONCILE_GRACE_S)
     for job in q.read():
-        if job.get("status") != "running" or job.get("claimed_by") != machine:
+        if job.get("status") != "running":
+            continue
+        claimed_by = job.get("claimed_by")
+
+        if claimed_by != machine:
+            # Cross-machine dead-man's-switch (found 2026-08-22,
+            # pixel10a_champ_champion): the OWN-claim self-heal below only
+            # ever runs from within a freshly (re)started/idle-ticking
+            # run_loop for the machine that claimed the job. If that
+            # machine's runner process dies outright (crashes silently,
+            # gets killed, or the host itself never restarts it) and
+            # nothing ever launches `ablator run`/`ablator start` there
+            # again, that machine's own self-heal never gets a chance to
+            # fire — confirmed live: main's runner process died mid-job
+            # with no traceback, the container it had launched kept
+            # training independently and finished cleanly with a real
+            # completion artifact, and the ledger entry stayed stuck at
+            # status="running" (serving an increasingly stale cached
+            # health snapshot) for over 24h until a human ran `ablator
+            # stop` by hand. A completion artifact is authoritative
+            # regardless of which machine claimed the job or whether that
+            # machine's own runner is still alive to notice it, and
+            # marking it done here can never race a duplicate dispatch
+            # (unlike the requeue-to-pending transition below, this one
+            # only ever moves a job further away from being claimable).
+            # Still respect the grace window so a job claimed moments ago
+            # (result_glob/log not written yet) isn't misread — though
+            # that can only ever produce a false "not done" here, never a
+            # false "done".
+            age_s = _claimed_age_s(job)
+            if age_s is not None and age_s < grace_s:
+                continue
+            base_dir = _job_base_dir(cfg, job, claimed_by or machine)
+            h = healthmod.job_health(job, base_dir, cfg.get("queue", {}),
+                                     process_alive=False)
+            if h["state"] == "done":
+                print(f"[ablator] reconcile: {job['id']} (claimed by "
+                      f"{claimed_by!r}) has a completion artifact but is "
+                      "stuck at 'running' -- that machine's own runner may "
+                      f"be dead with nothing left to notice; marking done "
+                      f"from {machine}'s idle tick", flush=True)
+                q.finish(job["id"], "done", health=h, reconciled=True,
+                        reconciled_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+            continue
+
+        if busy:
             continue
 
         # Grace window (issue splatograph#295): a job that was claimed only
