@@ -208,3 +208,22 @@ def test_invalid_negative_age_remains_rejected(tmp_path):
         source_gc.gc_worktrees(
             _cfg(tmp_path), "main", [], max_age_days=-1,
         )
+
+
+def test_interrupted_removal_is_reported_and_preserves_sidecar(tmp_path, monkeypatch):
+    _repo_path, _sha, prepared = _prepared(tmp_path)
+    source_checkout.release_source(prepared)
+    sidecar = _age_sidecar(prepared.checkout_path, last_used_at=0)
+
+    def _fail_remove(_root, _entry):
+        return "error", "simulated interrupted cleanup"
+
+    monkeypatch.setattr(source_gc, "_remove_entry", _fail_remove)
+    result = source_gc.gc_worktrees(
+        _cfg(tmp_path), "main", [], max_age_days=0, now=200000,
+    )
+
+    assert result.removed == ()
+    assert result.errors == ("simulated interrupted cleanup",)
+    assert os.path.isdir(prepared.checkout_path)
+    assert os.path.exists(sidecar)
