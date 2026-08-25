@@ -237,6 +237,9 @@ def check_checkout_drift(cfg: dict, job: dict, machine: str, state: dict,
     `scripts/audit_run_drift.py`) makes the drift impossible to miss
     without blocking a job the user may have wanted to run as-is.
     """
+    if job.get("requested_git_sha"):
+        return
+
     warnings: list[str] = []
     fields: dict = {}
     commit = state.get("commit")
@@ -1468,9 +1471,23 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
     try:
         tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+        if job.get("requested_git_sha"):
+            if not mcfg.get("git_sync_repo_url"):
+                raise sourcecheckout.SourcePreparationError(
+                    "pinned k8s job requires machine git_sync_repo_url so the "
+                    "pod can materialize the requested SHA")
+            source_cwd = (cfg.get("types", {}).get(job.get("type", ""), {})
+                          .get("cwd"))
+            source_identity = sourcecheckout.validate_requested_revision_policy(
+                cfg, job, machine, source_cwd)
+            if q is not None:
+                q.update(job["id"], source_repo=source_identity,
+                         requested_git_sha=job.get("requested_git_sha"))
         argv, _env, cwd = render_command(tcfg, job, machine)
-    except (KeyError, TemplateError) as e:
+    except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:
         print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
+        if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):
+            q.update(job["id"], source_prepare_error=str(e))
         return "failed", None
 
     local_commit = _dispatch_host_commit(cfg, job)
@@ -2204,6 +2221,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
             # dispatch (step 2 below), which always runs regardless of
             # baremetal_busy.
             job = None
+            currency_ok = True
             if not baremetal_busy:
                 # Re-run bare-metal self-heal on every idle tick, not just at
                 # startup. The startup-only call can legitimately skip a job
@@ -2244,12 +2262,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 # auto-pull here can never yank code out from under a running
                 # bind-mounted job. See urgent_fixes.py for the full incident
                 # writeup and design rationale.
-                if not enforce_urgent_fixes(cfg, machine, q):
-                    if once:
-                        inflight.join_all()
-                        return
-                    time.sleep(IDLE_POLL_S)
-                    continue
+                currency_ok = enforce_urgent_fixes(cfg, machine, q)
 
                 # 1. Claim (non-blocking) this runner's own bare-metal job
                 # FIRST, before k8s claiming — this is what actually gives an
@@ -2259,7 +2272,10 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 # to step 3 (it's blocking) so it doesn't starve k8s
                 # concurrency in the meantime — see the design comment above
                 # for why that split matters.
-                job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
+                job = q.claim_next(
+                    machine, can_run=make_can_run(cfg, machine),
+                    allow_pinned_git_while_paused=not currency_ok,
+                )
 
             # Preserve bare-metal priority through the new runner-provenance
             # write as well as through queue claiming.  If a k8s thread wins
@@ -2283,7 +2299,13 @@ def run_loop(cfg: dict, once: bool = False) -> None:
             defer_any = _other_idle_baremetal(cfg, machine)
             for k8s_name in k8s_machines:
                 cap = _k8s_max_concurrent(cfg, k8s_name)
-                can_run = make_can_run(cfg, k8s_name)
+                base_can_run = make_can_run(cfg, k8s_name)
+                if currency_ok:
+                    can_run = base_can_run
+                else:
+                    can_run = lambda candidate, inner=base_can_run: (
+                        bool(candidate.get("requested_git_sha")) and inner(candidate)
+                    )
                 while inflight.count(k8s_name) < cap:
                     kjob = q.claim_next(k8s_name, can_run=can_run,
                                         only_pinned=defer_any)
