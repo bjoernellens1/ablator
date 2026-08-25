@@ -53,6 +53,46 @@ class PreparedSource:
 
 _CONTAINER_RUNTIMES = {"docker", "podman"}
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+_FULL_GIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+
+
+def normalize_git_target(
+    sha: object,
+    repo: object = None,
+    *,
+    required: bool = False,
+    where: str = "job",
+) -> tuple[str, str | None] | None:
+    """Validate and normalize one immutable Git target.
+
+    Queue producers and runners share this check so a non-plan submission
+    cannot bypass the full-SHA contract established by ``spec.expand_spec``.
+    """
+    if sha is None and repo is None:
+        if required:
+            raise SourcePreparationError(
+                f"{where} requires an immutable Git target (full commit SHA)"
+            )
+        return None
+    if not isinstance(sha, str) or _FULL_GIT_SHA.fullmatch(sha) is None:
+        raise SourcePreparationError(
+            f"{where}: Git target must be a full 40-character hexadecimal commit SHA"
+        )
+    if repo is not None and (not isinstance(repo, str) or not repo.strip()):
+        raise SourcePreparationError(f"{where}: git.repo must be a non-empty string")
+    return sha.lower(), (repo.strip() if isinstance(repo, str) else None)
+
+
+def job_git_target(
+    job: dict, *, required: bool = False, where: str | None = None,
+) -> tuple[str, str | None] | None:
+    """Return a queue job's normalized registered source identity."""
+    return normalize_git_target(
+        job.get("requested_git_sha"),
+        job.get("git_repo"),
+        required=required,
+        where=where or f"job {job.get('id')!r}",
+    )
 
 
 def _run(cmd: list[str], *, cwd: str | None = None, timeout: float = 90.0

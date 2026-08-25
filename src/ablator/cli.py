@@ -471,6 +471,8 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--metadata-json", default="{}")
     sp.add_argument("--lane", type=int, default=2)
     sp.add_argument("--depends-on")
+    sp.add_argument("--git-sha")
+    sp.add_argument("--git-repo")
     sp = sub.add_parser("inspect", help="inspect one exact job as structured JSON")
     sp.add_argument("--format", choices=["json"], default="json")
     sp.add_argument("job_id")
@@ -543,7 +545,8 @@ def main(argv: list[str] | None = None) -> None:
         metadata = externalmod.parse_metadata_json(a.metadata_json)
         job = externalmod.build_job(
             cfg, job_id=a.id, job_type=a.job_type, machine=a.machine,
-            params=params, metadata=metadata, lane=a.lane, depends_on=a.depends_on)
+            params=params, metadata=metadata, lane=a.lane, depends_on=a.depends_on,
+            git_sha=a.git_sha, git_repo=a.git_repo)
         record, created = externalmod.submit_job(cfg, job)
         externalmod.print_json({
             "schema": externalmod.SCHEMA, "job_id": record["id"],

@@ -19,6 +19,7 @@ import time
 from typing import Callable
 
 from . import experiment_declaration as declarations
+from . import source_checkout as sourcecheckout
 
 DEFAULT_FLOCK_TIMEOUT_S = 60.0
 
@@ -230,7 +231,15 @@ class Queue:
         for job in new_jobs:
             try:
                 declarations.validate_frozen_job(job)
+                sourcecheckout.job_git_target(
+                    job,
+                    required=job.get("gradeability") == "GRADEABLE_DECLARED",
+                )
             except declarations.ExperimentDeclarationError as exc:
+                raise SystemExit(
+                    f"refusing to enqueue job {job.get('id')!r}: {exc}"
+                ) from exc
+            except sourcecheckout.SourcePreparationError as exc:
                 raise SystemExit(
                     f"refusing to enqueue job {job.get('id')!r}: {exc}"
                 ) from exc
@@ -240,6 +249,26 @@ class Queue:
             dupes = [j["id"] for j in new_jobs if j["id"] in existing]
             if dupes:
                 raise SystemExit(f"refusing to enqueue: duplicate job ids {dupes}")
+            combined = [*jobs, *new_jobs]
+            by_id = {job.get("id"): job for job in combined}
+            for job in new_jobs:
+                dependency_id = job.get("depends_on")
+                dependency = by_id.get(dependency_id)
+                if dependency is None:
+                    continue
+                try:
+                    dependency_target = sourcecheckout.job_git_target(dependency)
+                    job_target = sourcecheckout.job_git_target(job)
+                except sourcecheckout.SourcePreparationError as exc:
+                    raise SystemExit(
+                        f"refusing to enqueue job {job.get('id')!r}: {exc}"
+                    ) from exc
+                if dependency_target != job_target:
+                    raise SystemExit(
+                        "refusing to enqueue: dependency chain changes Git target "
+                        f"between {dependency_id!r} and {job.get('id')!r}: "
+                        f"{dependency_target!r} -> {job_target!r}"
+                    )
             jobs.extend(new_jobs)
             self._save(f, jobs)
 

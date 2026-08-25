@@ -19,6 +19,9 @@ from ablator.external import (
 from ablator.queue import Queue
 
 
+SHA_A = "0123456789abcdef0123456789abcdef01234567"
+
+
 def _cfg(tmp_path: Path) -> dict:
     config = tmp_path / "ablator.json"
     queue = tmp_path / "queue.jsonl"
@@ -66,6 +69,43 @@ def test_submit_is_idempotent_and_conflicts_fail_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(ExternalJobError):
         submit_job(cfg, changed)
+
+
+def test_external_git_target_is_immutable_submit_identity(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(
+        cfg,
+        job_id="rf-pinned",
+        job_type="researchflow",
+        params={"jobscript": "/shared/job.sh"},
+        git_sha=SHA_A.upper(),
+        git_repo="https://github.com/example/project.git",
+    )
+    assert job["requested_git_sha"] == SHA_A
+    assert job["git_repo"] == "https://github.com/example/project.git"
+
+    changed = build_job(
+        cfg,
+        job_id="rf-pinned",
+        job_type="researchflow",
+        params={"jobscript": "/shared/job.sh"},
+        git_sha="f" * 40,
+        git_repo="https://github.com/example/project.git",
+    )
+    submit_job(cfg, job)
+    with pytest.raises(ExternalJobError, match="different specification"):
+        submit_job(cfg, changed)
+
+
+@pytest.mark.parametrize("sha", ["main", "a" * 39, "g" * 40, ""])
+def test_external_git_target_requires_full_commit_sha(tmp_path: Path, sha: str) -> None:
+    with pytest.raises(ExternalJobError, match="full 40-character hexadecimal"):
+        build_job(
+            _cfg(tmp_path),
+            job_id="rf-bad-pin",
+            job_type="researchflow",
+            git_sha=sha,
+        )
 
 
 def test_exact_inspection_and_pending_cancel(tmp_path: Path) -> None:
@@ -161,3 +201,20 @@ def test_cli_submit_inspect_cancel_json_contract(tmp_path: Path, capsys: pytest.
     cli.main(["--config", cfg["_path"], "cancel-jobs", "--format", "json", "cli-job"])
     cancelled = _last_json(capsys.readouterr().out)
     assert cancelled["jobs"][0]["status"] == "cancelled"
+
+
+def test_cli_submit_transports_git_target(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cfg = _cfg(tmp_path)
+    cli.main(
+        [
+            "--config", cfg["_path"], "submit", "--format", "json",
+            "--id", "cli-pinned", "--type", "researchflow",
+            "--git-sha", SHA_A,
+            "--git-repo", "https://github.com/example/project.git",
+        ]
+    )
+    _last_json(capsys.readouterr().out)
+    cli.main(["--config", cfg["_path"], "inspect", "--format", "json", "cli-pinned"])
+    inspected = _last_json(capsys.readouterr().out)
+    assert inspected["requested_git_sha"] == SHA_A
+    assert inspected["git_repo"] == "https://github.com/example/project.git"

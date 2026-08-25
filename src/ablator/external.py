@@ -22,6 +22,7 @@ from . import config as cfgmod
 from .identity import package_source_sha256
 from .queue import Queue
 from . import source_display as sourcedisplay
+from . import source_checkout as sourcecheckout
 
 SCHEMA = "ablator.external-job/v1"
 RESERVED_PARAMS = frozenset(
@@ -85,6 +86,8 @@ def build_job(
     metadata: dict[str, Any] | None = None,
     lane: int = 2,
     depends_on: str | None = None,
+    git_sha: str | None = None,
+    git_repo: str | None = None,
 ) -> dict[str, Any]:
     """Validate and normalize one external job into the existing queue schema."""
     job_id = _validate_id(job_id)
@@ -114,6 +117,12 @@ def build_job(
             raise ExternalJobError(f"invalid external parameter name {key!r}")
 
     metadata = dict(metadata or {})
+    try:
+        git_target = sourcecheckout.normalize_git_target(
+            git_sha, git_repo, where=f"external job {job_id!r}"
+        )
+    except sourcecheckout.SourcePreparationError as exc:
+        raise ExternalJobError(str(exc)) from exc
     immutable = {
         "id": job_id,
         "type": job_type,
@@ -122,8 +131,10 @@ def build_job(
         "metadata": metadata,
         "lane": lane,
         "depends_on": depends_on,
+        "requested_git_sha": git_target[0] if git_target else None,
+        "git_repo": git_target[1] if git_target else None,
     }
-    return {
+    job = {
         "id": job_id,
         "external_id": job_id,
         "external_schema": SCHEMA,
@@ -138,6 +149,11 @@ def build_job(
         "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "source": "external",
     }
+    if git_target is not None:
+        job["requested_git_sha"] = git_target[0]
+        if git_target[1] is not None:
+            job["git_repo"] = git_target[1]
+    return job
 
 
 def submit_job(cfg: dict[str, Any], job: dict[str, Any]) -> tuple[dict[str, Any], bool]:

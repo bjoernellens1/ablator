@@ -3,6 +3,7 @@
 import pytest
 
 from ablator import spec as specmod
+from ablator.queue import Queue
 
 
 SHA_A = "0123456789abcdef0123456789abcdef01234567"
@@ -18,6 +19,24 @@ def _spec(**extra):
     }
     spec.update(extra)
     return spec
+
+
+def _gradeable_spec(**extra):
+    value = _spec(**extra)
+    value["experiment"] = {
+        "schema_version": 1,
+        "run_class": "experiment",
+        "title": "immutable source contract",
+        "purpose": "prove every scientific arm executes registered code",
+        "experiment_id": "rf-issue-7",
+        "expected_evidence": ["report.json"],
+        "owner_refs": ["ablator#7"],
+        "arm": {
+            "comparison_role": "candidate",
+            "manipulation": "source pin contract",
+        },
+    }
+    return value
 
 
 def test_spec_level_git_sha_is_frozen_into_every_job():
@@ -48,6 +67,67 @@ def test_legacy_spec_has_no_git_fields():
     jobs = specmod.expand_spec(_spec())
     assert all("requested_git_sha" not in job for job in jobs)
     assert all("git_repo" not in job for job in jobs)
+
+
+def test_gradeable_spec_requires_immutable_git_target():
+    with pytest.raises(SystemExit, match="requires an immutable Git target"):
+        specmod.expand_spec(_gradeable_spec())
+
+
+def test_non_gradeable_declaration_can_remain_unpinned():
+    value = _spec()
+    value["experiment"] = {
+        "schema_version": 1,
+        "run_class": "developer_smoke",
+        "title": "local smoke",
+        "purpose": "debug runner wiring",
+    }
+    jobs = specmod.expand_spec(value)
+    assert all("requested_git_sha" not in job for job in jobs)
+
+
+def test_sequential_dependency_chain_rejects_mixed_git_targets():
+    value = _spec(parallel=False, git_sha=SHA_A)
+    value["arms"][1]["git_sha"] = SHA_B
+    with pytest.raises(SystemExit, match="dependency chain changes Git target"):
+        specmod.expand_spec(value)
+
+
+def test_parallel_arms_may_explicitly_target_distinct_commits():
+    value = _spec(parallel=True, git_sha=SHA_A)
+    value["arms"][1]["git_sha"] = SHA_B
+    jobs = specmod.expand_spec(value)
+    assert [job["requested_git_sha"] for job in jobs] == [SHA_A, SHA_B]
+
+
+def test_queue_append_rejects_dependency_git_target_drift(tmp_path):
+    queue = Queue(str(tmp_path / "queue.jsonl"))
+    with pytest.raises(SystemExit, match="dependency chain changes Git target"):
+        queue.append([
+            {"id": "parent", "status": "pending", "requested_git_sha": SHA_A},
+            {
+                "id": "child",
+                "status": "pending",
+                "depends_on": "parent",
+                "requested_git_sha": SHA_B,
+            },
+        ])
+
+
+def test_queue_append_checks_dependency_already_in_queue(tmp_path):
+    queue = Queue(str(tmp_path / "queue.jsonl"))
+    queue.append([
+        {"id": "parent", "status": "done", "requested_git_sha": SHA_A},
+    ])
+    with pytest.raises(SystemExit, match="dependency chain changes Git target"):
+        queue.append([
+            {
+                "id": "child",
+                "status": "pending",
+                "depends_on": "parent",
+                "requested_git_sha": SHA_B,
+            },
+        ])
 
 
 @pytest.mark.parametrize("value", [
