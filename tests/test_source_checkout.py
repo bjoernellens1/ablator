@@ -190,7 +190,37 @@ def test_repo_cwd_template_is_supported_for_container_mounts(tmp_path):
     prepared = source.prepare_job_source(
         _cfg(tmp_path), {"id": "pin", "requested_git_sha": sha}, "main", tcfg
     )
-    assert f"{prepared.checkout_path}:/src" in prepared.type_config["command"]
+    assert f"{prepared.checkout_path}:/src:ro" in prepared.type_config["command"]
+
+
+def test_long_container_mount_form_is_read_only(tmp_path):
+    repo, sha = _repo(tmp_path)
+    tcfg = {
+        "cwd": str(repo),
+        "command": [
+            "podman", "run", "--mount",
+            "type=bind,src={repo_cwd},dst=/workspace/project",
+            "image:test",
+        ],
+    }
+    prepared = source.prepare_job_source(
+        _cfg(tmp_path), {"id": "pin", "requested_git_sha": sha}, "main", tcfg
+    )
+    assert (
+        f"type=bind,src={prepared.checkout_path},dst=/workspace/project,readonly"
+        in prepared.type_config["command"]
+    )
+
+
+def test_pinned_direct_process_disables_bytecode_writes(tmp_path):
+    repo, sha = _repo(tmp_path)
+    prepared = source.prepare_job_source(
+        _cfg(tmp_path),
+        {"id": "pin", "requested_git_sha": sha},
+        "main",
+        {"cwd": str(repo), "command": ["python3", "train.py"]},
+    )
+    assert prepared.type_config["env"]["PYTHONDONTWRITEBYTECODE"] == "1"
 
 
 def test_pinned_container_without_source_mount_is_rejected(tmp_path):

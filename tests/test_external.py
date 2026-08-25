@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ablator import cli, runner
+from ablator import cli, experiment_declaration, runner
 from ablator.external import (
     ExternalJobError,
     build_job,
@@ -83,6 +83,9 @@ def test_external_git_target_is_immutable_submit_identity(tmp_path: Path) -> Non
     )
     assert job["requested_git_sha"] == SHA_A
     assert job["git_repo"] == "https://github.com/example/project.git"
+    submission = experiment_declaration.submission_provenance(job)
+    assert submission["requested_git_sha"] == SHA_A
+    assert submission["git_repo"] == "https://github.com/example/project.git"
 
     changed = build_job(
         cfg,

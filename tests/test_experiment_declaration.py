@@ -300,6 +300,7 @@ def test_k8s_manifest_propagates_exact_declaration_to_trainer_container():
         declarations.DECLARATION_ENV: job["experiment_declaration_json"],
         declarations.DECLARATION_SHA_ENV: job["experiment_declaration_sha256"],
         declarations.JOB_ID_ENV: job["id"],
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
 
 

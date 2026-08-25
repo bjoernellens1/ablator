@@ -279,6 +279,11 @@ def test_k8s_manifest_git_sync_adds_init_container_and_shared_volume():
     # SAME path the trainer already uses, no new path/env for it to know
     # about.
     assert trainer_mounts["repo-src"]["mountPath"] == "/workspace/splatograph"
+    assert trainer_mounts["repo-src"]["readOnly"] is True
+    clone_script = init["command"][2]
+    assert "submodule update --init --recursive --checkout" in clone_script
+    assert "git rev-parse HEAD" in clone_script
+    assert "/dev/termination-log" in clone_script
 
 
 def test_k8s_manifest_git_sync_custom_image_overridable():

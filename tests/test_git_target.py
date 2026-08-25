@@ -130,6 +130,22 @@ def test_queue_append_checks_dependency_already_in_queue(tmp_path):
         ])
 
 
+def test_requested_git_target_cannot_change_after_enqueue(tmp_path):
+    queue = Queue(str(tmp_path / "queue.jsonl"))
+    queue.append([
+        {
+            "id": "pinned",
+            "status": "pending",
+            "requested_git_sha": SHA_A,
+            "git_repo": "https://github.com/example/project.git",
+        },
+    ])
+    with pytest.raises(SystemExit, match="immutable requested_git_sha"):
+        queue.update("pinned", requested_git_sha=SHA_B)
+    with pytest.raises(SystemExit, match="immutable git_repo"):
+        queue.update("pinned", git_repo="https://github.com/example/other.git")
+
+
 @pytest.mark.parametrize("value", [
     "deadbeef",
     "g" * 40,

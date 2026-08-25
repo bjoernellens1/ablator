@@ -27,6 +27,7 @@ import time
 
 from . import config as cfgmod
 from . import error as errormod
+from . import execution_receipt as receiptmod
 from . import experiment_declaration as declarations
 from . import health as healthmod
 from . import provenance as provmod
@@ -409,7 +410,9 @@ def _inject_container_environment(argv: list[str], child_env: dict[str, str]) ->
     return argv[: run_index + 1] + flags + argv[run_index + 1 :]
 
 
-def render_command(tcfg: dict, job: dict, machine: str) -> tuple[list[str], dict, str | None]:
+def render_command(
+    tcfg: dict, job: dict, machine: str, *, include_protected_env: bool = True,
+) -> tuple[list[str], dict, str | None]:
     """Render (argv, env, cwd) for a job from its merged type config."""
     vars = _job_vars(job, machine)
     argv: list[str] = []
@@ -425,13 +428,15 @@ def render_command(tcfg: dict, job: dict, machine: str) -> tuple[list[str], dict
     except declarations.ExperimentDeclarationError as exc:
         raise TemplateError(str(exc)) from exc
     argv = _ensure_container_name(argv, job)
-    argv = _inject_container_environment(argv, declaration_env)
+    if include_protected_env:
+        argv = _inject_container_environment(argv, declaration_env)
     env = os.environ.copy()
     for k, v in (tcfg.get("env") or {}).items():
         env[k] = _fmt(str(v), vars)
     for key in declarations.PROTECTED_ENV:
         env.pop(key, None)
-    env.update(declaration_env)
+    if include_protected_env:
+        env.update(declaration_env)
     cwd = tcfg.get("cwd")
     return argv, env, (_fmt(cwd, vars) if cwd else None)
 
@@ -1109,6 +1114,8 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
         {"name": key, "value": value}
         for key, value in declaration_env.items()
     ]
+    if job.get("requested_git_sha"):
+        trainer_env.append({"name": "PYTHONDONTWRITEBYTECODE", "value": "1"})
     if mps_enabled:
         volumes.append({
             "name": "mps-root",
@@ -1138,7 +1145,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
         workspace_path = cwd or mcfg.get("default_workdir", "/workspace")
         volumes.append({"name": "repo-src", "emptyDir": {}})
         trainer_volume_mounts.append(
-            {"name": "repo-src", "mountPath": workspace_path})
+            {"name": "repo-src", "mountPath": workspace_path, "readOnly": True})
         sha = job.get("requested_git_sha") or local_commit or "HEAD"
         # git_sync_http_secret_name takes precedence if both are somehow set --
         # rewrite the remote URL to embed the token as an x-access-token
@@ -1162,7 +1169,17 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
             f"cd {workspace_path}; "
             f"git remote add origin \"{remote_url_expr}\"; "
             f"git fetch --depth 1 origin {sha}; "
-            "git checkout -q FETCH_HEAD; "
+            "git checkout -q --detach FETCH_HEAD; "
+            "git submodule sync --recursive; "
+            "git -c protocol.file.allow=always submodule update --init --recursive --checkout; "
+            f"test \"$(git rev-parse HEAD)\" = \"{sha}\"; "
+            "test -z \"$(git status --porcelain --untracked-files=all)\"; "
+            "git submodule foreach --quiet --recursive "
+            "'test -z \"$(git status --porcelain --untracked-files=all)\"'; "
+            "submodules_sha256=$(git submodule status --recursive | sha256sum | cut -d' ' -f1); "
+            f"printf 'ABLATOR_SOURCE_V1 requested={sha} executed=%s "
+            "ref=DETACHED dirty=false submodules_sha256=%s\\n' "
+            "\"$(git rev-parse HEAD)\" \"$submodules_sha256\" > /dev/termination-log; "
             f"echo \"git-sync: checked out {sha} from {git_sync_repo_url}\""
         )
         init_container: dict = {
@@ -1331,9 +1348,103 @@ def _log_stall_tracker(stall_after_s: float):
     return check
 
 
+def _k8s_execution_attestation(pods_payload: dict, expected_sha: str) -> dict:
+    """Validate init-container source proof and capture actual pod identity."""
+    items = pods_payload.get("items") or []
+    if not items:
+        return {
+            "schema": "ablator.execution-attestation/v1",
+            "verdict": "REJECTED",
+            "source": None,
+            "runtime": None,
+            "error": "k8s source attestation unavailable: no job pod found",
+        }
+    pod = items[0]
+    status = pod.get("status") or {}
+    init_statuses = status.get("initContainerStatuses") or []
+    git_status = next(
+        (item for item in init_statuses if item.get("name") == "git-sync"), None
+    )
+    message = (((git_status or {}).get("state") or {}).get("terminated") or {}).get(
+        "message"
+    )
+    fields: dict[str, str] = {}
+    if isinstance(message, str) and message.startswith("ABLATOR_SOURCE_V1 "):
+        for token in message.strip().split()[1:]:
+            key, separator, value = token.partition("=")
+            if separator:
+                fields[key] = value
+    source = {
+        "requested_git_sha": fields.get("requested"),
+        "executed_git_sha": fields.get("executed"),
+        "ref": fields.get("ref"),
+        "dirty": ({"true": True, "false": False}.get(fields.get("dirty", ""))),
+        "submodules_sha256": fields.get("submodules_sha256"),
+    }
+    reasons: list[str] = []
+    if not fields:
+        reasons.append("git-sync termination message is missing or malformed")
+    if source["requested_git_sha"] != expected_sha:
+        reasons.append("init-container requested SHA differs from queue intent")
+    if source["executed_git_sha"] != expected_sha:
+        reasons.append("init-container executed SHA differs from queue intent")
+    if source["ref"] != "DETACHED":
+        reasons.append("init-container checkout is not detached")
+    if source["dirty"] is not False:
+        reasons.append("init-container checkout is dirty or unreadable")
+    if not source["submodules_sha256"]:
+        reasons.append("recursive submodule fingerprint is missing")
+
+    trainer_statuses = status.get("containerStatuses") or []
+    trainer = next(
+        (item for item in trainer_statuses if item.get("name") == "trainer"), {}
+    )
+    runtime = {
+        "pod": (pod.get("metadata") or {}).get("name"),
+        "node": (pod.get("spec") or {}).get("nodeName"),
+        "image": trainer.get("image"),
+        "image_id": trainer.get("imageID"),
+    }
+    return {
+        "schema": "ablator.execution-attestation/v1",
+        "verdict": "REJECTED" if reasons else "ACCEPTED",
+        "source": source,
+        "runtime": runtime,
+        "error": "; ".join(reasons) if reasons else None,
+    }
+
+
+def _capture_k8s_execution_attestation(
+    name: str, ns: str, expected_sha: str,
+) -> dict:
+    pods = _kubectl([
+        "get", "pods", "-n", ns, "-l", f"job-name={name}", "-o", "json"
+    ], timeout=30)
+    if pods.returncode != 0:
+        return {
+            "schema": "ablator.execution-attestation/v1",
+            "verdict": "REJECTED",
+            "source": None,
+            "runtime": None,
+            "error": "k8s source attestation query failed: "
+                     f"{(pods.stderr or pods.stdout).strip()[:400]}",
+        }
+    try:
+        payload = json.loads(pods.stdout)
+    except json.JSONDecodeError as exc:
+        return {
+            "schema": "ablator.execution-attestation/v1",
+            "verdict": "REJECTED",
+            "source": None,
+            "runtime": None,
+            "error": f"k8s source attestation JSON is invalid: {exc}",
+        }
+    return _k8s_execution_attestation(payload, expected_sha)
+
+
 def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
                   name: str, ns: str, log_path: str,
-                  append: bool = False) -> tuple[str, int | None]:
+                  append: bool = False, q: Queue | None = None) -> tuple[str, int | None]:
     """Poll an existing (already-submitted) k8s Job to completion.
 
     Shared by the initial-submission path (`run_job_k8s`) and the
@@ -1363,6 +1474,7 @@ def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
     # without driving this function's real polling loop.
     _stall_after_s = healthmod.hung_after_s(cfg.get("queue", {}), job)
     _stall_tracker = _log_stall_tracker(_stall_after_s)
+    rc: int | None = None
     try:
         with open(log_path, "a" if append else "w") as lf:
             if append:
@@ -1436,6 +1548,24 @@ def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
             except subprocess.TimeoutExpired:
                 log_proc.kill()
     finally:
+        expected_sha = job.get("requested_git_sha")
+        if expected_sha:
+            attestation = _capture_k8s_execution_attestation(name, ns, expected_sha)
+            job["execution_attestation"] = attestation
+            if attestation["verdict"] == "ACCEPTED":
+                job["executed_git_sha"] = expected_sha
+            elif rc == 0:
+                rc = 1
+                print(
+                    f"[ablator] {job['id']} k8s source attestation rejected: "
+                    f"{attestation['error']}", flush=True,
+                )
+            if q is not None:
+                q.update(
+                    job["id"],
+                    executed_git_sha=job.get("executed_git_sha"),
+                    execution_attestation=attestation,
+                )
         _kubectl(["delete", "job", name, "-n", ns, "--ignore-not-found", "--wait=false"])
 
     if rc == 0 and _require_result_artifact(cfg, tcfg):
@@ -1471,6 +1601,15 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
     try:
         tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+        sourcecheckout.job_git_target(
+            job,
+            required=(
+                job.get("gradeability") == "GRADEABLE_DECLARED"
+                or bool(tcfg.get("require_pinned_git"))
+            ),
+        )
+        job = dict(job)
+        source_identity = None
         if job.get("requested_git_sha"):
             if not mcfg.get("git_sync_repo_url"):
                 raise sourcecheckout.SourcePreparationError(
@@ -1480,10 +1619,10 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
                           .get("cwd"))
             source_identity = sourcecheckout.validate_requested_revision_policy(
                 cfg, job, machine, source_cwd)
-            if q is not None:
-                q.update(job["id"], source_repo=source_identity,
-                         requested_git_sha=job.get("requested_git_sha"))
-        argv, _env, cwd = render_command(tcfg, job, machine)
+            job["source_repo"] = source_identity
+        argv, _env, cwd = render_command(
+            tcfg, job, machine, include_protected_env=False
+        )
     except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:
         print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
         if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):
@@ -1492,8 +1631,52 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
 
     local_commit = _dispatch_host_commit(cfg, job)
     image_override = tcfg.get("image")
-    manifest = build_k8s_job_manifest(mcfg, job, argv, cwd, local_commit,
-                                       image_override=image_override)
+    preliminary_manifest = build_k8s_job_manifest(
+        mcfg, job, argv, cwd, local_commit, image_override=image_override
+    )
+    from .external import capture_runner_provenance
+    runner_provenance = capture_runner_provenance(cfg, machine)
+    execution_receipt = receiptmod.build_prelaunch_receipt(
+        cfg=cfg,
+        job=job,
+        machine=machine,
+        type_config=tcfg,
+        argv=argv,
+        cwd=cwd,
+        source_state=None,
+        source_repo=source_identity,
+        source_checkout=cwd if job.get("requested_git_sha") else None,
+        source_lease_id=None,
+        runner_provenance=runner_provenance,
+    )
+    trainer = preliminary_manifest["spec"]["template"]["spec"]["containers"][0]
+    execution_receipt["launch"].update({
+        "runtime": "kubernetes",
+        "image": trainer["image"],
+        "mounts": [
+            {
+                "name": mount["name"],
+                "target": mount["mountPath"],
+                "read_only": bool(mount.get("readOnly", False)),
+            }
+            for mount in trainer.get("volumeMounts", [])
+        ],
+        "namespace": mcfg["namespace"],
+    })
+    job["runner_provenance"] = runner_provenance
+    job["execution_receipt"] = execution_receipt
+    if q is not None:
+        q.update(
+            job["id"],
+            source_repo=source_identity,
+            requested_git_sha=job.get("requested_git_sha"),
+            runner_provenance=runner_provenance,
+            execution_receipt=execution_receipt,
+            source_prepare_error=None,
+        )
+    manifest = build_k8s_job_manifest(
+        mcfg, job, argv, cwd, local_commit, image_override=image_override
+    )
     name = manifest["metadata"]["name"]
     ns = mcfg["namespace"]
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
@@ -1517,8 +1700,9 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
         print(f"[ablator] {job['id']} k8s apply failed: {apply.stderr}", flush=True)
         return "failed", None
 
-    return _poll_k8s_job(cfg, job, machine, mcfg, tcfg, name, ns, log_path,
-                        append=True)
+    return _poll_k8s_job(
+        cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=True, q=q
+    )
 
 
 def run_job(cfg: dict, job: dict, machine: str,
@@ -1533,49 +1717,96 @@ def run_job(cfg: dict, job: dict, machine: str,
     if mcfg.get("backend") == "k8s":
         return run_job_k8s(cfg, job, machine, mcfg, q)
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
+    prepared_source: sourcecheckout.PreparedSource | None = None
+    execution_receipt: dict | None = None
+    status = "failed"
+    exit_code: int | None = None
     try:
         tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+        sourcecheckout.job_git_target(
+            job,
+            required=(
+                job.get("gradeability") == "GRADEABLE_DECLARED"
+                or bool(tcfg.get("require_pinned_git"))
+            ),
+        )
         prepared_source = sourcecheckout.prepare_job_source(cfg, job, machine, tcfg)
         tcfg = prepared_source.type_config
         if prepared_source.checkout_path:
-            job = dict(job)
             job["_prepared_repo_cwd"] = prepared_source.checkout_path
-            if q is not None:
-                q.update(
-                    job["id"],
-                    source_checkout=prepared_source.checkout_path,
-                    source_repo=prepared_source.source_repo,
-                    requested_git_sha=prepared_source.requested_git_sha,
-                )
-        argv, env, cwd = render_command(tcfg, job, machine)
-    except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:
-        print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
-        if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):
-            q.update(job["id"], source_prepare_error=str(e))
-        return "failed", None
-    print(f"[ablator] running {job['id']} -> {job.get('model_path')} (log {log_path})",
-          flush=True)
-    prov_state = capture_and_record_provenance(cfg, job, machine, cwd or os.getcwd(), q)
-    try:
+            job.update({
+                "source_checkout": prepared_source.checkout_path,
+                "source_repo": prepared_source.source_repo,
+                "requested_git_sha": prepared_source.requested_git_sha,
+                "source_lease": {
+                    "lease_id": prepared_source.lease.lease_id,
+                    "checkout": prepared_source.lease.checkout,
+                    "sidecar": prepared_source.lease.sidecar,
+                },
+            })
+
+        # Render the semantic command before protected env injection. The
+        # receipt hashes this form so ABLATOR_JOB_JSON can contain the receipt
+        # without recursively hashing an argv that embeds ABLATOR_JOB_JSON.
+        argv, _discard_env, cwd = render_command(
+            tcfg, job, machine, include_protected_env=False
+        )
+        prov_state = capture_and_record_provenance(
+            cfg, job, machine, cwd or os.getcwd(), q
+        )
         executed_git_sha = sourcecheckout.verify_executed_provenance(job, prov_state)
-    except sourcecheckout.SourcePreparationError as e:
-        print(f"[ablator] {job['id']} source provenance rejected before launch: {e}", flush=True)
+        job["provenance"] = prov_state
+        if executed_git_sha is not None:
+            job["executed_git_sha"] = executed_git_sha
+        from .external import capture_runner_provenance
+        runner_provenance = capture_runner_provenance(cfg, machine)
+        job["runner_provenance"] = runner_provenance
+        receipt_source_state = prepared_source.state or {
+            "commit": prov_state.get("commit"),
+            "ref": prov_state.get("branch"),
+            "dirty": prov_state.get("dirty"),
+            "submodules": [],
+        }
+        execution_receipt = receiptmod.build_prelaunch_receipt(
+            cfg=cfg,
+            job=job,
+            machine=machine,
+            type_config=tcfg,
+            argv=argv,
+            cwd=cwd or os.getcwd(),
+            source_state=receipt_source_state,
+            source_repo=prepared_source.source_repo,
+            source_checkout=prepared_source.checkout_path,
+            source_lease_id=(
+                prepared_source.lease.lease_id if prepared_source.lease else None
+            ),
+            runner_provenance=runner_provenance,
+        )
+        job["execution_receipt"] = execution_receipt
         if q is not None:
-            q.update(job["id"], source_prepare_error=str(e))
-        return "failed", None
-    if executed_git_sha is not None and q is not None:
-        q.update(job["id"], executed_git_sha=executed_git_sha)
-    check_checkout_drift(cfg, job, machine, prov_state, q)
-    container_name = container_name_from_argv(argv)
-    if container_name:
-        # Pre-launch safety net: if a prior attempt for this same job id
-        # leaked a container under this name (e.g. crashed before this fix,
-        # or a future bug reintroduces the gap), `podman run --name X` would
-        # otherwise fail loudly with "name already in use" and the job would
-        # spuriously fail every retry. Force-clear it first so retries never
-        # collide, and log loudly so a real leak doesn't pass silently.
-        force_remove_container(argv[0], container_name)
-    try:
+            q.update(
+                job["id"],
+                source_checkout=job.get("source_checkout"),
+                source_repo=job.get("source_repo"),
+                requested_git_sha=job.get("requested_git_sha"),
+                executed_git_sha=job.get("executed_git_sha"),
+                source_lease=job.get("source_lease"),
+                provenance=prov_state,
+                runner_provenance=runner_provenance,
+                execution_receipt=execution_receipt,
+                source_prepare_error=None,
+            )
+        # Re-render only after the local queue envelope contains actual
+        # source/runner/receipt identity. This is the form the child executes.
+        argv, env, cwd = render_command(tcfg, job, machine)
+        check_checkout_drift(cfg, job, machine, prov_state, q)
+        container_name = container_name_from_argv(argv)
+        if container_name:
+            # Clear only a leaked prior attempt with this deterministic name.
+            force_remove_container(argv[0], container_name)
+
+        print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
+              f"(log {log_path})", flush=True)
         with open(log_path, "w") as lf:
             lf.write(f"# {time.strftime('%Y-%m-%dT%H:%M:%S')} {job['id']}\n"
                      f"# cwd={cwd or os.getcwd()}\n# {shlex.join(argv)}\n")
@@ -1590,14 +1821,14 @@ def run_job(cfg: dict, job: dict, machine: str,
                                     start_new_session=True)
             override = supervise(cfg, job, proc, cwd or os.getcwd(), q, argv=argv,
                                  machine=machine)
-        rc = proc.returncode
+        exit_code = proc.returncode
         if override is not None:
             # Control-triggered stop/skip/requeue (or a lane preemption)
             # already returned an explicit terminal/backoff status above in
             # supervise() — the exit code of the killed subprocess is never
             # consulted here, so a manual kill can never read as "done".
-            return override, rc
-        if rc == 0 and _require_result_artifact(cfg, tcfg):
+            status = override
+        elif exit_code == 0 and _require_result_artifact(cfg, tcfg):
             h = healthmod.job_health(job, cwd or os.getcwd(), cfg.get("queue", {}),
                                      process_alive=False)
             if h["state"] != "done":
@@ -1605,11 +1836,57 @@ def run_job(cfg: dict, job: dict, machine: str,
                       f"artifact found (result_glob unmatched, state="
                       f"{h['state']!r}) — treating as failed, not done",
                       flush=True)
-                return "failed", rc
-        return ("done" if rc == 0 else "failed"), rc
+                status = "failed"
+            else:
+                status = "done"
+        else:
+            status = "done" if exit_code == 0 else "failed"
+    except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:
+        print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
+        if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):
+            q.update(job["id"], source_prepare_error=str(e))
     except Exception as e:
         print(f"[ablator] {job['id']} crashed: {e}", flush=True)
-        return "failed", None
+    finally:
+        if prepared_source is not None and prepared_source.checkout_path:
+            try:
+                final_state = sourcecheckout.inspect_checkout_state(
+                    prepared_source.checkout_path
+                )
+                attestation = receiptmod.build_final_attestation(
+                    execution_receipt or {
+                        "source": {
+                            "requested_git_sha": job.get("requested_git_sha"),
+                            "submodules": (prepared_source.state or {}).get(
+                                "submodules", []
+                            ),
+                        }
+                    },
+                    source_state=final_state,
+                )
+            except Exception as exc:
+                attestation = receiptmod.build_final_attestation(
+                    execution_receipt or {"source": {}}, error=str(exc)
+                )
+            if attestation["verdict"] != "ACCEPTED":
+                status = "failed"
+                print(
+                    f"[ablator] {job['id']} final source attestation rejected: "
+                    f"{attestation['error']}", flush=True,
+                )
+            if q is not None:
+                q.update(job["id"], execution_attestation=attestation)
+            try:
+                sourcecheckout.release_source(prepared_source)
+            except sourcecheckout.SourcePreparationError as exc:
+                status = "failed"
+                if q is not None:
+                    q.update(job["id"], source_release_error=str(exc))
+                print(
+                    f"[ablator] {job['id']} source lease release failed: {exc}",
+                    flush=True,
+                )
+    return status, exit_code
 
 
 def _job_base_dir(cfg: dict, job: dict, machine: str) -> str:
@@ -1853,7 +2130,7 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
                 def run_fn(job=job, tcfg=tcfg, name=name, ns=ns,
                           log_path=log_path):
                     return _poll_k8s_job(cfg, job, machine, mcfg, tcfg, name,
-                                        ns, log_path, append=True)
+                                        ns, log_path, append=True, q=q)
 
                 t = threading.Thread(
                     target=_dispatch_and_finalize,

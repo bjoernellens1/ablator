@@ -248,7 +248,7 @@ def _initialize_submodules(checkout: str) -> None:
     _require_ok(update, f"initialize submodules at {checkout}")
 
 
-def _submodule_state(checkout: str) -> list[dict]:
+def _submodule_state(checkout: str, *, require_clean: bool = True) -> list[dict]:
     result = _git(checkout, "submodule", "status", "--recursive", timeout=60)
     if result.returncode != 0:
         _require_ok(result, f"read recursive submodule state at {checkout}")
@@ -272,7 +272,8 @@ def _submodule_state(checkout: str) -> list[dict]:
                 "+": "at a different commit",
                 "U": "conflicted",
             }.get(marker, f"unexpected marker {marker!r}")
-            raise SourcePreparationError(f"submodule {path} is {meaning}")
+            if require_clean:
+                raise SourcePreparationError(f"submodule {path} is {meaning}")
         submodule_path = os.path.join(checkout, path)
         dirty_status = _require_ok(
             _git(
@@ -282,33 +283,44 @@ def _submodule_state(checkout: str) -> list[dict]:
             ),
             f"read submodule status at {submodule_path}",
         )
-        if dirty_status:
+        if dirty_status and require_clean:
             raise SourcePreparationError(f"submodule {path} is dirty")
-        state.append({"path": path, "sha": sha, "dirty": False})
+        state.append({"path": path, "sha": sha, "dirty": bool(dirty_status)})
     return state
 
 
-def capture_checkout_state(path: str) -> dict:
-    """Capture and validate the complete source state of one worktree."""
+def inspect_checkout_state(path: str) -> dict:
+    """Capture complete source state without turning drift into an exception."""
     head = _require_ok(
         _git(path, "rev-parse", "HEAD", timeout=15),
         f"read checkout HEAD at {path}",
     )
     symbolic = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD", timeout=15)
     ref = symbolic.stdout.strip() if symbolic.returncode == 0 else "DETACHED"
-    submodules = _submodule_state(path)
+    submodules = _submodule_state(path, require_clean=False)
     status = _require_ok(
         _git(path, "status", "--porcelain", "--untracked-files=all", timeout=15),
         f"read checkout status at {path}",
     )
-    if status:
-        raise SourcePreparationError(f"immutable checkout {path} is dirty")
     return {
         "commit": head,
         "ref": ref,
-        "dirty": False,
+        "dirty": bool(status) or any(item["dirty"] for item in submodules),
         "submodules": submodules,
     }
+
+
+def capture_checkout_state(path: str) -> dict:
+    """Capture and require the clean, detached source state of a worktree."""
+    state = inspect_checkout_state(path)
+    dirty_submodule = next(
+        (item["path"] for item in state["submodules"] if item["dirty"]), None
+    )
+    if dirty_submodule is not None:
+        raise SourcePreparationError(f"submodule {dirty_submodule} is dirty")
+    if state["dirty"]:
+        raise SourcePreparationError(f"immutable checkout {path} is dirty")
+    return state
 
 
 def _atomic_json_write(path: str, payload: dict) -> None:
@@ -497,6 +509,85 @@ def _container_reaches_checkout(tcfg: dict, source_cwd: str | None) -> bool:
     return False
 
 
+def _read_only_volume(spec: str, checkout: str) -> tuple[str, bool]:
+    parts = spec.split(":")
+    if len(parts) < 2 or os.path.realpath(parts[0]) != os.path.realpath(checkout):
+        return spec, False
+    options = [item for item in ",".join(parts[2:]).split(",") if item]
+    if "ro" not in options and "readonly" not in options:
+        options.append("ro")
+    suffix = f":{','.join(options)}" if options else ""
+    return f"{parts[0]}:{parts[1]}{suffix}", True
+
+
+def _read_only_long_mount(spec: str, checkout: str) -> tuple[str, bool]:
+    items = spec.split(",")
+    fields = dict(item.split("=", 1) for item in items if "=" in item)
+    source = fields.get("src") or fields.get("source")
+    if fields.get("type", "bind") != "bind" or not source:
+        return spec, False
+    if os.path.realpath(source) != os.path.realpath(checkout):
+        return spec, False
+    if not any(item in {"readonly", "ro"} or item.startswith(("readonly=", "ro="))
+               for item in items):
+        items.append("readonly")
+    return ",".join(items), True
+
+
+def _make_checkout_mount_read_only(tcfg: dict, checkout: str) -> dict:
+    command = list(tcfg.get("command") or [])
+    if not command or os.path.basename(str(command[0])) not in _CONTAINER_RUNTIMES:
+        return tcfg
+    if "run" not in command:
+        return tcfg
+
+    found = False
+    rewritten: list = []
+    index = 0
+    while index < len(command):
+        token = command[index]
+        if token in ("-v", "--volume", "--mount") and index + 1 < len(command):
+            value = str(command[index + 1])
+            if token == "--mount":
+                value, matched = _read_only_long_mount(value, checkout)
+            else:
+                value, matched = _read_only_volume(value, checkout)
+            found = found or matched
+            rewritten.extend([token, value])
+            index += 2
+            continue
+        if isinstance(token, str) and token.startswith("--volume="):
+            value, matched = _read_only_volume(token.split("=", 1)[1], checkout)
+            rewritten.append(f"--volume={value}")
+            found = found or matched
+            index += 1
+            continue
+        if isinstance(token, str) and token.startswith("--mount="):
+            value, matched = _read_only_long_mount(token.split("=", 1)[1], checkout)
+            rewritten.append(f"--mount={value}")
+            found = found or matched
+            index += 1
+            continue
+        if (isinstance(token, str) and token.startswith("-v")
+                and not token.startswith("--") and len(token) > 2):
+            value, matched = _read_only_volume(token[2:].removeprefix("="), checkout)
+            rewritten.append(f"-v{value}")
+            found = found or matched
+            index += 1
+            continue
+        rewritten.append(token)
+        index += 1
+
+    if not found:
+        raise SourcePreparationError(
+            "pinned container job does not bind its prepared source checkout; "
+            "use {repo_cwd} in a -v/--volume/--mount source"
+        )
+    updated = copy.deepcopy(tcfg)
+    updated["command"] = rewritten
+    return updated
+
+
 def prepare_job_source(cfg: dict, job: dict, machine: str, tcfg: dict) -> PreparedSource:
     """Prepare and wire the immutable checkout for a pinned job.
 
@@ -523,6 +614,8 @@ def prepare_job_source(cfg: dict, job: dict, machine: str, tcfg: dict) -> Prepar
     _validate_required_fixes(cfg, repo, checkout, requested)
     rewritten = _replace_checkout(copy.deepcopy(tcfg), source_cwd, checkout)
     rewritten["cwd"] = checkout
+    rewritten = _make_checkout_mount_read_only(rewritten, checkout)
+    rewritten.setdefault("env", {})["PYTHONDONTWRITEBYTECODE"] = "1"
     return PreparedSource(
         type_config=rewritten,
         checkout_path=checkout,

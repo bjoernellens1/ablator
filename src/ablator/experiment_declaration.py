@@ -37,7 +37,9 @@ DECLARATION_JOB_FIELDS = frozenset(
         "gradeability",
     }
 )
-IMMUTABLE_JOB_FIELDS = DECLARATION_JOB_FIELDS | frozenset({"submission_provenance"})
+IMMUTABLE_JOB_FIELDS = DECLARATION_JOB_FIELDS | frozenset(
+    {"submission_provenance", "requested_git_sha", "git_repo"}
+)
 
 
 class ExperimentDeclarationError(ValueError):
@@ -269,6 +271,8 @@ def submission_provenance(job: Mapping[str, Any]) -> dict[str, Any] | None:
             "metadata": deepcopy(job.get("external_metadata") or {}),
             "lane": job.get("lane", 2),
             "depends_on": job.get("depends_on"),
+            "requested_git_sha": job.get("requested_git_sha"),
+            "git_repo": job.get("git_repo"),
             "external_schema": job.get("external_schema"),
             "external_spec_sha256": job.get("external_spec_sha256"),
         }

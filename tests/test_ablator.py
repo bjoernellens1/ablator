@@ -1341,7 +1341,7 @@ def test_reconcile_k8s_reattaches_genuinely_running_job(tmp_path, monkeypatch):
 
     release = threading.Event()
 
-    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False):
+    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False, q=None):
         release.wait(timeout=5)
         return "done", 0
 
@@ -1450,7 +1450,7 @@ def test_reconcile_k8s_reattach_counts_toward_max_concurrent(tmp_path, monkeypat
 
     release = threading.Event()
 
-    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False):
+    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False, q=None):
         release.wait(timeout=5)
         return "done", 0
 
