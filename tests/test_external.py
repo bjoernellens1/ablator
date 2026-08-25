@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -70,6 +72,55 @@ def test_submit_is_idempotent_and_conflicts_fail_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(ExternalJobError):
         submit_job(cfg, changed)
+
+
+def test_concurrent_identical_external_submissions_create_exactly_once(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(
+        cfg, job_id="concurrent-same", job_type="researchflow",
+        params={"jobscript": "/shared/job.sh"},
+    )
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(
+            lambda _index: submit_job(cfg, deepcopy(job)), range(16)
+        ))
+
+    assert sum(created for _item, created in results) == 1
+    queued = Queue(cfg["queue"]["path"]).read()
+    assert len(queued) == 1
+    assert queued[0]["external_spec_sha256"] == job["external_spec_sha256"]
+
+
+def test_concurrent_conflicting_external_submissions_never_mix_envelopes(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(tmp_path)
+    variants = [
+        build_job(
+            cfg, job_id="concurrent-conflict", job_type="researchflow",
+            params={"jobscript": f"/shared/{name}.sh"},
+        )
+        for name in ("a", "b")
+    ]
+
+    def attempt(job):
+        try:
+            stored, created = submit_job(cfg, deepcopy(job))
+            return ("stored", stored["external_spec_sha256"], created)
+        except ExternalJobError:
+            return ("rejected", job["external_spec_sha256"], False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(attempt, variants))
+
+    queued = Queue(cfg["queue"]["path"]).read()
+    assert len(queued) == 1
+    assert sorted(item[0] for item in results) == ["rejected", "stored"]
+    winner = next(item for item in results if item[0] == "stored")
+    assert winner[2] is True
+    assert queued[0]["external_spec_sha256"] == winner[1]
 
 
 def test_strict_external_submit_rejects_unpinned_atomically(tmp_path: Path) -> None:
