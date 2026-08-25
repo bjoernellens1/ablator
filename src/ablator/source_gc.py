@@ -56,14 +56,23 @@ def _read_sidecar(path: Path) -> GCEntry | None:
 
 def scan_entries(root: str) -> list[GCEntry]:
     """Read valid Ablator worktree sidecars under one cache root."""
-    path = Path(os.path.abspath(os.path.expanduser(root)))
+    path = Path(os.path.abspath(os.path.expanduser(root))).resolve()
     if not path.exists():
         return []
     entries: list[GCEntry] = []
     for sidecar in path.rglob("*.ablator.json"):
         item = _read_sidecar(sidecar)
-        if item is not None:
-            entries.append(item)
+        if item is None:
+            continue
+        checkout = Path(item.checkout).resolve()
+        try:
+            checkout.relative_to(path)
+        except ValueError:
+            continue
+        expected_sidecar = Path(f"{checkout}.ablator.json").resolve()
+        if sidecar.resolve() != expected_sidecar:
+            continue
+        entries.append(item)
     return entries
 
 

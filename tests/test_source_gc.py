@@ -121,3 +121,44 @@ def test_orphan_sidecar_and_checkout_can_be_removed(tmp_path):
     assert str(checkout) in result.removed
     assert not checkout.exists()
     assert not os.path.exists(sidecar)
+
+
+def test_sidecar_cannot_escape_the_configured_cache_root(tmp_path):
+    root = tmp_path / "cache"
+    root.mkdir()
+    outside = tmp_path / "must-survive"
+    outside.mkdir()
+    (outside / "payload").write_text("keep")
+    sidecar = root / "forged.ablator.json"
+    sidecar.write_text(json.dumps({
+        "checkout": str(outside),
+        "sha": "1" * 40,
+        "repo": "gone",
+        "source_repo_path": str(tmp_path / "missing-repo"),
+        "last_used_at": 0,
+    }))
+    cfg = {"git": {"worktree_root": str(root)}, "machines": {"main": {}}}
+
+    result = source_gc.gc_worktrees(cfg, "main", [], max_age_days=0, now=200000)
+
+    assert result.candidates == ()
+    assert outside.is_dir()
+    assert (outside / "payload").read_text() == "keep"
+
+
+def test_interrupted_removal_is_reported_and_preserves_sidecar(tmp_path, monkeypatch):
+    _repo_path, _sha, prepared = _prepared(tmp_path)
+    sidecar = _age_sidecar(prepared.checkout_path, last_used_at=0)
+
+    def _fail_remove(_entry):
+        return "simulated interrupted cleanup"
+
+    monkeypatch.setattr(source_gc, "_remove_entry", _fail_remove)
+    result = source_gc.gc_worktrees(
+        _cfg(tmp_path), "main", [], max_age_days=0, now=200000,
+    )
+
+    assert result.removed == ()
+    assert result.errors == ("simulated interrupted cleanup",)
+    assert os.path.isdir(prepared.checkout_path)
+    assert os.path.exists(sidecar)
