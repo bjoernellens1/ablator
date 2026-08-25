@@ -55,6 +55,12 @@ before protected environment generation, and queue bookkeeping cannot mutate
 any field covered by that fingerprint. Strict unpinned or mixed-repository/SHA
 dependency submissions are rejected without partially enqueuing the job.
 
+External records created before the frozen envelope contract are not granted a
+compatibility bypass. If `external_schema` is present but the canonical
+`submission_provenance`/`external_spec_sha256` pair is missing or inconsistent,
+launch fails closed. Migrate such a record explicitly under a trusted queue
+transaction or submit a new job identity through this API.
+
 `--git-sha` accepts only a full 40-character commit SHA. `--git-repo` is
 optional when the configured type `cwd` is already a usable repository. Both
 fields participate in the idempotency fingerprint, and a dependent job must

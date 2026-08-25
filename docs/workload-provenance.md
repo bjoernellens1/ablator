@@ -44,11 +44,14 @@ The execution receipt records requested/executed source identity, detached
 ref/dirty/submodule state, checkout and lease identity, runner/config identity,
 resolved cwd, runtime/image, normalized mounts, and hashes of the rendered argv
 and merged type configuration. It excludes arbitrary environment values and
-credentials. Its canonical `execution_receipt_sha256` and exact
-`actual_launch` are stored before execution. The queue's later
-`execution_attestation` verifies the receipt hash and binds source, runner,
-config, semantic argv, and actual launch evidence; Kubernetes additionally
-binds observed command/mount/pod/node/image/image-ID identity.
+credentials. Its canonical `execution_receipt_sha256` is stored before launch;
+the exact `actual_launch` is captured immediately after launch and before
+supervision. The queue's later `execution_attestation` verifies the receipt hash
+and binds source, runner, config, semantic argv, and actual launch evidence.
+Docker/Podman launches additionally bind the resolved image digest and running
+container ID. Kubernetes binds observed command/mount/pod/node/image/image-ID
+identity and a credential-free hash projection of only Ablator's protected
+trainer environment.
 
 ## `ablator plan`
 
@@ -69,11 +72,25 @@ The spec contents and hash are authoritative. `spec_path` is only provenance abo
 
 ## `ablator submit`
 
-External jobs already store their immutable submit inputs in the queue record. At launch, Ablator derives the equivalent `ablator.submission/v1` envelope from those fields, including job id, type, requested machine, typed params, metadata, lane, dependency, and the existing `external_spec_sha256`.
+Current external jobs store both their immutable submit inputs and the frozen
+`ablator.submission/v1` envelope in the queue record. At launch, Ablator
+recomputes and verifies the envelope and `external_spec_sha256`, including job
+id, type, requested machine, typed params, metadata, lane, and dependency.
 
 ## Compatibility
 
-Old queue records remain runnable. Once an old pending job is claimed and becomes `running`, the runner can still transport `ABLATOR_JOB_ID` and `ABLATOR_JOB_JSON` even though there is no recoverable original spec/submission envelope. Consumers must therefore treat `ABLATOR_SUBMISSION_JSON` as optional and must never invent a spec from job naming conventions.
+Legacy non-external queue records remain runnable for non-strict/debug types.
+Once claimed, the runner can transport `ABLATOR_JOB_ID` and
+`ABLATOR_JOB_JSON` even though there is no recoverable original submission
+envelope. Consumers must therefore treat `ABLATOR_SUBMISSION_JSON` as optional
+for those records and must never invent a spec from naming conventions.
+
+Old **external** records are different: an `external_schema` record without its
+new frozen `submission_provenance` envelope and matching
+`external_spec_sha256` fails closed before launch. It must be explicitly
+migrated under a trusted queue transaction, or resubmitted through the current
+API under a new job identity; Ablator does not reconstruct that intent from
+legacy mutable fields at launch.
 
 ## Intended consumer behavior
 
