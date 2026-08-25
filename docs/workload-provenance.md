@@ -35,12 +35,20 @@ ABLATOR_EXPERIMENT_DECLARATION_SHA256
 
 All of these names are protected. Ambient environment variables and type-configured environment entries with the same names are removed/rejected before the trusted values are injected into direct children, Docker/Podman containers, and Kubernetes trainer containers.
 
+A pinned Kubernetes trainer additionally receives
+`ABLATOR_SOURCE_PROOF_JSON`. It is populated only by the command wrapper from
+the init container's verified, read-only proof file; ambient or configured
+values are scrubbed like the other protected variables.
+
 The execution receipt records requested/executed source identity, detached
 ref/dirty/submodule state, checkout and lease identity, runner/config identity,
 resolved cwd, runtime/image, normalized mounts, and hashes of the rendered argv
 and merged type configuration. It excludes arbitrary environment values and
-credentials. The queue's later `execution_attestation` records the post-run
-source verdict and Kubernetes runtime identity where applicable.
+credentials. Its canonical `execution_receipt_sha256` and exact
+`actual_launch` are stored before execution. The queue's later
+`execution_attestation` verifies the receipt hash and binds source, runner,
+config, semantic argv, and actual launch evidence; Kubernetes additionally
+binds observed command/mount/pod/node/image/image-ID identity.
 
 ## `ablator plan`
 

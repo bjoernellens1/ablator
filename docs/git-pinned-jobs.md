@@ -56,13 +56,16 @@ For a pinned bare-metal job, the runner that actually claims the job:
 3. recursively initializes every submodule at the commit recorded by the
    superproject and verifies the complete tree is clean;
 4. rewrites the configured job `cwd` and source bind mount to that worktree;
-5. makes every container bind of the checkout read-only (direct processes get
+5. makes every container bind sourced at the checkout root or any descendant
+   read-only, rejecting symlink escapes (direct processes get
    `PYTHONDONTWRITEBYTECODE=1`);
 6. records the resolved launch and source identity in an execution receipt;
 7. requires `executed_git_sha == requested_git_sha`, detached HEAD, and clean
    source before launch and checks the same state again after the process exits.
 
-A mismatch or unprovable checkout fails before the expensive workload starts.
+A declared repository is also checked against the actual Git common directory
+and canonical origin. Finding the requested object in a different repository
+does not satisfy that check. A mismatch or unprovable checkout fails before the expensive workload starts.
 Post-run drift changes an otherwise successful exit into a failed job. Attempts
 never share a writable worktree, even when they request the same SHA.
 
@@ -109,11 +112,14 @@ source bind itself is always rewritten with `ro`/`readonly`.
 Pinned Kubernetes jobs require `git_sync_repo_url` on the target machine
 configuration. The dispatcher validates the requested revision policy first;
 the pod's git-sync init container then fetches the exact requested SHA,
-initializes recursive submodules, verifies detached/clean state, and records a
-termination-message proof. The trainer sees that `emptyDir` at its configured
-working directory as read-only. Final queue attestation also records the actual
-pod, node, image reference, and image ID. A pinned k8s job is rejected when
-git-sync is not configured or when its source proof is absent or inconsistent.
+initializes recursive submodules, verifies detached/clean state, and writes a
+source-proof JSON file into a second `emptyDir`. The trainer sees both the source
+and proof mounts read-only; a wrapper exports the proof as protected
+`ABLATOR_SOURCE_PROOF_JSON` before executing the configured argv. Final queue
+attestation binds the receipt hash to the actual command, working directory,
+mounts, pod, node, image reference, and image ID. A pinned k8s job is rejected
+when git-sync is not configured or any source, launch, or runtime identity is
+absent or inconsistent.
 
 ## Interaction with `urgent_fix_unsynced`
 
@@ -140,8 +146,10 @@ Pinned jobs persist source information in the queue as it becomes available:
 - `executed_git_sha`
 - `execution_receipt` (pre-launch source, runner, config, argv, runtime, image,
   and normalized mount identity)
-- `execution_attestation` (post-run source verdict and, for Kubernetes, actual
-  pod/node/image identity)
+- `execution_receipt_sha256`
+- `actual_launch` (the argv handed to the local runtime, including its hash)
+- `execution_attestation` (post-run receipt/config/runner/source/launch verdict
+  and, for Kubernetes, actual pod/node/image identity)
 - `source_prepare_error` on pre-launch preparation/provenance failure
 
 The protected `ABLATOR_JOB_JSON` passed to the workload is rendered only after

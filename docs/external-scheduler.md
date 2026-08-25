@@ -48,6 +48,13 @@ Response:
 
 Submission is idempotent. Repeating the same ID with the same immutable specification returns the existing job with `created=false`. Reusing an ID for a different specification fails closed.
 
+Validation, duplicate comparison, dependency-edge validation, and persistence
+run inside one public locked queue transaction. The complete external
+submission envelope is frozen: the stored fingerprint is recomputed immediately
+before protected environment generation, and queue bookkeeping cannot mutate
+any field covered by that fingerprint. Strict unpinned or mixed-repository/SHA
+dependency submissions are rejected without partially enqueuing the job.
+
 `--git-sha` accepts only a full 40-character commit SHA. `--git-repo` is
 optional when the configured type `cwd` is already a usable repository. Both
 fields participate in the idempotency fingerprint, and a dependent job must
@@ -67,7 +74,8 @@ The JSON projection exposes the stable queue state plus execution provenance, in
 - typed parameters and opaque scheduler metadata;
 - workload checkout provenance;
 - container/image provenance when available;
-- the canonical `execution_receipt` and post-run `execution_attestation`,
+- the canonical `execution_receipt`, `execution_receipt_sha256`, actual launch,
+  and post-run `execution_attestation`,
   including requested/executed commit, ref/dirty/submodules, resolved cwd,
   runtime image and mounts, and hashed argv/type configuration;
 - **Ablator runner provenance**: package version, runner Git commit/branch/dirty state, config SHA-256, machine and hostname;

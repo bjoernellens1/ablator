@@ -75,18 +75,26 @@ ablator --config ~/.config/ablator/config.toml gc --max-age-days 7
 - Cleanup accepts only an adjacent sidecar and checkout whose resolved paths
   are strictly below the configured cache root. Invalid records are reported;
   their claimed paths are never removed.
-- Materialization, lease release, and cleanup share the repository lock. GC
-  re-reads the lease under that lock and refuses it if it is active or changed.
+- Materialization, lease release, and cleanup share a lock derived from the
+  repository's actual Git common directory. GC derives the checkout's common
+  directory itself and cross-checks the sidecar's repository, common-directory,
+  repository-identity, and lock claims. A forged or unprovable claim is retained
+  and reported without invoking Git or filesystem removal against that path.
 - Managed worktrees are removed with `git worktree remove --force` followed by
   a successful `git worktree prune`, so the owning repository does not retain
   stale administration entries.
-- An orphaned cache whose owning repository has already disappeared can be removed directly because no Git administration tree remains to update.
+- A checkout whose owning repository/common directory cannot be proven is
+  retained as evidence; it is never treated as a safely removable orphan.
 - Cleanup/prune errors are reported and make `ablator gc` exit non-zero. The
   sidecar is retained as evidence instead of treating a partial cleanup as
   success.
 - A runner crash can leave an active lease. GC deliberately retains it; an
   operator must reconcile that orphan explicitly rather than weakening the
   active-lease safety rule with an age-only deletion.
+- Failed materialization keeps an inactive sidecar containing the requested SHA,
+  checkout path, repository identity, failure state, and sanitized error. The
+  partial checkout is retained for diagnosis and later trusted GC rather than
+  being deleted during exception cleanup.
 
 The cache shares Git objects only. It does not weaken the requested-vs-executed
 SHA contract or remove job result directories.

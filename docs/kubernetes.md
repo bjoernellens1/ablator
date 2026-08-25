@@ -86,21 +86,26 @@ For a pinned job, the init container additionally initializes recursive
 submodules, verifies the exact requested commit, detached HEAD, and a fully
 clean source tree, and writes that proof to its termination message. The
 trainer mounts the source `emptyDir` read-only and receives
-`PYTHONDONTWRITEBYTECODE=1`. The runner captures the proof plus the actual pod,
-node, image, and image ID before deleting the Job; a missing or inconsistent
-proof changes a nominal Kubernetes success to failure.
+`PYTHONDONTWRITEBYTECODE=1`. Before the configured command executes, a wrapper
+reads the init container's read-only proof file and exports protected
+`ABLATOR_SOURCE_PROOF_JSON`. The runner binds that proof and the receipt hash to
+the observed command, working directory, mounts, pod, node, image, and image ID
+before deleting the Job; a missing or inconsistent identity changes a nominal
+Kubernetes success to failure.
 
 Set `require_pinned_git = true` on scientific job types. With that setting,
 the runner rejects a job without a full registered SHA and rejects a pinned job
 when `git_sync_repo_url` is absent. The historical unpinned git-sync behavior
 remains available only to non-strict legacy/debug types.
 
-`git_sync_http_secret_name` takes precedence if both secret fields are
-somehow set; it rewrites the remote URL to embed the token as an
-`x-access-token` credential rather than relying on `GIT_SSH_COMMAND`
-(which needs an `ssh://`/`git@` URL). A PAT already provisioned for
-`image_pull_secret`/registry push can often be reused here instead of a
-separate deploy key.
+`git_sync_http_secret_name` takes precedence if both secret fields are somehow
+set. The init container supplies the token through a fetch-scoped
+`http.extraHeader`, then unsets it and verifies that neither the token nor a
+persistent extra-header exists in `.git/config`. The credential secret is
+mounted only in the init container; the trainer-visible checkout retains a
+credential-free origin URL. A PAT already provisioned for
+`image_pull_secret`/registry push can often be reused here instead of a separate
+deploy key.
 
 !!! warning "Known limitation"
     Overlaying source without rebuilding the image decouples "source
