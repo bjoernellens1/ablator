@@ -198,11 +198,16 @@ def validate_repo_identity(repo: str, declared: str) -> None:
     """Require an explicit git.repo to identify the configured source repo."""
     declared_local = _local_repo_from_identity(declared, base=repo)
     if declared_local is not None and _is_git_repo(declared_local):
-        if git_common_dir(declared_local) != git_common_dir(repo):
-            raise SourcePreparationError(
-                f"git.repo {declared!r} does not match configured checkout common directory"
-            )
-        return
+        if git_common_dir(declared_local) == git_common_dir(repo):
+            return
+        origin = _origin_url(repo)
+        if (origin and _canonical_remote_identity(origin, base=repo)
+                == _canonical_remote_identity(declared, base=repo)):
+            return
+        raise SourcePreparationError(
+            f"git.repo {declared!r} matches neither configured checkout common "
+            "directory nor origin"
+        )
     origin = _origin_url(repo)
     if not origin:
         raise SourcePreparationError(

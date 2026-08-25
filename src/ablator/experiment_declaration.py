@@ -40,7 +40,7 @@ DECLARATION_JOB_FIELDS = frozenset(
     }
 )
 IMMUTABLE_JOB_FIELDS = DECLARATION_JOB_FIELDS | frozenset(
-    {"submission_provenance", "requested_git_sha", "git_repo"}
+    {"id", "submission_provenance", "requested_git_sha", "git_repo"}
 )
 EXTERNAL_HASHED_JOB_FIELDS = frozenset(
     {
@@ -304,9 +304,9 @@ def submission_provenance(job: Mapping[str, Any]) -> dict[str, Any] | None:
     """Return the exact queue-submission envelope for a job when known.
 
     ``ablator plan`` freezes its loaded spec into ``submission_provenance``.
-    External ``ablator submit`` jobs predate that field, but already carry all
-    immutable submit inputs in the queue record, so build the equivalent
-    structured envelope here without requiring a queue/schema migration.
+    Current external jobs must already contain the frozen envelope written by
+    ``ablator submit``. Older external records without it fail closed; the
+    runner never reconstructs mutable intent at launch time.
     """
     if job.get("external_schema"):
         return validate_external_submission(job)

@@ -185,6 +185,7 @@ def test_complete_external_submission_is_frozen_and_protected(tmp_path: Path) ->
     queue = Queue(cfg["queue"]["path"])
 
     for field, changed in (
+        ("id", "other"),
         ("external_id", "other"),
         ("external_schema", "other/v1"),
         ("external_spec_sha256", "0" * 64),
@@ -197,6 +198,21 @@ def test_complete_external_submission_is_frozen_and_protected(tmp_path: Path) ->
     ):
         with pytest.raises(SystemExit, match=f"immutable {field}"):
             queue.update("frozen", **{field: changed})
+
+
+def test_legacy_external_record_without_frozen_envelope_fails_closed():
+    job = build_job(
+        {"types": {"researchflow": {"command": ["true"]}}, "machines": {}},
+        job_id="old-external", job_type="researchflow",
+    )
+    job.pop("submission_provenance")
+    job["status"] = "running"
+
+    with pytest.raises(
+        experiment_declaration.ExperimentDeclarationError,
+        match="frozen submission_provenance",
+    ):
+        experiment_declaration.experiment_environment(job)
 
 
 def test_external_hash_is_reverified_before_protected_environment() -> None:

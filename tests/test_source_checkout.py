@@ -329,6 +329,22 @@ def test_explicit_git_repo_must_match_configured_checkout_origin(tmp_path):
         )
 
 
+def test_explicit_local_git_repo_matching_checkout_origin_is_accepted(tmp_path):
+    repo, sha = _repo(tmp_path)
+    bare = tmp_path / "origin.git"
+    _run("git", "clone", "--bare", str(repo), str(bare), cwd=tmp_path)
+    _run("git", "remote", "add", "origin", str(bare), cwd=repo)
+
+    prepared = source.prepare_job_source(
+        _cfg(tmp_path),
+        {"id": "local-origin", "requested_git_sha": sha, "git_repo": str(bare)},
+        "main", _tcfg(repo),
+    )
+
+    assert prepared.checkout_path
+    assert source.capture_checkout_state(prepared.checkout_path)["commit"] == sha
+
+
 def test_pinned_direct_process_disables_bytecode_writes(tmp_path):
     repo, sha = _repo(tmp_path)
     prepared = source.prepare_job_source(

@@ -8,6 +8,8 @@ import os
 from copy import deepcopy
 from typing import Any, Mapping
 
+from . import experiment_declaration as declarations
+
 
 _CONTAINER_RUNTIMES = {"docker", "podman"}
 _OPTIONS_WITH_VALUE = {
@@ -34,6 +36,29 @@ def receipt_sha256(receipt: Mapping[str, Any]) -> str:
 def argv_sha256(argv: list[str]) -> str:
     """Return the canonical digest for one argument vector."""
     return _sha256_json(argv)
+
+
+def protected_environment_projection(entries: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """Hash only Ablator-owned trainer variables, never arbitrary pod env."""
+    variables: dict[str, str] = {}
+    for entry in entries:
+        name = entry.get("name")
+        if name not in declarations.PROTECTED_ENV:
+            continue
+        if name in variables:
+            raise ValueError(f"duplicate protected trainer environment {name}")
+        value = entry.get("value")
+        if not isinstance(value, str):
+            raise ValueError(f"protected trainer environment {name} has no literal value")
+        variables[str(name)] = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return {
+        "schema": "ablator.protected-env/v1",
+        "variables": dict(sorted(variables.items())),
+    }
+
+
+def protected_environment_sha256(projection: Mapping[str, Any]) -> str:
+    return _sha256_json(projection)
 
 
 def _volume_mount(spec: str) -> dict[str, Any] | None:
@@ -125,16 +150,64 @@ def container_launch(argv: list[str]) -> tuple[str | None, str | None, list[dict
     return os.path.basename(argv[0]), image, mounts
 
 
-def build_actual_launch(argv: list[str], cwd: str | None) -> dict[str, Any]:
-    """Capture the exact launch form handed to the process runtime."""
+def _nonrecursive_argv(argv: list[str]) -> list[str]:
+    """Remove trusted protected-env values that recursively contain the receipt."""
+    if not argv or os.path.basename(argv[0]) not in _CONTAINER_RUNTIMES:
+        return list(argv)
+    projected: list[str] = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"-e", "--env"} and index + 1 < len(argv):
+            name = argv[index + 1].split("=", 1)[0]
+            if name in declarations.PROTECTED_ENV:
+                index += 2
+                continue
+        if token.startswith("--env="):
+            name = token[len("--env="):].split("=", 1)[0]
+            if name in declarations.PROTECTED_ENV:
+                index += 1
+                continue
+        if token.startswith("-e") and not token.startswith("--") and len(token) > 2:
+            name = token[2:].removeprefix("=").split("=", 1)[0]
+            if name in declarations.PROTECTED_ENV:
+                index += 1
+                continue
+        projected.append(token)
+        index += 1
+    return projected
+
+
+_LAUNCH_FINGERPRINT_FIELDS = (
+    "cwd", "runtime", "image", "image_digest", "mounts", "argv_sha256",
+)
+
+
+def launch_sha256(launch: Mapping[str, Any]) -> str:
+    """Hash the finite, nonrecursive expected-vs-actual launch projection."""
+    return _sha256_json({key: deepcopy(launch.get(key)) for key in _LAUNCH_FINGERPRINT_FIELDS})
+
+
+def build_actual_launch(
+    argv: list[str],
+    cwd: str | None,
+    *,
+    container_id: str | None = None,
+    image_digest: str | None = None,
+) -> dict[str, Any]:
+    """Capture the launch form handed to the runtime without receipt recursion."""
     runtime, image, mounts = container_launch(argv)
-    return {
+    actual = {
         "cwd": cwd,
         "runtime": runtime or "process",
         "image": image,
+        "image_digest": image_digest,
         "mounts": mounts,
-        "argv_sha256": argv_sha256(argv),
+        "argv_sha256": argv_sha256(_nonrecursive_argv(argv)),
+        "container_id": container_id,
     }
+    actual["launch_sha256"] = launch_sha256(actual)
+    return actual
 
 
 def _runner_identity(
@@ -165,11 +238,12 @@ def build_prelaunch_receipt(
     source_checkout: str | None,
     source_lease_id: str | None,
     runner_provenance: Mapping[str, Any],
+    resolved_image_digest: str | None = None,
 ) -> dict[str, Any]:
     """Build the exact pre-launch identity without copying environment values."""
     runtime, image, mounts = container_launch(argv)
     state = dict(source_state or {})
-    return {
+    receipt = {
         "schema": "ablator.execution/v1",
         "phase": "prelaunch",
         "job_id": str(job.get("id") or ""),
@@ -189,6 +263,7 @@ def build_prelaunch_receipt(
             "cwd": cwd,
             "runtime": runtime or "process",
             "image": image,
+            "image_digest": resolved_image_digest,
             "mounts": mounts,
             "argv_sha256": argv_sha256(argv),
             # Hashing the merged type config captures all runtime knobs while
@@ -196,6 +271,8 @@ def build_prelaunch_receipt(
             "type_config_sha256": _sha256_json(type_config),
         },
     }
+    receipt["launch"]["launch_sha256"] = launch_sha256(receipt["launch"])
+    return receipt
 
 
 def build_final_attestation(
@@ -259,11 +336,27 @@ def build_final_attestation(
         reasons.append("runner identity is unavailable")
     if actual_launch is not None:
         actual_launch_dict = dict(actual_launch)
-        for field in ("cwd", "runtime", "image", "mounts"):
-            if actual_launch_dict.get(field) != launch.get(field):
-                reasons.append(
-                    f"actual launch {field} differs from prelaunch receipt"
-                )
+        expected_launch_sha256 = launch_sha256(launch)
+        if (not launch.get("launch_sha256")
+                or launch.get("launch_sha256") != expected_launch_sha256):
+            reasons.append("prelaunch fingerprint is missing or invalid")
+        actual_launch_sha256 = launch_sha256(actual_launch_dict)
+        if (not actual_launch_dict.get("launch_sha256")
+                or actual_launch_dict.get("launch_sha256") != actual_launch_sha256):
+            reasons.append("actual launch fingerprint is missing or invalid")
+        if actual_launch_dict.get("argv_sha256") != launch.get("argv_sha256"):
+            reasons.append("actual argv fingerprint differs from prelaunch receipt")
+        if actual_launch_sha256 != expected_launch_sha256:
+            reasons.append("actual launch differs from prelaunch receipt")
+        if launch.get("runtime") in _CONTAINER_RUNTIMES:
+            if not actual_launch_dict.get("container_id"):
+                reasons.append("actual container ID is missing")
+            if not launch.get("image_digest"):
+                reasons.append("prelaunch image digest is missing")
+            if not actual_launch_dict.get("image_digest"):
+                reasons.append("actual image digest is missing")
+            elif actual_launch_dict.get("image_digest") != launch.get("image_digest"):
+                reasons.append("actual image digest differs from prelaunch receipt")
     elif launch:
         reasons.append("actual launch is unavailable")
     return {

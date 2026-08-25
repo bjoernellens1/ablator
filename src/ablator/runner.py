@@ -524,6 +524,89 @@ def container_name_from_argv(argv: list[str]) -> str | None:
     return None
 
 
+def _normalized_sha256_digest(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if "@sha256:" in text:
+        text = "sha256:" + text.rsplit("@sha256:", 1)[1]
+    elif re.fullmatch(r"[0-9a-f]{64}", text):
+        text = f"sha256:{text}"
+    return text if re.fullmatch(r"sha256:[0-9a-f]{64}", text) else None
+
+
+def _inspect_identity(result: subprocess.CompletedProcess) -> dict:
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "inspect failed").strip()
+        raise sourcecheckout.SourcePreparationError(detail[:600])
+    try:
+        payload = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise sourcecheckout.SourcePreparationError(
+            f"container inspect returned invalid JSON: {exc}"
+        ) from exc
+    if isinstance(payload, list):
+        payload = payload[0] if payload else {}
+    if not isinstance(payload, dict):
+        raise sourcecheckout.SourcePreparationError(
+            "container inspect returned no identity object"
+        )
+    digest = next((
+        normalized
+        for candidate in (
+            payload.get("Image"), payload.get("Id"), payload.get("ID"),
+            payload.get("ImageDigest"),
+        )
+        if (normalized := _normalized_sha256_digest(candidate))
+    ), None)
+    return {
+        "container_id": str(payload.get("Id") or payload.get("ID") or "") or None,
+        "image_digest": digest,
+    }
+
+
+def _resolve_container_image_digest(runtime: str, image: str) -> str:
+    """Resolve a mutable image reference before launch to an immutable ID."""
+    try:
+        result = subprocess.run(
+            [runtime, "image", "inspect", image],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise sourcecheckout.SourcePreparationError(
+            f"could not inspect container image {image!r}: {exc}"
+        ) from exc
+    identity = _inspect_identity(result)
+    digest = identity.get("image_digest")
+    if not digest:
+        raise sourcecheckout.SourcePreparationError(
+            f"container image {image!r} has no resolvable sha256 identity"
+        )
+    return str(digest)
+
+
+def _capture_container_identity(
+    runtime: str, name: str, *, attempts: int = 20, delay_s: float = 0.1,
+) -> dict:
+    """Inspect the running named container before ``--rm`` removes it."""
+    last_error = "container did not become inspectable"
+    for attempt in range(attempts):
+        try:
+            result = subprocess.run(
+                [runtime, "inspect", name],
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            identity = _inspect_identity(result)
+            if identity.get("container_id") and identity.get("image_digest"):
+                return identity
+            last_error = "container inspect omitted ID or image digest"
+        except (OSError, subprocess.TimeoutExpired, sourcecheckout.SourcePreparationError) as exc:
+            last_error = str(exc)
+        if attempt + 1 < attempts:
+            time.sleep(delay_s)
+    raise sourcecheckout.SourcePreparationError(
+        f"could not capture running container identity for {name!r}: {last_error}"
+    )
+
+
 def force_remove_container(runtime: str, name: str) -> None:
     """Best-effort, idempotent `stop` then `rm -f` by name. Safe to call
     whether or not the container exists — never raises. This is the
@@ -1401,6 +1484,8 @@ def _k8s_execution_attestation(
     expected_image: str,
     receipt: dict,
     expected_receipt_sha256: str,
+    expected_protected_env: dict | None = None,
+    expected_protected_env_sha256: str | None = None,
 ) -> dict:
     """Validate source, receipt, and actual Kubernetes runtime identity."""
     reasons: list[str] = []
@@ -1413,6 +1498,19 @@ def _k8s_execution_attestation(
         reasons.append("receipt runtime is not kubernetes")
     if receipt_launch.get("image") != expected_image:
         reasons.append("receipt image differs from policy")
+    if not expected_protected_env or not expected_protected_env_sha256:
+        reasons.append("expected protected trainer environment is missing")
+    elif (receiptmod.protected_environment_sha256(expected_protected_env)
+          != expected_protected_env_sha256):
+        reasons.append("expected protected trainer environment hash is invalid")
+    expected_variables = dict(
+        (expected_protected_env or {}).get("variables") or {}
+    )
+    for required_name in (declarations.JOB_ID_ENV, declarations.JOB_JSON_ENV):
+        if required_name not in expected_variables:
+            reasons.append(
+                f"expected protected trainer environment lacks {required_name}"
+            )
 
     items = pods_payload.get("items") or []
     if not items:
@@ -1425,6 +1523,8 @@ def _k8s_execution_attestation(
             "binding": {
                 "receipt": deepcopy(receipt),
                 "actual_launch": None,
+                "protected_env": deepcopy(expected_protected_env),
+                "protected_env_sha256": expected_protected_env_sha256,
             },
             "error": "; ".join(
                 [*reasons, "k8s source attestation unavailable: no job pod found"]
@@ -1495,6 +1595,13 @@ def _k8s_execution_attestation(
         "mounts": actual_mounts,
         "argv_sha256": receiptmod.argv_sha256(trainer_spec.get("command") or []),
     }
+    try:
+        actual_protected_env = receiptmod.protected_environment_projection(
+            trainer_spec.get("env") or []
+        )
+    except ValueError as exc:
+        actual_protected_env = None
+        reasons.append(str(exc))
     if not runtime["pod"]:
         reasons.append("pod identity is missing")
     if not runtime["node"]:
@@ -1519,6 +1626,8 @@ def _k8s_execution_attestation(
             reasons.append("receipt actual command fingerprint is missing")
         elif actual_launch["argv_sha256"] != expected_actual_argv:
             reasons.append("actual command differs from receipt")
+    if actual_protected_env != expected_protected_env:
+        reasons.append("protected trainer environment differs from submitted manifest")
     return {
         "schema": "ablator.execution-attestation/v1",
         "verdict": "REJECTED" if reasons else "ACCEPTED",
@@ -1528,6 +1637,11 @@ def _k8s_execution_attestation(
         "binding": {
             "receipt": deepcopy(receipt),
             "actual_launch": actual_launch,
+            "protected_env": actual_protected_env,
+            "protected_env_sha256": (
+                receiptmod.protected_environment_sha256(actual_protected_env)
+                if actual_protected_env is not None else None
+            ),
         },
         "error": "; ".join(reasons) if reasons else None,
     }
@@ -1540,6 +1654,8 @@ def _capture_k8s_execution_attestation(
     expected_image: str,
     receipt: dict,
     expected_receipt_sha256: str,
+    expected_protected_env: dict | None = None,
+    expected_protected_env_sha256: str | None = None,
 ) -> dict:
     pods = _kubectl([
         "get", "pods", "-n", ns, "-l", f"job-name={name}", "-o", "json"
@@ -1551,7 +1667,11 @@ def _capture_k8s_execution_attestation(
             "receipt_sha256": expected_receipt_sha256 or None,
             "source": None,
             "runtime": None,
-            "binding": {"receipt": deepcopy(receipt), "actual_launch": None},
+            "binding": {
+                "receipt": deepcopy(receipt), "actual_launch": None,
+                "protected_env": deepcopy(expected_protected_env),
+                "protected_env_sha256": expected_protected_env_sha256,
+            },
             "error": "k8s source attestation query failed: "
                      f"{(pods.stderr or pods.stdout).strip()[:400]}",
         }
@@ -1564,7 +1684,11 @@ def _capture_k8s_execution_attestation(
             "receipt_sha256": expected_receipt_sha256 or None,
             "source": None,
             "runtime": None,
-            "binding": {"receipt": deepcopy(receipt), "actual_launch": None},
+            "binding": {
+                "receipt": deepcopy(receipt), "actual_launch": None,
+                "protected_env": deepcopy(expected_protected_env),
+                "protected_env_sha256": expected_protected_env_sha256,
+            },
             "error": f"k8s source attestation JSON is invalid: {exc}",
         }
     return _k8s_execution_attestation(
@@ -1573,6 +1697,8 @@ def _capture_k8s_execution_attestation(
         expected_image,
         receipt,
         expected_receipt_sha256,
+        expected_protected_env,
+        expected_protected_env_sha256,
     )
 
 
@@ -1692,6 +1818,8 @@ def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
                 expected_image,
                 job.get("execution_receipt") or {},
                 job.get("execution_receipt_sha256") or "",
+                job.get("k8s_protected_env"),
+                job.get("k8s_protected_env_sha256"),
             )
             job["execution_attestation"] = attestation
             if attestation["verdict"] == "ACCEPTED":
@@ -1806,6 +1934,9 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
         ],
         "namespace": mcfg["namespace"],
     })
+    execution_receipt["launch"]["launch_sha256"] = receiptmod.launch_sha256(
+        execution_receipt["launch"]
+    )
     execution_receipt_sha256 = receiptmod.receipt_sha256(execution_receipt)
     job["runner_provenance"] = runner_provenance
     job["execution_receipt"] = execution_receipt
@@ -1823,6 +1954,21 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
     manifest = build_k8s_job_manifest(
         mcfg, job, argv, cwd, local_commit, image_override=image_override
     )
+    final_trainer = manifest["spec"]["template"]["spec"]["containers"][0]
+    k8s_protected_env = receiptmod.protected_environment_projection(
+        final_trainer.get("env") or []
+    )
+    k8s_protected_env_sha256 = receiptmod.protected_environment_sha256(
+        k8s_protected_env
+    )
+    job["k8s_protected_env"] = k8s_protected_env
+    job["k8s_protected_env_sha256"] = k8s_protected_env_sha256
+    if q is not None:
+        q.update(
+            job["id"],
+            k8s_protected_env=k8s_protected_env,
+            k8s_protected_env_sha256=k8s_protected_env_sha256,
+        )
     name = manifest["metadata"]["name"]
     ns = mcfg["namespace"]
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
@@ -1870,6 +2016,8 @@ def run_job(cfg: dict, job: dict, machine: str,
     actual_launch: dict | None = None
     runner_provenance: dict | None = None
     tcfg: dict | None = None
+    proc: subprocess.Popen | None = None
+    launched_argv: list[str] | None = None
     status = "failed"
     exit_code: int | None = None
     try:
@@ -1903,6 +2051,18 @@ def run_job(cfg: dict, job: dict, machine: str,
             tcfg, job, machine, include_protected_env=False
         )
         semantic_argv = argv
+        semantic_runtime, semantic_image, _semantic_mounts = (
+            receiptmod.container_launch(semantic_argv)
+        )
+        resolved_image_digest = None
+        if semantic_runtime:
+            if not semantic_image:
+                raise sourcecheckout.SourcePreparationError(
+                    "container launch has no resolvable image reference"
+                )
+            resolved_image_digest = _resolve_container_image_digest(
+                semantic_argv[0], semantic_image
+            )
         prov_state = capture_and_record_provenance(
             cfg, job, machine, cwd or os.getcwd(), q
         )
@@ -1933,6 +2093,7 @@ def run_job(cfg: dict, job: dict, machine: str,
                 prepared_source.lease.lease_id if prepared_source.lease else None
             ),
             runner_provenance=runner_provenance,
+            resolved_image_digest=resolved_image_digest,
         )
         execution_receipt_sha256 = receiptmod.receipt_sha256(execution_receipt)
         job["execution_receipt"] = execution_receipt
@@ -1954,10 +2115,7 @@ def run_job(cfg: dict, job: dict, machine: str,
         # Re-render only after the local queue envelope contains actual
         # source/runner/receipt identity. This is the form the child executes.
         argv, env, cwd = render_command(tcfg, job, machine)
-        actual_launch = receiptmod.build_actual_launch(argv, cwd or os.getcwd())
-        job["actual_launch"] = actual_launch
-        if q is not None:
-            q.update(job["id"], actual_launch=actual_launch)
+        launched_argv = argv
         check_checkout_drift(cfg, job, machine, prov_state, q)
         container_name = container_name_from_argv(argv)
         if container_name:
@@ -1978,6 +2136,23 @@ def run_job(cfg: dict, job: dict, machine: str,
             proc = subprocess.Popen(argv, env=env, cwd=cwd,
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
+            if container_name:
+                container_identity = _capture_container_identity(
+                    argv[0], container_name
+                )
+                actual_launch = receiptmod.build_actual_launch(
+                    argv,
+                    cwd or os.getcwd(),
+                    container_id=container_identity["container_id"],
+                    image_digest=container_identity["image_digest"],
+                )
+            else:
+                actual_launch = receiptmod.build_actual_launch(
+                    argv, cwd or os.getcwd()
+                )
+            job["actual_launch"] = actual_launch
+            if q is not None:
+                q.update(job["id"], actual_launch=actual_launch)
             override = supervise(cfg, job, proc, cwd or os.getcwd(), q, argv=argv,
                                  machine=machine)
         exit_code = proc.returncode
@@ -2002,6 +2177,8 @@ def run_job(cfg: dict, job: dict, machine: str,
             status = "done" if exit_code == 0 else "failed"
     except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:
         print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
+        if proc is not None and actual_launch is None and launched_argv is not None:
+            kill_job(proc, job, launched_argv)
         if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):
             q.update(job["id"], source_prepare_error=str(e))
     except Exception as e:
