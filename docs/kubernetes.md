@@ -82,6 +82,19 @@ cluster schedules the pod — into a shared `emptyDir`, and the trainer
 container mounts that same `emptyDir` *over* the baked source path,
 overlaying fresh source on top of (not beside) the image's own copy.
 
+For a pinned job, the init container additionally initializes recursive
+submodules, verifies the exact requested commit, detached HEAD, and a fully
+clean source tree, and writes that proof to its termination message. The
+trainer mounts the source `emptyDir` read-only and receives
+`PYTHONDONTWRITEBYTECODE=1`. The runner captures the proof plus the actual pod,
+node, image, and image ID before deleting the Job; a missing or inconsistent
+proof changes a nominal Kubernetes success to failure.
+
+Set `require_pinned_git = true` on scientific job types. With that setting,
+the runner rejects a job without a full registered SHA and rejects a pinned job
+when `git_sync_repo_url` is absent. The historical unpinned git-sync behavior
+remains available only to non-strict legacy/debug types.
+
 `git_sync_http_secret_name` takes precedence if both secret fields are
 somehow set; it rewrites the remote URL to embed the token as an
 `x-access-token` credential rather than relying on `GIT_SSH_COMMAND`

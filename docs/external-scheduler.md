@@ -28,6 +28,8 @@ ablator submit \
   --id rf-0123456789ab-train-fr3-seed1 \
   --type researchflow \
   --machine any \
+  --git-sha 0123456789abcdef0123456789abcdef01234567 \
+  --git-repo https://github.com/example/project.git \
   --param jobscript=/mnt/cps_scratch1_tmp/researchflow/jobs/train.sh \
   --metadata-json '{"scheduler":"snakemake","researchflow_plan_sha256":"..."}'
 ```
@@ -46,6 +48,12 @@ Response:
 
 Submission is idempotent. Repeating the same ID with the same immutable specification returns the existing job with `created=false`. Reusing an ID for a different specification fails closed.
 
+`--git-sha` accepts only a full 40-character commit SHA. `--git-repo` is
+optional when the configured type `cwd` is already a usable repository. Both
+fields participate in the idempotency fingerprint, and a dependent job must
+use the same Git target as its parent. A type with `require_pinned_git = true`
+rejects an external job that omits the SHA before launch.
+
 ## Inspect an exact job
 
 ```bash
@@ -59,6 +67,9 @@ The JSON projection exposes the stable queue state plus execution provenance, in
 - typed parameters and opaque scheduler metadata;
 - workload checkout provenance;
 - container/image provenance when available;
+- the canonical `execution_receipt` and post-run `execution_attestation`,
+  including requested/executed commit, ref/dirty/submodules, resolved cwd,
+  runtime image and mounts, and hashed argv/type configuration;
 - **Ablator runner provenance**: package version, runner Git commit/branch/dirty state, config SHA-256, machine and hostname;
 - failure classification and health state.
 

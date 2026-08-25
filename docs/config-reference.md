@@ -77,6 +77,7 @@ command = ["podman", "run", "...", "{scene}", "-m", "{model_path}",
            "--iterations", "{iterations}", "{extra_args}"]
 env = { SCENE_SOURCE = "{scene}" }
 result_glob = "..."               # per-type override for `collect`
+require_pinned_git = true         # reject jobs without a full registered SHA
 
 [types.<type>.machines.<name>]    # shallow per-machine override
 command = ["docker", "run", "..."]        # replaces base command
@@ -91,7 +92,8 @@ value outright; `env` is merged on top of the base `env` dict instead
 of replacing it.
 
 `ABLATOR_EXPERIMENT_DECLARATION_JSON`,
-`ABLATOR_EXPERIMENT_DECLARATION_SHA256`, and `ABLATOR_JOB_ID` are reserved.
+`ABLATOR_EXPERIMENT_DECLARATION_SHA256`, `ABLATOR_JOB_ID`,
+`ABLATOR_JOB_JSON`, and `ABLATOR_SUBMISSION_JSON` are reserved.
 The runner derives them only from a validated immutable declaration in the
 queue; ambient and `[types.*.env]` values with those names are scrubbed. Direct
 Docker/Podman and Kubernetes jobs receive them automatically, so command
@@ -101,6 +103,23 @@ templates must not add their own copies.
 
 Available in every `command` token and `env` value:
 `{scene}` `{model_path}` `{extra_args}` `{iterations}` `{id}` `{machine}`.
+
+Pinned type commands may also use `{repo_cwd}` for host source paths. The
+runner replaces it with the unique per-attempt checkout, rewrites `cwd`, and
+makes Docker/Podman binds of that checkout read-only. Keep datasets, scratch,
+and result directories on separate mounts.
+
+## `[git]`
+
+```toml
+[git]
+worktree_root = "~/.cache/ablator/worktrees"
+gc_max_age_days = 30
+```
+
+`machines.<name>.git_worktree_root` overrides the root for one runner.
+`ABLATOR_GIT_WORKTREE_ROOT` is the fallback process override. See
+[Immutable Git worktree cache](worktree-cache.md) for lease and cleanup rules.
 
 A token that is *exactly* `"{extra_args}"` expands to zero or more
 whitespace-split argv items (so an empty `extra_args` cleanly disappears

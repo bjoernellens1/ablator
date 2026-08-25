@@ -11,7 +11,10 @@ ABLATOR_JOB_ID
 ABLATOR_JOB_JSON
 ```
 
-`ABLATOR_JOB_JSON` is the canonical JSON snapshot of the queue job as seen by the runner when the command is rendered.
+`ABLATOR_JOB_JSON` is the canonical JSON snapshot of the queue job as seen by
+the runner when the command is rendered. For a pinned bare-metal launch, that
+render occurs only after the runner has persisted `executed_git_sha`, source
+lease, runner provenance, and the canonical pre-launch `execution_receipt`.
 
 When the original queue surface is known, the child also receives:
 
@@ -31,6 +34,13 @@ ABLATOR_EXPERIMENT_DECLARATION_SHA256
 ```
 
 All of these names are protected. Ambient environment variables and type-configured environment entries with the same names are removed/rejected before the trusted values are injected into direct children, Docker/Podman containers, and Kubernetes trainer containers.
+
+The execution receipt records requested/executed source identity, detached
+ref/dirty/submodule state, checkout and lease identity, runner/config identity,
+resolved cwd, runtime/image, normalized mounts, and hashes of the rendered argv
+and merged type configuration. It excludes arbitrary environment values and
+credentials. The queue's later `execution_attestation` records the post-run
+source verdict and Kubernetes runtime identity where applicable.
 
 ## `ablator plan`
 
