@@ -40,6 +40,21 @@ DECLARATION_JOB_FIELDS = frozenset(
 IMMUTABLE_JOB_FIELDS = DECLARATION_JOB_FIELDS | frozenset(
     {"submission_provenance", "requested_git_sha", "git_repo"}
 )
+EXTERNAL_HASHED_JOB_FIELDS = frozenset(
+    {
+        "external_id",
+        "external_schema",
+        "external_spec_sha256",
+        "external_metadata",
+        "params",
+        "machine",
+        "type",
+        "lane",
+        "depends_on",
+        "requested_git_sha",
+        "git_repo",
+    }
+)
 
 
 class ExperimentDeclarationError(ValueError):
@@ -220,7 +235,10 @@ def validate_frozen_job(job: Mapping[str, Any]) -> dict[str, Any] | None:
 def validate_immutable_update(
     job: Mapping[str, Any], fields: Mapping[str, Any]
 ) -> None:
-    for key in IMMUTABLE_JOB_FIELDS.intersection(fields):
+    immutable = IMMUTABLE_JOB_FIELDS
+    if job.get("external_schema"):
+        immutable = immutable | EXTERNAL_HASHED_JOB_FIELDS
+    for key in immutable.intersection(fields):
         if fields[key] != job.get(key):
             raise ExperimentDeclarationError(
                 f"immutable {key} cannot be changed after enqueue"
@@ -237,6 +255,49 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _external_submission_content(job: Mapping[str, Any]) -> dict[str, Any]:
+    """Return every external input whose identity is frozen at submission."""
+    return {
+        "schema": "ablator.submission/v1",
+        "surface": "submit",
+        "job_id": str(job.get("id") or ""),
+        "external_id": job.get("external_id"),
+        "type": job.get("type"),
+        "machine": job.get("machine", "any"),
+        "params": deepcopy(job.get("params") or {}),
+        "metadata": deepcopy(job.get("external_metadata") or {}),
+        "lane": job.get("lane", 2),
+        "depends_on": job.get("depends_on"),
+        "requested_git_sha": job.get("requested_git_sha"),
+        "git_repo": job.get("git_repo"),
+        "external_schema": job.get("external_schema"),
+    }
+
+
+def freeze_external_submission(job: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+    """Build the canonical external envelope and its immutable digest."""
+    content = _external_submission_content(job)
+    digest = hashlib.sha256(_canonical_json(content).encode("utf-8")).hexdigest()
+    return {**content, "external_spec_sha256": digest}, digest
+
+
+def validate_external_submission(job: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Recompute external identity from queue fields and verify its envelope."""
+    if not job.get("external_schema"):
+        return None
+    expected, digest = freeze_external_submission(job)
+    if job.get("external_spec_sha256") != digest:
+        raise ExperimentDeclarationError("external specification SHA-256 mismatch")
+    recorded = job.get("submission_provenance")
+    if not isinstance(recorded, Mapping):
+        raise ExperimentDeclarationError(
+            "external job requires a frozen submission_provenance envelope"
+        )
+    if dict(recorded) != expected:
+        raise ExperimentDeclarationError("external submission provenance mismatch")
+    return expected
+
+
 def submission_provenance(job: Mapping[str, Any]) -> dict[str, Any] | None:
     """Return the exact queue-submission envelope for a job when known.
 
@@ -245,6 +306,9 @@ def submission_provenance(job: Mapping[str, Any]) -> dict[str, Any] | None:
     immutable submit inputs in the queue record, so build the equivalent
     structured envelope here without requiring a queue/schema migration.
     """
+    if job.get("external_schema"):
+        return validate_external_submission(job)
+
     recorded = job.get("submission_provenance")
     if isinstance(recorded, Mapping):
         resolved = deepcopy(dict(recorded))
@@ -260,22 +324,6 @@ def submission_provenance(job: Mapping[str, Any]) -> dict[str, Any] | None:
                 raise ExperimentDeclarationError("plan submission spec SHA-256 mismatch")
         return resolved
 
-    if job.get("external_schema"):
-        return {
-            "schema": "ablator.submission/v1",
-            "surface": "submit",
-            "job_id": str(job.get("id") or ""),
-            "type": job.get("type"),
-            "machine": job.get("machine", "any"),
-            "params": deepcopy(job.get("params") or {}),
-            "metadata": deepcopy(job.get("external_metadata") or {}),
-            "lane": job.get("lane", 2),
-            "depends_on": job.get("depends_on"),
-            "requested_git_sha": job.get("requested_git_sha"),
-            "git_repo": job.get("git_repo"),
-            "external_schema": job.get("external_schema"),
-            "external_spec_sha256": job.get("external_spec_sha256"),
-        }
     return None
 
 

@@ -22,7 +22,7 @@ from ablator.queue import Queue
 SHA_A = "0123456789abcdef0123456789abcdef01234567"
 
 
-def _cfg(tmp_path: Path) -> dict:
+def _cfg(tmp_path: Path, *, require_pin: bool = False) -> dict:
     config = tmp_path / "ablator.json"
     queue = tmp_path / "queue.jsonl"
     raw = {
@@ -32,6 +32,7 @@ def _cfg(tmp_path: Path) -> dict:
             "researchflow": {
                 "command": ["bash", "{jobscript}"],
                 "cwd": str(tmp_path),
+                "require_pinned_git": require_pin,
             }
         },
         "resources": {},
@@ -69,6 +70,101 @@ def test_submit_is_idempotent_and_conflicts_fail_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(ExternalJobError):
         submit_job(cfg, changed)
+
+
+def test_strict_external_submit_rejects_unpinned_atomically(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, require_pin=True)
+    job = build_job(cfg, job_id="strict", job_type="researchflow")
+
+    with pytest.raises(ExternalJobError, match="requires an immutable Git target"):
+        submit_job(cfg, job)
+
+    assert Queue(cfg["queue"]["path"]).read() == []
+
+
+def test_external_dependency_mixed_sha_rejects_atomically(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, require_pin=True)
+    parent = build_job(
+        cfg, job_id="parent", job_type="researchflow", git_sha=SHA_A,
+    )
+    child = build_job(
+        cfg, job_id="child", job_type="researchflow", depends_on="parent",
+        git_sha="f" * 40,
+    )
+    submit_job(cfg, parent)
+
+    with pytest.raises(ExternalJobError, match="dependency chain changes Git target"):
+        submit_job(cfg, child)
+
+    assert [item["id"] for item in Queue(cfg["queue"]["path"]).read()] == ["parent"]
+
+
+def test_mutated_external_hash_input_rejects_before_enqueue(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(
+        cfg, job_id="mutated", job_type="researchflow",
+        params={"jobscript": "/shared/original.sh"},
+    )
+    job["params"]["jobscript"] = "/shared/tampered.sh"
+
+    with pytest.raises(ExternalJobError, match="external specification SHA-256 mismatch"):
+        submit_job(cfg, job)
+
+    assert Queue(cfg["queue"]["path"]).read() == []
+
+
+def test_complete_external_submission_is_frozen_and_protected(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(
+        cfg,
+        job_id="frozen",
+        job_type="researchflow",
+        machine="main",
+        params={"jobscript": "/shared/job.sh"},
+        metadata={"scheduler": "snakemake"},
+        lane=3,
+        depends_on=None,
+        git_sha=SHA_A,
+        git_repo="https://github.com/example/project.git",
+    )
+    submission = job["submission_provenance"]
+    assert submission == experiment_declaration.submission_provenance(job)
+    assert submission["external_spec_sha256"] == job["external_spec_sha256"]
+    submit_job(cfg, job)
+    queue = Queue(cfg["queue"]["path"])
+
+    for field, changed in (
+        ("external_id", "other"),
+        ("external_schema", "other/v1"),
+        ("external_spec_sha256", "0" * 64),
+        ("external_metadata", {"scheduler": "other"}),
+        ("params", {"jobscript": "/other.sh"}),
+        ("machine", "any"),
+        ("type", "other"),
+        ("lane", 1),
+        ("depends_on", "other"),
+    ):
+        with pytest.raises(SystemExit, match=f"immutable {field}"):
+            queue.update("frozen", **{field: changed})
+
+
+def test_external_hash_is_reverified_before_protected_environment() -> None:
+    cfg = {
+        "types": {"researchflow": {"command": ["true"]}},
+        "machines": {},
+    }
+    job = build_job(
+        cfg, job_id="env-tamper", job_type="researchflow",
+        params={"jobscript": "/shared/original.sh"},
+    )
+    job["status"] = "running"
+    job["params"] = {"jobscript": "/shared/tampered.sh"}
+
+    with pytest.raises(
+        experiment_declaration.ExperimentDeclarationError,
+        match="external specification SHA-256 mismatch",
+    ):
+        experiment_declaration.experiment_environment(job)
 
 
 def test_external_git_target_is_immutable_submit_identity(tmp_path: Path) -> None:
