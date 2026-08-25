@@ -277,6 +277,11 @@ class Queue:
 
     def append(self, new_jobs: list[dict]) -> None:
         """Atomically enqueue jobs; refuses duplicate ids."""
+        # _open_locked() creates the queue file. Reject malformed input before
+        # that observable side effect, then repeat validation under the lock so
+        # the transaction remains authoritative if caller-owned data changes.
+        for job in new_jobs:
+            self._validate_enqueue_job(job)
         with self._open_locked() as f:
             jobs = self._load(f)
             for job in new_jobs:
@@ -305,6 +310,7 @@ class Queue:
         lock/file internals. Validation, duplicate comparison, dependency-pin
         checks, and persistence all observe the same locked queue snapshot.
         """
+        self._validate_enqueue_job(job, require_pinned_git=require_pinned_git)
         with self._open_locked() as handle:
             jobs = self._load(handle)
             self._validate_enqueue_job(
