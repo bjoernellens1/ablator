@@ -522,10 +522,7 @@ def test_k8s_manifest_git_sync_ssh_secret_unaffected_by_http_option():
 
 
 def test_k8s_manifest_git_sync_http_token_secret():
-    """git_sync_http_secret_name rewrites the remote URL to embed the token
-    from a mounted secret file, and mounts that secret read-only into the
-    init container only -- no GIT_SSH_COMMAND env var (that's the SSH path's
-    mechanism, not this one)."""
+    """HTTPS credentials are ephemeral and absent from trainer-visible Git."""
     mcfg = {"namespace": "ns", "kai_queue": "q", "priority_class": "p",
             "image": "img:tag", "git_sync_repo_url": "https://github.com/o/r",
             "git_sync_http_secret_name": "gh-token"}
@@ -542,9 +539,11 @@ def test_k8s_manifest_git_sync_http_token_secret():
     trainer_mounts = pod_spec["containers"][0]["volumeMounts"]
     assert not any(m["name"] == "git-creds" for m in trainer_mounts)
     script = init["command"][2]
-    assert 'https://x-access-token:$(cat /etc/git-creds/token)@github.com/o/r' in script
-    # the ORIGINAL (credential-free) URL must still appear in the echo, for
-    # readable logs -- the token must never be echoed
+    assert 'git remote add origin "https://github.com/o/r"' in script
+    assert 'http.extraHeader=' in script
+    assert 'cat /etc/git-creds/token' in script
+    assert 'grep -F "$(cat /etc/git-creds/token)" .git/config' in script
+    assert 'x-access-token:$(cat' not in script
     assert "checked out abc123 from https://github.com/o/r" in script
     assert "x-access-token" not in script.split("echo")[1]
 
@@ -1341,7 +1340,7 @@ def test_reconcile_k8s_reattaches_genuinely_running_job(tmp_path, monkeypatch):
 
     release = threading.Event()
 
-    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False):
+    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False, q=None):
         release.wait(timeout=5)
         return "done", 0
 
@@ -1450,7 +1449,7 @@ def test_reconcile_k8s_reattach_counts_toward_max_concurrent(tmp_path, monkeypat
 
     release = threading.Event()
 
-    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False):
+    def fake_poll(cfg, job, machine, mcfg, tcfg, name, ns, log_path, append=False, q=None):
         release.wait(timeout=5)
         return "done", 0
 

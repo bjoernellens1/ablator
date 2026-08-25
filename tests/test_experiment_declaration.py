@@ -35,6 +35,7 @@ def test_canonical_declaration_matches_splatograph_contract():
 def _declared_spec() -> dict:
     return {
         "name": "issue705",
+        "git_sha": "0123456789abcdef0123456789abcdef01234567",
         "experiment": {
             "schema_version": 1,
             "run_class": "experiment",
@@ -299,6 +300,7 @@ def test_k8s_manifest_propagates_exact_declaration_to_trainer_container():
         declarations.DECLARATION_ENV: job["experiment_declaration_json"],
         declarations.DECLARATION_SHA_ENV: job["experiment_declaration_sha256"],
         declarations.JOB_ID_ENV: job["id"],
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
 
 
@@ -316,7 +318,16 @@ def test_bare_metal_runner_log_records_same_frozen_declaration_before_child(
     monkeypatch.setattr(
         runner,
         "capture_and_record_provenance",
-        lambda *args, **kwargs: {"commit": "abc123", "branch": "main", "dirty": False},
+        lambda *args, **kwargs: {
+            "commit": job["requested_git_sha"], "branch": "HEAD", "dirty": False
+        },
+    )
+    monkeypatch.setattr(
+        runner.sourcecheckout,
+        "prepare_job_source",
+        lambda cfg, job, machine, tcfg: runner.sourcecheckout.PreparedSource(
+            type_config=tcfg
+        ),
     )
     monkeypatch.setattr(runner, "check_checkout_drift", lambda *args, **kwargs: None)
     monkeypatch.setattr(runner, "output_folder_preflight", lambda *args: "preflight ok")
@@ -353,7 +364,13 @@ def test_k8s_runner_log_records_same_frozen_declaration_before_submit(
         "kai_queue": "batch",
         "priority_class": "batch-low",
         "image": "image:tag",
+        "git_sync_repo_url": "https://github.com/example/project.git",
     }
+    monkeypatch.setattr(
+        runner.sourcecheckout,
+        "validate_requested_revision_policy",
+        lambda *args: "https://github.com/example/project.git",
+    )
     monkeypatch.setattr(runner, "_dispatch_host_commit", lambda *args: "abc123")
     monkeypatch.setattr(
         runner.provmod,

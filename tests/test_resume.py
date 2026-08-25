@@ -279,6 +279,38 @@ def test_k8s_manifest_git_sync_adds_init_container_and_shared_volume():
     # SAME path the trainer already uses, no new path/env for it to know
     # about.
     assert trainer_mounts["repo-src"]["mountPath"] == "/workspace/splatograph"
+    assert trainer_mounts["repo-src"]["readOnly"] is True
+    clone_script = init["command"][2]
+    assert "submodule update --init --recursive --checkout" in clone_script
+    assert "git rev-parse HEAD" in clone_script
+    assert "/dev/termination-log" in clone_script
+
+
+def test_pinned_k8s_workload_receives_verified_source_proof_before_exec():
+    sha = "a" * 40
+    mcfg = {
+        **BASE_MCFG,
+        "git_sync_repo_url": "https://github.com/example/project.git",
+    }
+    job = {
+        **GIT_JOB,
+        "status": "running",
+        "requested_git_sha": sha,
+    }
+    original_argv = ["python", "train.py"]
+    manifest = runner.build_k8s_job_manifest(
+        mcfg, job, original_argv, "/workspace/splatograph", local_commit=sha,
+    )
+    pod_spec = manifest["spec"]["template"]["spec"]
+    init = pod_spec["initContainers"][0]
+    trainer = pod_spec["containers"][0]
+    mounts = {item["name"]: item for item in trainer["volumeMounts"]}
+
+    assert "source-proof.json" in init["command"][2]
+    assert mounts["ablator-proof"]["readOnly"] is True
+    assert trainer["command"][:3] == ["sh", "-c", trainer["command"][2]]
+    assert "ABLATOR_SOURCE_PROOF_JSON" in trainer["command"][2]
+    assert trainer["command"][-len(original_argv):] == original_argv
 
 
 def test_k8s_manifest_git_sync_custom_image_overridable():

@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
-from ablator import cli, runner
+from ablator import cli, experiment_declaration, runner
 from ablator.external import (
     ExternalJobError,
     build_job,
@@ -19,7 +21,10 @@ from ablator.external import (
 from ablator.queue import Queue
 
 
-def _cfg(tmp_path: Path) -> dict:
+SHA_A = "0123456789abcdef0123456789abcdef01234567"
+
+
+def _cfg(tmp_path: Path, *, require_pin: bool = False) -> dict:
     config = tmp_path / "ablator.json"
     queue = tmp_path / "queue.jsonl"
     raw = {
@@ -29,6 +34,7 @@ def _cfg(tmp_path: Path) -> dict:
             "researchflow": {
                 "command": ["bash", "{jobscript}"],
                 "cwd": str(tmp_path),
+                "require_pinned_git": require_pin,
             }
         },
         "resources": {},
@@ -66,6 +72,206 @@ def test_submit_is_idempotent_and_conflicts_fail_closed(tmp_path: Path) -> None:
     )
     with pytest.raises(ExternalJobError):
         submit_job(cfg, changed)
+
+
+def test_concurrent_identical_external_submissions_create_exactly_once(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(
+        cfg, job_id="concurrent-same", job_type="researchflow",
+        params={"jobscript": "/shared/job.sh"},
+    )
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(
+            lambda _index: submit_job(cfg, deepcopy(job)), range(16)
+        ))
+
+    assert sum(created for _item, created in results) == 1
+    queued = Queue(cfg["queue"]["path"]).read()
+    assert len(queued) == 1
+    assert queued[0]["external_spec_sha256"] == job["external_spec_sha256"]
+
+
+def test_concurrent_conflicting_external_submissions_never_mix_envelopes(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(tmp_path)
+    variants = [
+        build_job(
+            cfg, job_id="concurrent-conflict", job_type="researchflow",
+            params={"jobscript": f"/shared/{name}.sh"},
+        )
+        for name in ("a", "b")
+    ]
+
+    def attempt(job):
+        try:
+            stored, created = submit_job(cfg, deepcopy(job))
+            return ("stored", stored["external_spec_sha256"], created)
+        except ExternalJobError:
+            return ("rejected", job["external_spec_sha256"], False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(attempt, variants))
+
+    queued = Queue(cfg["queue"]["path"]).read()
+    assert len(queued) == 1
+    assert sorted(item[0] for item in results) == ["rejected", "stored"]
+    winner = next(item for item in results if item[0] == "stored")
+    assert winner[2] is True
+    assert queued[0]["external_spec_sha256"] == winner[1]
+
+
+def test_strict_external_submit_rejects_unpinned_atomically(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, require_pin=True)
+    job = build_job(cfg, job_id="strict", job_type="researchflow")
+
+    with pytest.raises(ExternalJobError, match="requires an immutable Git target"):
+        submit_job(cfg, job)
+
+    assert Queue(cfg["queue"]["path"]).read() == []
+
+
+def test_external_dependency_mixed_sha_rejects_atomically(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, require_pin=True)
+    parent = build_job(
+        cfg, job_id="parent", job_type="researchflow", git_sha=SHA_A,
+    )
+    child = build_job(
+        cfg, job_id="child", job_type="researchflow", depends_on="parent",
+        git_sha="f" * 40,
+    )
+    submit_job(cfg, parent)
+
+    with pytest.raises(ExternalJobError, match="dependency chain changes Git target"):
+        submit_job(cfg, child)
+
+    assert [item["id"] for item in Queue(cfg["queue"]["path"]).read()] == ["parent"]
+
+
+def test_mutated_external_hash_input_rejects_before_enqueue(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(
+        cfg, job_id="mutated", job_type="researchflow",
+        params={"jobscript": "/shared/original.sh"},
+    )
+    job["params"]["jobscript"] = "/shared/tampered.sh"
+
+    with pytest.raises(ExternalJobError, match="external specification SHA-256 mismatch"):
+        submit_job(cfg, job)
+
+    assert Queue(cfg["queue"]["path"]).read() == []
+
+
+def test_complete_external_submission_is_frozen_and_protected(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(
+        cfg,
+        job_id="frozen",
+        job_type="researchflow",
+        machine="main",
+        params={"jobscript": "/shared/job.sh"},
+        metadata={"scheduler": "snakemake"},
+        lane=3,
+        depends_on=None,
+        git_sha=SHA_A,
+        git_repo="https://github.com/example/project.git",
+    )
+    submission = job["submission_provenance"]
+    assert submission == experiment_declaration.submission_provenance(job)
+    assert submission["external_spec_sha256"] == job["external_spec_sha256"]
+    submit_job(cfg, job)
+    queue = Queue(cfg["queue"]["path"])
+
+    for field, changed in (
+        ("id", "other"),
+        ("external_id", "other"),
+        ("external_schema", "other/v1"),
+        ("external_spec_sha256", "0" * 64),
+        ("external_metadata", {"scheduler": "other"}),
+        ("params", {"jobscript": "/other.sh"}),
+        ("machine", "any"),
+        ("type", "other"),
+        ("lane", 1),
+        ("depends_on", "other"),
+    ):
+        with pytest.raises(SystemExit, match=f"immutable {field}"):
+            queue.update("frozen", **{field: changed})
+
+
+def test_legacy_external_record_without_frozen_envelope_fails_closed():
+    job = build_job(
+        {"types": {"researchflow": {"command": ["true"]}}, "machines": {}},
+        job_id="old-external", job_type="researchflow",
+    )
+    job.pop("submission_provenance")
+    job["status"] = "running"
+
+    with pytest.raises(
+        experiment_declaration.ExperimentDeclarationError,
+        match="frozen submission_provenance",
+    ):
+        experiment_declaration.experiment_environment(job)
+
+
+def test_external_hash_is_reverified_before_protected_environment() -> None:
+    cfg = {
+        "types": {"researchflow": {"command": ["true"]}},
+        "machines": {},
+    }
+    job = build_job(
+        cfg, job_id="env-tamper", job_type="researchflow",
+        params={"jobscript": "/shared/original.sh"},
+    )
+    job["status"] = "running"
+    job["params"] = {"jobscript": "/shared/tampered.sh"}
+
+    with pytest.raises(
+        experiment_declaration.ExperimentDeclarationError,
+        match="external specification SHA-256 mismatch",
+    ):
+        experiment_declaration.experiment_environment(job)
+
+
+def test_external_git_target_is_immutable_submit_identity(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(
+        cfg,
+        job_id="rf-pinned",
+        job_type="researchflow",
+        params={"jobscript": "/shared/job.sh"},
+        git_sha=SHA_A.upper(),
+        git_repo="https://github.com/example/project.git",
+    )
+    assert job["requested_git_sha"] == SHA_A
+    assert job["git_repo"] == "https://github.com/example/project.git"
+    submission = experiment_declaration.submission_provenance(job)
+    assert submission["requested_git_sha"] == SHA_A
+    assert submission["git_repo"] == "https://github.com/example/project.git"
+
+    changed = build_job(
+        cfg,
+        job_id="rf-pinned",
+        job_type="researchflow",
+        params={"jobscript": "/shared/job.sh"},
+        git_sha="f" * 40,
+        git_repo="https://github.com/example/project.git",
+    )
+    submit_job(cfg, job)
+    with pytest.raises(ExternalJobError, match="different specification"):
+        submit_job(cfg, changed)
+
+
+@pytest.mark.parametrize("sha", ["main", "a" * 39, "g" * 40, ""])
+def test_external_git_target_requires_full_commit_sha(tmp_path: Path, sha: str) -> None:
+    with pytest.raises(ExternalJobError, match="full 40-character hexadecimal"):
+        build_job(
+            _cfg(tmp_path),
+            job_id="rf-bad-pin",
+            job_type="researchflow",
+            git_sha=sha,
+        )
 
 
 def test_exact_inspection_and_pending_cancel(tmp_path: Path) -> None:
@@ -161,3 +367,20 @@ def test_cli_submit_inspect_cancel_json_contract(tmp_path: Path, capsys: pytest.
     cli.main(["--config", cfg["_path"], "cancel-jobs", "--format", "json", "cli-job"])
     cancelled = _last_json(capsys.readouterr().out)
     assert cancelled["jobs"][0]["status"] == "cancelled"
+
+
+def test_cli_submit_transports_git_target(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    cfg = _cfg(tmp_path)
+    cli.main(
+        [
+            "--config", cfg["_path"], "submit", "--format", "json",
+            "--id", "cli-pinned", "--type", "researchflow",
+            "--git-sha", SHA_A,
+            "--git-repo", "https://github.com/example/project.git",
+        ]
+    )
+    _last_json(capsys.readouterr().out)
+    cli.main(["--config", cfg["_path"], "inspect", "--format", "json", "cli-pinned"])
+    inspected = _last_json(capsys.readouterr().out)
+    assert inspected["requested_git_sha"] == SHA_A
+    assert inspected["git_repo"] == "https://github.com/example/project.git"

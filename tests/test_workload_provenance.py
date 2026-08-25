@@ -118,6 +118,7 @@ def test_new_transport_variables_are_protected():
     assert declarations.JOB_ID_ENV in declarations.PROTECTED_ENV
     assert declarations.JOB_JSON_ENV in declarations.PROTECTED_ENV
     assert declarations.SUBMISSION_ENV in declarations.PROTECTED_ENV
+    assert declarations.SOURCE_PROOF_ENV in declarations.PROTECTED_ENV
 
 
 def test_claimed_legacy_direct_child_replaces_stale_protected_environment(monkeypatch):
@@ -165,6 +166,28 @@ def test_claimed_legacy_container_receives_trusted_job_environment(runtime):
         f"{declarations.JOB_JSON_ENV}="
         f"{json.dumps(job, sort_keys=True, separators=(',', ':'))}",
     }
+
+
+def test_absolute_container_runtime_receives_protected_environment():
+    job = {
+        "id": "absolute-runtime",
+        "type": "replay",
+        "machine": "main",
+        "status": "running",
+    }
+    argv, _, _ = runner.render_command(
+        {
+            "command": [
+                "/usr/bin/podman", "run", "--rm", "image:tag", "true",
+            ],
+        },
+        job,
+        "main",
+    )
+
+    assert argv[0] == "/usr/bin/podman"
+    assert any(token.startswith("ABLATOR_JOB_JSON=") for token in argv)
+    assert runner.container_name_from_argv(argv) == "splat_train_absolute-runtime"
 
 
 def test_claimed_legacy_kubernetes_trainer_receives_job_environment():

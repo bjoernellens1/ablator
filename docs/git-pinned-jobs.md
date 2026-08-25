@@ -32,19 +32,42 @@ or the structured form when the repository must be explicit:
 
 Only full 40-character commit SHAs are accepted. Ablator deliberately does not put a floating branch, tag, or PR ref into the queue. Resolve those to an immutable SHA before planning.
 
-The Git target can be declared at spec, `base`, or arm level. Nearest scope wins: arm > base > spec.
+The Git target can be declared at spec, `base`, or arm level. Nearest scope
+wins: arm > base > spec. A sequential (`parallel: false`) plan must resolve to
+the same repository and SHA for every dependency edge. Mixed revisions are
+rejected before enqueue, and the queue repeats that check for non-plan
+producers.
+
+Gradeable declarations always require a Git target. Operators can extend the
+same fail-closed rule to any configured type:
+
+```toml
+[types.replay]
+require_pinned_git = true
+```
 
 ## What the runner does
 
 For a pinned bare-metal job, the runner that actually claims the job:
 
 1. verifies that the requested commit is available, fetching it from `origin` when necessary;
-2. creates or reuses a detached, clean worktree under the machine's Ablator cache;
-3. rewrites the configured job `cwd` and source bind mount to that worktree;
-4. captures Git provenance from that worktree;
-5. requires `executed_git_sha == requested_git_sha` and a clean worktree before launching the workload.
+2. creates a unique detached worktree for that job attempt under the machine's
+   Ablator cache;
+3. recursively initializes every submodule at the commit recorded by the
+   superproject and verifies the complete tree is clean;
+4. rewrites the configured job `cwd` and source bind mount to that worktree;
+5. makes every container bind sourced at the checkout root or any descendant
+   read-only, rejecting symlink escapes (direct processes get
+   `PYTHONDONTWRITEBYTECODE=1`);
+6. records the resolved launch and source identity in an execution receipt;
+7. requires `executed_git_sha == requested_git_sha`, detached HEAD, and clean
+   source before launch and checks the same state again after the process exits.
 
-A mismatch or unprovable checkout fails before the expensive workload starts.
+A declared repository is also checked against the actual Git common directory
+and canonical origin. Finding the requested object in a different repository
+does not satisfy that check. A mismatch or unprovable checkout fails before the expensive workload starts.
+Post-run drift changes an otherwise successful exit into a failed job. Attempts
+never share a writable worktree, even when they request the same SHA.
 
 The operator's normal development checkout is not switched, rebased, reset, or pulled as part of pinned-job preparation.
 
@@ -79,11 +102,24 @@ command = [
 ]
 ```
 
-A pinned container job that does not expose its source checkout is rejected rather than pretending the pin controls code baked into an unrelated image.
+A pinned container job that does not expose its source checkout is rejected
+rather than pretending the pin controls code baked into an unrelated image.
+Writable datasets, scratch paths, and results must use separate mounts; the
+source bind itself is always rewritten with `ro`/`readonly`.
 
 ## Kubernetes
 
-Pinned Kubernetes jobs require `git_sync_repo_url` on the target machine configuration. The dispatcher validates the requested revision policy first; the pod's git-sync init container then fetches and checks out the exact requested SHA into the trainer workspace. A pinned k8s job is rejected when git-sync is not configured.
+Pinned Kubernetes jobs require `git_sync_repo_url` on the target machine
+configuration. The dispatcher validates the requested revision policy first;
+the pod's git-sync init container then fetches the exact requested SHA,
+initializes recursive submodules, verifies detached/clean state, and writes a
+source-proof JSON file into a second `emptyDir`. The trainer sees both the source
+and proof mounts read-only; a wrapper exports the proof as protected
+`ABLATOR_SOURCE_PROOF_JSON` before executing the configured argv. Final queue
+attestation binds the receipt hash to the actual command, working directory,
+mounts, pod, node, image reference, and image ID. A pinned k8s job is rejected
+when git-sync is not configured or any source, launch, or runtime identity is
+absent or inconsistent.
 
 ## Interaction with `urgent_fix_unsynced`
 
@@ -106,7 +142,22 @@ Pinned jobs persist source information in the queue as it becomes available:
 - `git_repo` when declared in the spec
 - `source_repo`
 - `source_checkout`
+- `source_lease`
 - `executed_git_sha`
+- `execution_receipt` (pre-launch source, runner, config, argv, runtime, image,
+  and normalized mount identity)
+- `execution_receipt_sha256`
+- `actual_launch` (the argv handed to the local runtime, including its hash)
+- `execution_attestation` (post-run receipt/config/runner/source/launch verdict
+  and, for Kubernetes, actual pod/node/image identity)
 - `source_prepare_error` on pre-launch preparation/provenance failure
 
-Operator-facing presentation of these fields is tracked separately so CLI/TUI output can remain compact while the queue retains the full values.
+The protected `ABLATOR_JOB_JSON` passed to the workload is rendered only after
+the pre-launch receipt is persisted. Receipts intentionally hash the rendered
+argv and merged type configuration rather than copying arbitrary environment
+values or credentials.
+
+These contracts are execution evidence, not proof that a scientific result is
+valid. Production rollout still requires idle runners, the merged release on
+every execution machine, and a fresh real-path pinned diagnostic whose queue,
+workload artifacts, and final attestation agree.

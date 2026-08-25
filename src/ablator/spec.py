@@ -38,6 +38,7 @@ import re
 from copy import deepcopy
 
 from . import experiment_declaration as declarations
+from . import source_checkout as sourcecheckout
 
 DEFAULT_MODEL_PATH_TEMPLATE = "output/scratch/{name}_{arm}"
 _FULL_GIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -151,6 +152,7 @@ def expand_spec(spec: dict,
     submission = _plan_submission(spec)
     jobs: list[dict] = []
     prev_id: str | None = None
+    prev_git_target: tuple[str, str | None] | None = None
     seen_ids: set[str] = set()
     for arm in spec["arms"]:
         arm_id = arm["id"]
@@ -176,14 +178,14 @@ def expand_spec(spec: dict,
             "lane": lane,
             "status": "pending",
         }
-        if submission is not None:
-            job["submission_provenance"] = deepcopy(submission)
         git_target = _resolve_git_target(spec, base, arm, name=name, arm_id=arm_id)
         if git_target is not None:
             git_sha, git_repo = git_target
             job["requested_git_sha"] = git_sha
             if git_repo is not None:
                 job["git_repo"] = git_repo
+        if submission is not None:
+            job["submission_provenance"] = deepcopy(submission)
         try:
             declaration = declarations.resolve_declaration(
                 spec.get("experiment"), arm.get("declaration"), arm_id
@@ -192,8 +194,21 @@ def expand_spec(spec: dict,
             raise SystemExit(f"spec '{name}' arm '{arm_id}': {exc}") from exc
         if declaration is not None:
             job.update(declarations.freeze_declaration(declaration))
+        if job.get("gradeability") == "GRADEABLE_DECLARED" and git_target is None:
+            raise SystemExit(
+                f"spec '{name}' arm '{arm_id}' requires an immutable Git target "
+                "because it is gradeable"
+            )
+        current_git_target = sourcecheckout.job_git_target(job)
+        if not parallel and prev_id is not None and current_git_target != prev_git_target:
+            raise SystemExit(
+                f"spec '{name}' dependency chain changes Git target between "
+                f"'{prev_id}' and '{job_id}': {prev_git_target!r} -> "
+                f"{current_git_target!r}"
+            )
         if not parallel and prev_id is not None:
             job["depends_on"] = prev_id
         jobs.append(job)
         prev_id = job_id
+        prev_git_target = current_git_target
     return jobs

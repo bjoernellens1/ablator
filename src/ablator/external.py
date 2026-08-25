@@ -15,13 +15,16 @@ import os
 import socket
 import subprocess
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from . import config as cfgmod
+from . import experiment_declaration as declarations
 from .identity import package_source_sha256
 from .queue import Queue
 from . import source_display as sourcedisplay
+from . import source_checkout as sourcecheckout
 
 SCHEMA = "ablator.external-job/v1"
 RESERVED_PARAMS = frozenset(
@@ -85,6 +88,8 @@ def build_job(
     metadata: dict[str, Any] | None = None,
     lane: int = 2,
     depends_on: str | None = None,
+    git_sha: str | None = None,
+    git_repo: str | None = None,
 ) -> dict[str, Any]:
     """Validate and normalize one external job into the existing queue schema."""
     job_id = _validate_id(job_id)
@@ -103,7 +108,7 @@ def build_job(
     if lane not in (1, 2, 3):
         raise ExternalJobError("lane must be 1, 2 or 3")
 
-    params = dict(params or {})
+    params = deepcopy(dict(params or {}))
     conflicts = sorted(RESERVED_PARAMS.intersection(params))
     if conflicts:
         raise ExternalJobError(
@@ -113,21 +118,17 @@ def build_job(
         if not isinstance(key, str) or not key or "{" in key or "}" in key:
             raise ExternalJobError(f"invalid external parameter name {key!r}")
 
-    metadata = dict(metadata or {})
-    immutable = {
-        "id": job_id,
-        "type": job_type,
-        "machine": machine,
-        "params": params,
-        "metadata": metadata,
-        "lane": lane,
-        "depends_on": depends_on,
-    }
-    return {
+    metadata = deepcopy(dict(metadata or {}))
+    try:
+        git_target = sourcecheckout.normalize_git_target(
+            git_sha, git_repo, where=f"external job {job_id!r}"
+        )
+    except sourcecheckout.SourcePreparationError as exc:
+        raise ExternalJobError(str(exc)) from exc
+    job = {
         "id": job_id,
         "external_id": job_id,
         "external_schema": SCHEMA,
-        "external_spec_sha256": _sha256_json(immutable),
         "external_metadata": metadata,
         "params": params,
         "machine": machine,
@@ -138,6 +139,27 @@ def build_job(
         "submitted_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "source": "external",
     }
+    if git_target is not None:
+        job["requested_git_sha"] = git_target[0]
+        if git_target[1] is not None:
+            job["git_repo"] = git_target[1]
+    submission, digest = declarations.freeze_external_submission(job)
+    job["external_spec_sha256"] = digest
+    job["submission_provenance"] = submission
+    return job
+
+
+def _requires_pinned_git(cfg: dict[str, Any], job: dict[str, Any]) -> bool:
+    """Conservatively resolve strict pin policy for an external job target."""
+    base = (cfg.get("types") or {}).get(job.get("type"), {}) or {}
+    if base.get("require_pinned_git"):
+        return True
+    overrides = base.get("machines") or {}
+    machine = job.get("machine", "any")
+    if machine == "any":
+        return any(bool((value or {}).get("require_pinned_git"))
+                   for value in overrides.values())
+    return bool((overrides.get(machine) or {}).get("require_pinned_git"))
 
 
 def submit_job(cfg: dict[str, Any], job: dict[str, Any]) -> tuple[dict[str, Any], bool]:
@@ -149,18 +171,14 @@ def submit_job(cfg: dict[str, Any], job: dict[str, Any]) -> tuple[dict[str, Any]
     meaning of a scheduler job already known to Snakemake or another caller.
     """
     queue = Queue(cfgmod.queue_path(cfg))
-    with queue._open_locked() as handle:
-        jobs = queue._load(handle)
-        existing = next((item for item in jobs if item.get("id") == job["id"]), None)
-        if existing is not None:
-            if existing.get("external_spec_sha256") == job.get("external_spec_sha256"):
-                return existing, False
-            raise ExternalJobError(
-                f"job id {job['id']!r} already exists with a different specification"
-            )
-        jobs.append(job)
-        queue._save(handle, jobs)
-    return job, True
+    try:
+        return queue.enqueue_idempotent(
+            job,
+            fingerprint_field="external_spec_sha256",
+            require_pinned_git=_requires_pinned_git(cfg, job),
+        )
+    except SystemExit as exc:
+        raise ExternalJobError(str(exc)) from exc
 
 
 def inspect_job(cfg: dict[str, Any], job_id: str) -> dict[str, Any]:

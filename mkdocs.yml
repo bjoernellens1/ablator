@@ -45,6 +45,8 @@ nav:
   - Spec reference: spec-reference.md
   - Config reference: config-reference.md
   - Queue semantics: queue-semantics.md
+  - Git-pinned jobs: git-pinned-jobs.md
+  - Immutable worktree cache: worktree-cache.md
   - External scheduler API: external-scheduler.md
   - Workload launch provenance: workload-provenance.md
   - Multi-machine setup: multi-machine.md

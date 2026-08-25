@@ -1,6 +1,9 @@
 # Immutable Git worktree cache
 
-SHA-pinned jobs materialize detached Git worktrees on the machine that actually executes the job. Repeated jobs for the same repository and SHA reuse the same verified clean worktree rather than creating a fresh clone every time.
+SHA-pinned jobs materialize detached Git worktrees on the machine that actually
+executes the job. Git object storage is shared, but every job attempt gets a
+unique execution worktree. Concurrent jobs and retries therefore never share a
+writable filesystem, even when they request the same repository and SHA.
 
 ## Cache location
 
@@ -26,7 +29,12 @@ git_worktree_root = "/home/bjoern1/.cache/ablator/worktrees"
 
 The process environment variable `ABLATOR_GIT_WORKTREE_ROOT` is also supported when no config override is present.
 
-Each materialized checkout has a sidecar metadata file outside the worktree. It records the requested SHA, repository identity, owning repository path and last-use timestamp. Keeping the sidecar outside the worktree ensures cache metadata never makes the immutable checkout dirty.
+Each materialized checkout has an adjacent sidecar metadata file outside the
+worktree. It records the requested SHA, repository identity, owning repository
+path, unique lease ID, repository lock, active state, and timestamps. The lease
+becomes inactive only after post-run source attestation. Keeping the sidecar
+outside the worktree ensures cache metadata never makes the immutable checkout
+dirty.
 
 ## Garbage collection
 
@@ -60,11 +68,33 @@ ablator --config ~/.config/ablator/config.toml gc --max-age-days 7
 
 ## Safety rules
 
-- A worktree referenced by a currently `running` queue job is protected regardless of age.
+- An active sidecar lease is protected regardless of age or queue-update lag.
+- A worktree referenced by a currently `running` queue job is also protected;
+  this preserves compatibility with older sidecars.
 - Dry-run performs the same classification as a real cleanup but does not mutate anything.
-- Managed worktrees are removed with `git worktree remove --force` followed by `git worktree prune`, so the owning repository does not retain stale worktree administration entries.
-- An orphaned cache whose owning repository has already disappeared can be removed directly because no Git administration tree remains to update.
-- Cleanup errors are reported and make `ablator gc` exit non-zero; they are not silently treated as successful removal.
-- Reusing a cached checkout remains subject to the normal pinning checks: exact requested HEAD and a clean worktree are required before execution.
+- Cleanup accepts only an adjacent sidecar and checkout whose resolved paths
+  are strictly below the configured cache root. Invalid records are reported;
+  their claimed paths are never removed.
+- Materialization, lease release, and cleanup share a lock derived from the
+  repository's actual Git common directory. GC derives the checkout's common
+  directory itself and cross-checks the sidecar's repository, common-directory,
+  repository-identity, and lock claims. A forged or unprovable claim is retained
+  and reported without invoking Git or filesystem removal against that path.
+- Managed worktrees are removed with `git worktree remove --force` followed by
+  a successful `git worktree prune`, so the owning repository does not retain
+  stale administration entries.
+- A checkout whose owning repository/common directory cannot be proven is
+  retained as evidence; it is never treated as a safely removable orphan.
+- Cleanup/prune errors are reported and make `ablator gc` exit non-zero. The
+  sidecar is retained as evidence instead of treating a partial cleanup as
+  success.
+- A runner crash can leave an active lease. GC deliberately retains it; an
+  operator must reconcile that orphan explicitly rather than weakening the
+  active-lease safety rule with an age-only deletion.
+- Failed materialization keeps an inactive sidecar containing the requested SHA,
+  checkout path, repository identity, failure state, and sanitized error. The
+  partial checkout is retained for diagnosis and later trusted GC rather than
+  being deleted during exception cleanup.
 
-The cache is an optimization only. It does not weaken the requested-vs-executed SHA contract.
+The cache shares Git objects only. It does not weaken the requested-vs-executed
+SHA contract or remove job result directories.

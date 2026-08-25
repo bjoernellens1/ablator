@@ -19,6 +19,7 @@ import time
 from typing import Callable
 
 from . import experiment_declaration as declarations
+from . import source_checkout as sourcecheckout
 
 DEFAULT_FLOCK_TIMEOUT_S = 60.0
 
@@ -225,23 +226,114 @@ class Queue:
         with open(self.path) as f:
             return [json.loads(l) for l in f if l.strip()]
 
+    @staticmethod
+    def _validate_enqueue_job(job: dict, *, require_pinned_git: bool = False) -> None:
+        try:
+            declarations.validate_frozen_job(job)
+            declarations.validate_external_submission(job)
+            sourcecheckout.job_git_target(
+                job,
+                required=(
+                    require_pinned_git
+                    or job.get("gradeability") == "GRADEABLE_DECLARED"
+                ),
+            )
+        except (
+            declarations.ExperimentDeclarationError,
+            sourcecheckout.SourcePreparationError,
+        ) as exc:
+            raise SystemExit(
+                f"refusing to enqueue job {job.get('id')!r}: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _validate_dependency_edge(
+        job: dict, by_id: dict[object, dict], *, require_dependency: bool = False,
+    ) -> None:
+        dependency_id = job.get("depends_on")
+        if not dependency_id:
+            return
+        dependency = by_id.get(dependency_id)
+        if dependency is None:
+            if require_dependency:
+                raise SystemExit(
+                    f"refusing to enqueue job {job.get('id')!r}: "
+                    f"dependency {dependency_id!r} is not in the queue"
+                )
+            return
+        try:
+            dependency_target = sourcecheckout.job_git_target(dependency)
+            job_target = sourcecheckout.job_git_target(job)
+        except sourcecheckout.SourcePreparationError as exc:
+            raise SystemExit(
+                f"refusing to enqueue job {job.get('id')!r}: {exc}"
+            ) from exc
+        if dependency_target != job_target:
+            raise SystemExit(
+                "refusing to enqueue: dependency chain changes Git target "
+                f"between {dependency_id!r} and {job.get('id')!r}: "
+                f"{dependency_target!r} -> {job_target!r}"
+            )
+
     def append(self, new_jobs: list[dict]) -> None:
         """Atomically enqueue jobs; refuses duplicate ids."""
+        # _open_locked() creates the queue file. Reject malformed input before
+        # that observable side effect, then repeat validation under the lock so
+        # the transaction remains authoritative if caller-owned data changes.
         for job in new_jobs:
-            try:
-                declarations.validate_frozen_job(job)
-            except declarations.ExperimentDeclarationError as exc:
-                raise SystemExit(
-                    f"refusing to enqueue job {job.get('id')!r}: {exc}"
-                ) from exc
+            self._validate_enqueue_job(job)
         with self._open_locked() as f:
             jobs = self._load(f)
+            for job in new_jobs:
+                self._validate_enqueue_job(job)
             existing = {j.get("id") for j in jobs}
             dupes = [j["id"] for j in new_jobs if j["id"] in existing]
             if dupes:
                 raise SystemExit(f"refusing to enqueue: duplicate job ids {dupes}")
+            combined = [*jobs, *new_jobs]
+            by_id = {job.get("id"): job for job in combined}
+            for job in new_jobs:
+                self._validate_dependency_edge(job, by_id)
             jobs.extend(new_jobs)
             self._save(f, jobs)
+
+    def enqueue_idempotent(
+        self,
+        job: dict,
+        *,
+        fingerprint_field: str,
+        require_pinned_git: bool = False,
+    ) -> tuple[dict, bool]:
+        """Validate and idempotently enqueue one job in one locked transaction.
+
+        External producers use this public API instead of reaching into queue
+        lock/file internals. Validation, duplicate comparison, dependency-pin
+        checks, and persistence all observe the same locked queue snapshot.
+        """
+        self._validate_enqueue_job(job, require_pinned_git=require_pinned_git)
+        with self._open_locked() as handle:
+            jobs = self._load(handle)
+            self._validate_enqueue_job(
+                job, require_pinned_git=require_pinned_git
+            )
+            existing = next(
+                (item for item in jobs if item.get("id") == job.get("id")), None
+            )
+            if existing is not None:
+                self._validate_enqueue_job(
+                    existing, require_pinned_git=require_pinned_git
+                )
+                if existing.get(fingerprint_field) == job.get(fingerprint_field):
+                    return existing, False
+                raise SystemExit(
+                    f"job id {job.get('id')!r} already exists with a different specification"
+                )
+            by_id = {item.get("id"): item for item in jobs}
+            by_id[job.get("id")] = job
+            self._validate_dependency_edge(job, by_id, require_dependency=True)
+            jobs.append(job)
+            self._save(handle, jobs)
+            return job, True
 
     def claim_next(self, machine: str,
                    can_run: Callable[[dict], bool] | None = None,
