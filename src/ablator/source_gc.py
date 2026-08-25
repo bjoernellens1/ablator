@@ -17,6 +17,9 @@ class GCEntry:
     checkout: str
     sidecar: str
     source_repo_path: str | None
+    lock_path: str
+    active: bool
+    lease_id: str | None
     last_used_at: float
 
 
@@ -29,14 +32,61 @@ class GCResult:
     errors: tuple[str, ...]
 
 
-def _read_sidecar(path: Path) -> GCEntry | None:
+def _inside(path: Path, root: Path) -> bool:
+    """Return whether *path* resolves strictly below the managed root."""
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return path != root
+
+
+def _read_sidecar(path: Path, root: Path) -> GCEntry:
+    """Parse and validate one sidecar before trusting any filesystem path."""
+    resolved_sidecar = path.resolve(strict=False)
+    if not _inside(resolved_sidecar, root):
+        raise ValueError(f"{path}: sidecar is outside managed root {root}")
     try:
         data = json.loads(path.read_text())
-    except (OSError, ValueError, TypeError):
-        return None
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"{path}: could not read sidecar: {exc}") from exc
     checkout = data.get("checkout")
     if not isinstance(checkout, str) or not checkout:
-        return None
+        raise ValueError(f"{path}: sidecar has no checkout path")
+    resolved_checkout = Path(checkout).expanduser().resolve(strict=False)
+    if not _inside(resolved_checkout, root):
+        raise ValueError(
+            f"{path}: checkout {resolved_checkout} is outside managed root {root}"
+        )
+    expected_sidecar = Path(f"{resolved_checkout}.ablator.json").resolve(strict=False)
+    if resolved_sidecar != expected_sidecar:
+        raise ValueError(
+            f"{path}: sidecar is not adjacent to claimed checkout {resolved_checkout}"
+        )
+
+    active = data.get("active", False)
+    if not isinstance(active, bool):
+        raise ValueError(f"{path}: active lease marker must be boolean")
+    lease_id = data.get("lease_id")
+    if lease_id is not None and (not isinstance(lease_id, str) or not lease_id):
+        raise ValueError(f"{path}: lease_id must be a non-empty string")
+
+    lock_value = data.get("lock_path")
+    if lock_value is None:
+        if active or data.get("schema") == "ablator.source-lease/v1":
+            raise ValueError(f"{path}: active source lease has no repository lock")
+        # Historical inactive cache records predate per-repository leases. A
+        # root-local legacy lock is sufficient because they cannot reactivate.
+        lock_path = root / "_locks" / "legacy-gc.lock"
+    elif not isinstance(lock_value, str) or not lock_value:
+        raise ValueError(f"{path}: lock_path must be a non-empty string")
+    else:
+        lock_path = Path(lock_value).expanduser().resolve(strict=False)
+        if not _inside(lock_path, root):
+            raise ValueError(
+                f"{path}: repository lock {lock_path} is outside managed root {root}"
+            )
+
     last = data.get("last_used_at")
     try:
         last_used_at = float(last)
@@ -47,23 +97,33 @@ def _read_sidecar(path: Path) -> GCEntry | None:
             last_used_at = 0.0
     repo = data.get("source_repo_path")
     return GCEntry(
-        checkout=os.path.abspath(os.path.expanduser(checkout)),
-        sidecar=str(path),
+        checkout=str(resolved_checkout),
+        sidecar=str(resolved_sidecar),
         source_repo_path=(str(repo) if repo else None),
+        lock_path=str(lock_path),
+        active=active,
+        lease_id=lease_id,
         last_used_at=last_used_at,
     )
 
 
+def _scan_entries(root: str) -> tuple[list[GCEntry], list[str]]:
+    path = Path(os.path.abspath(os.path.expanduser(root))).resolve(strict=False)
+    if not path.exists():
+        return [], []
+    entries: list[GCEntry] = []
+    errors: list[str] = []
+    for sidecar in path.rglob("*.ablator.json"):
+        try:
+            entries.append(_read_sidecar(sidecar, path))
+        except ValueError as exc:
+            errors.append(str(exc))
+    return entries, errors
+
+
 def scan_entries(root: str) -> list[GCEntry]:
     """Read valid Ablator worktree sidecars under one cache root."""
-    path = Path(os.path.abspath(os.path.expanduser(root)))
-    if not path.exists():
-        return []
-    entries: list[GCEntry] = []
-    for sidecar in path.rglob("*.ablator.json"):
-        item = _read_sidecar(sidecar)
-        if item is not None:
-            entries.append(item)
+    entries, _errors = _scan_entries(root)
     return entries
 
 
@@ -75,7 +135,7 @@ def active_checkouts(jobs: list[dict]) -> set[str]:
             continue
         checkout = job.get("source_checkout")
         if isinstance(checkout, str) and checkout:
-            out.add(os.path.abspath(os.path.expanduser(checkout)))
+            out.add(str(Path(checkout).expanduser().resolve(strict=False)))
     return out
 
 
@@ -86,37 +146,57 @@ def _run_git(repo: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _remove_entry(entry: GCEntry) -> str | None:
-    """Remove one worktree and its Git metadata. Return an error string."""
-    checkout = entry.checkout
-    repo = entry.source_repo_path
+def _remove_entry(root: Path, entry: GCEntry) -> tuple[str, str | None]:
+    """Remove one inactive worktree under its repository lease lock.
 
-    if repo and os.path.isdir(repo):
-        # `git worktree remove` removes both files and the owning repository's
-        # worktree administration entry. It also handles a checkout that has
-        # already disappeared less cleanly than `rm -rf`, so prune afterwards.
-        if os.path.exists(checkout):
-            result = _run_git(repo, "worktree", "remove", "--force", checkout)
-            if result.returncode != 0:
-                detail = (result.stderr or result.stdout).strip()
-                return f"{checkout}: git worktree remove failed: {detail[:400]}"
-        _run_git(repo, "worktree", "prune")
-    elif os.path.exists(checkout):
-        # The owning repository can itself have been removed. In that orphan
-        # case there is no Git administration directory left to protect; clear
-        # the now-unmanageable cache tree and its sidecar.
-        try:
-            shutil.rmtree(checkout)
-        except OSError as exc:
-            return f"{checkout}: orphan removal failed: {exc}"
-
+    Returns ``(outcome, error)`` where outcome is ``removed``, ``protected``,
+    or ``error``. The sidecar is deliberately retained until both worktree
+    removal and Git administrative pruning succeed.
+    """
     try:
-        os.remove(entry.sidecar)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        return f"{checkout}: removed checkout but not sidecar: {exc}"
-    return None
+        with source_checkout._locked(entry.lock_path):
+            try:
+                current = _read_sidecar(Path(entry.sidecar), root)
+            except ValueError as exc:
+                return "error", str(exc)
+            except FileNotFoundError:
+                return "error", f"{entry.checkout}: source lease disappeared during cleanup"
+
+            if current.checkout != entry.checkout or current.lease_id != entry.lease_id:
+                return "error", f"{entry.checkout}: source lease identity changed during cleanup"
+            if current.active:
+                return "protected", None
+
+            checkout = current.checkout
+            repo = current.source_repo_path
+            if repo and os.path.isdir(repo):
+                if os.path.exists(checkout):
+                    result = _run_git(repo, "worktree", "remove", "--force", checkout)
+                    if result.returncode != 0:
+                        detail = (result.stderr or result.stdout).strip()
+                        return (
+                            "error",
+                            f"{checkout}: git worktree remove failed: {detail[:400]}",
+                        )
+                pruned = _run_git(repo, "worktree", "prune")
+                if pruned.returncode != 0:
+                    detail = (pruned.stderr or pruned.stdout).strip()
+                    return "error", f"{checkout}: git worktree prune failed: {detail[:400]}"
+            elif os.path.exists(checkout):
+                try:
+                    shutil.rmtree(checkout)
+                except OSError as exc:
+                    return "error", f"{checkout}: orphan removal failed: {exc}"
+
+            try:
+                os.remove(current.sidecar)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                return "error", f"{checkout}: removed checkout but not sidecar: {exc}"
+            return "removed", None
+    except source_checkout.SourcePreparationError as exc:
+        return "error", f"{entry.checkout}: could not acquire cleanup lease: {exc}"
 
 
 def gc_worktrees(
@@ -135,6 +215,7 @@ def gc_worktrees(
     threshold. Dry-run performs the same classification without mutation.
     """
     root = source_checkout.cache_root(cfg, machine)
+    resolved_root = Path(root).resolve(strict=False)
     if max_age_days is None:
         configured = (cfg.get("git") or {}).get("gc_max_age_days", 30)
         try:
@@ -151,10 +232,10 @@ def gc_worktrees(
     candidates: list[str] = []
     protected: list[str] = []
     retained: list[str] = []
-    errors: list[str] = []
+    entries, errors = _scan_entries(root)
 
-    for entry in scan_entries(root):
-        if entry.checkout in active:
+    for entry in entries:
+        if entry.active or entry.checkout in active:
             protected.append(entry.checkout)
             continue
         if entry.last_used_at > cutoff:
@@ -163,8 +244,10 @@ def gc_worktrees(
         candidates.append(entry.checkout)
         if dry_run:
             continue
-        error = _remove_entry(entry)
-        if error:
+        outcome, error = _remove_entry(resolved_root, entry)
+        if outcome == "protected":
+            protected.append(entry.checkout)
+        elif error:
             errors.append(error)
         else:
             removed.append(entry.checkout)

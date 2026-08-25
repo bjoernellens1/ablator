@@ -1,9 +1,11 @@
 """Concurrency contracts for immutable source preparation."""
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 import subprocess
 
 from ablator import source_checkout as source
+from ablator import source_gc
 
 
 def _run(*args, cwd=None):
@@ -58,3 +60,32 @@ def test_parallel_same_and_different_sha_materialization_is_per_job(tmp_path):
     assert [source.capture_checkout_state(path)["commit"] for path in paths] == [
         sha for _job_id, sha in jobs
     ]
+
+
+def test_gc_racing_materialization_cannot_remove_active_leases(tmp_path):
+    repo, shas = _repo(tmp_path)
+    cfg = {
+        "git": {"worktree_root": str(tmp_path / "cache")},
+        "machines": {"main": {}},
+    }
+    jobs = [(f"job-{index}", shas[index % 2]) for index in range(12)]
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(_prepare, cfg, repo, item) for item in jobs]
+        gc_futures = [
+            pool.submit(
+                source_gc.gc_worktrees,
+                cfg,
+                "main",
+                [],
+                max_age_days=0,
+                now=10 ** 12,
+            )
+            for _ in range(4)
+        ]
+        prepared = [future.result() for future in futures]
+        results = [future.result() for future in gc_futures]
+
+    assert all(item.checkout_path and os.path.isdir(item.checkout_path)
+               for item in prepared)
+    assert all(result.removed == () for result in results)
