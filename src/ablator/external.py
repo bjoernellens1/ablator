@@ -21,6 +21,7 @@ from typing import Any
 from . import config as cfgmod
 from .identity import package_source_sha256
 from .queue import Queue
+from . import source_display as sourcedisplay
 
 SCHEMA = "ablator.external-job/v1"
 RESERVED_PARAMS = frozenset(
@@ -193,6 +194,7 @@ def inspect_job(cfg: dict[str, Any], job_id: str) -> dict[str, Any]:
         "error_evidence": record.get("error_evidence"),
         "suggested_action": record.get("suggested_action"),
         "health": record.get("health"),
+        **sourcedisplay.inspect_fields(record),
         "terminal": str(record.get("status")) in TERMINAL_STATES,
     }
 

@@ -5,10 +5,11 @@ this is the unit-testable half of the queue/runs screens.
 from __future__ import annotations
 
 from .. import config as cfgmod
+from .. import source_display as sourcedisplay
 from ..queue import Queue, job_lane
 
 
-COLUMNS = ("id", "lane", "status", "machine", "claimed_by", "elapsed")
+COLUMNS = ("id", "lane", "status", "machine", "claimed_by", "elapsed", "git")
 
 
 def _elapsed(job: dict) -> str:
@@ -38,7 +39,12 @@ def job_row(job: dict) -> tuple:
         job.get("machine", ""),
         job.get("claimed_by") or "-",
         _elapsed(job),
+        sourcedisplay.source_state(job),
     )
+
+
+def source_detail(job: dict) -> str:
+    return sourcedisplay.source_detail(job)
 
 
 def queue_rows(jobs: list[dict], name: str | None = None) -> list[tuple]:
