@@ -31,6 +31,7 @@ from . import experiment_declaration as declarations
 from . import health as healthmod
 from . import provenance as provmod
 from . import resources
+from . import source_checkout as sourcecheckout
 from . import self_check as selfcheckmod
 from .pause_revalidation import revalidate_pause
 from .queue import Queue, is_paused, pause_flag_path, write_pause_flag
@@ -1135,7 +1136,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
         volumes.append({"name": "repo-src", "emptyDir": {}})
         trainer_volume_mounts.append(
             {"name": "repo-src", "mountPath": workspace_path})
-        sha = local_commit or "HEAD"
+        sha = job.get("requested_git_sha") or local_commit or "HEAD"
         # git_sync_http_secret_name takes precedence if both are somehow set --
         # rewrite the remote URL to embed the token as an x-access-token
         # credential, rather than relying on GIT_SSH_COMMAND (which needs an
@@ -1517,13 +1518,36 @@ def run_job(cfg: dict, job: dict, machine: str,
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
     try:
         tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+        prepared_source = sourcecheckout.prepare_job_source(cfg, job, machine, tcfg)
+        tcfg = prepared_source.type_config
+        if prepared_source.checkout_path:
+            job = dict(job)
+            job["_prepared_repo_cwd"] = prepared_source.checkout_path
+            if q is not None:
+                q.update(
+                    job["id"],
+                    source_checkout=prepared_source.checkout_path,
+                    source_repo=prepared_source.source_repo,
+                    requested_git_sha=prepared_source.requested_git_sha,
+                )
         argv, env, cwd = render_command(tcfg, job, machine)
-    except (KeyError, TemplateError) as e:
+    except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:
         print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
+        if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):
+            q.update(job["id"], source_prepare_error=str(e))
         return "failed", None
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} (log {log_path})",
           flush=True)
     prov_state = capture_and_record_provenance(cfg, job, machine, cwd or os.getcwd(), q)
+    try:
+        executed_git_sha = sourcecheckout.verify_executed_provenance(job, prov_state)
+    except sourcecheckout.SourcePreparationError as e:
+        print(f"[ablator] {job['id']} source provenance rejected before launch: {e}", flush=True)
+        if q is not None:
+            q.update(job["id"], source_prepare_error=str(e))
+        return "failed", None
+    if executed_git_sha is not None and q is not None:
+        q.update(job["id"], executed_git_sha=executed_git_sha)
     check_checkout_drift(cfg, job, machine, prov_state, q)
     container_name = container_name_from_argv(argv)
     if container_name:
