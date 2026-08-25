@@ -24,6 +24,7 @@ import signal
 import subprocess
 import threading
 import time
+from copy import deepcopy
 
 from . import config as cfgmod
 from . import error as errormod
@@ -1145,22 +1146,29 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
     git_sync_repo_url = mcfg.get("git_sync_repo_url")
     git_sync_enabled = bool(git_sync_repo_url)
     init_containers: list[dict] = []
+    trainer_command = argv
     if git_sync_enabled:
         workspace_path = cwd or mcfg.get("default_workdir", "/workspace")
         volumes.append({"name": "repo-src", "emptyDir": {}})
         trainer_volume_mounts.append(
             {"name": "repo-src", "mountPath": workspace_path, "readOnly": True})
         sha = job.get("requested_git_sha") or local_commit or "HEAD"
-        # git_sync_http_secret_name takes precedence if both are somehow set --
-        # rewrite the remote URL to embed the token as an x-access-token
-        # credential, rather than relying on GIT_SSH_COMMAND (which needs an
-        # ssh:// or git@ URL, not the https:// one this and git_sync_repo_url's
-        # existing SSH path both otherwise assume unchanged).
         git_sync_http_secret_name = mcfg.get("git_sync_http_secret_name")
-        remote_url_expr = git_sync_repo_url
+        remote_url_quoted = '"' + str(git_sync_repo_url).translate(str.maketrans({
+            "\\": "\\\\", '"': '\\"', "$": "\\$", "`": "\\`",
+        })) + '"'
+        fetch_command = f"git fetch --depth 1 origin {shlex.quote(sha)}; "
         if git_sync_http_secret_name:
-            stripped = git_sync_repo_url.removeprefix("https://")
-            remote_url_expr = f"https://x-access-token:$(cat /etc/git-creds/token)@{stripped}"
+            # Supply HTTPS auth to this fetch only. Embedding the token in the
+            # remote URL persists it in .git/config, which the trainer sees via
+            # repo-src even though the secret volume itself is init-only.
+            fetch_command = (
+                "auth_header=\"Authorization: Basic $(printf 'x-access-token:%s' "
+                "\"$(cat /etc/git-creds/token)\" | base64 | tr -d '\\n')\"; "
+                f"git -c http.extraHeader=\"$auth_header\" fetch --depth 1 origin "
+                f"{shlex.quote(sha)}; "
+                "unset auth_header; "
+            )
         # git init + fetch-by-sha + checkout (rather than `git clone
         # --branch`) is the only way to pin an EXACT commit rather than a
         # moving branch head -- the whole point of this feature is running
@@ -1169,10 +1177,10 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
         # actually schedules the pod.
         clone_script = (
             "set -eu; "
-            f"git init -q {workspace_path}; "
-            f"cd {workspace_path}; "
-            f"git remote add origin \"{remote_url_expr}\"; "
-            f"git fetch --depth 1 origin {sha}; "
+            f"git init -q {shlex.quote(workspace_path)}; "
+            f"cd {shlex.quote(workspace_path)}; "
+            f"git remote add origin {remote_url_quoted}; "
+            f"{fetch_command}"
             "git checkout -q --detach FETCH_HEAD; "
             "git submodule sync --recursive; "
             "git -c protocol.file.allow=always submodule update --init --recursive --checkout; "
@@ -1181,10 +1189,28 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
             "git submodule foreach --quiet --recursive "
             "'test -z \"$(git status --porcelain --untracked-files=all)\"'; "
             "submodules_sha256=$(git submodule status --recursive | sha256sum | cut -d' ' -f1); "
+            + (
+                "test ! -f .git/config || "
+                "! grep -F \"$(cat /etc/git-creds/token)\" .git/config; "
+                "! git config --get-regexp '^http\\..*extraheader$'; "
+                if git_sync_http_secret_name else ""
+            )
+            + (
+                "executed_sha=$(git rev-parse HEAD); "
+                "printf '{\"schema\":\"ablator.source-proof/v1\","
+                f"\"requested_git_sha\":\"{sha}\","
+                "\"executed_git_sha\":\"%s\",\"ref\":\"DETACHED\","
+                "\"dirty\":false,\"submodules_sha256\":\"%s\"}' "
+                "\"$executed_sha\" \"$submodules_sha256\" "
+                "> /var/run/ablator-proof/source-proof.json; "
+                if job.get("requested_git_sha") else ""
+            )
+            + (
             f"printf 'ABLATOR_SOURCE_V1 requested={sha} executed=%s "
             "ref=DETACHED dirty=false submodules_sha256=%s\\n' "
             "\"$(git rev-parse HEAD)\" \"$submodules_sha256\" > /dev/termination-log; "
             f"echo \"git-sync: checked out {sha} from {git_sync_repo_url}\""
+            )
         )
         init_container: dict = {
             "name": "git-sync",
@@ -1230,6 +1256,23 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
             })
             init_container["volumeMounts"].append(
                 {"name": "git-creds", "mountPath": "/etc/git-creds", "readOnly": True})
+        if job.get("requested_git_sha"):
+            volumes.append({"name": "ablator-proof", "emptyDir": {}})
+            init_container["volumeMounts"].append({
+                "name": "ablator-proof", "mountPath": "/var/run/ablator-proof",
+            })
+            trainer_volume_mounts.append({
+                "name": "ablator-proof", "mountPath": "/var/run/ablator-proof",
+                "readOnly": True,
+            })
+            proof_path = "/var/run/ablator-proof/source-proof.json"
+            trainer_command = [
+                "sh", "-c",
+                f"set -eu; test -s {proof_path}; "
+                f"export {declarations.SOURCE_PROOF_ENV}=\"$(cat {proof_path})\"; "
+                'exec "$@"',
+                "ablator-source-proof", *argv,
+            ]
         init_containers.append(init_container)
     return {
         "apiVersion": "batch/v1",
@@ -1301,7 +1344,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
                         # ignored by a node that had cached the broken prior build.
                         "imagePullPolicy": "Always",
                         "workingDir": cwd or mcfg.get("default_workdir", "/workspace"),
-                        "command": argv,
+                        "command": trainer_command,
                         **({"env": trainer_env} if trainer_env else {}),
                         "resources": {
                             "requests": {
@@ -1352,16 +1395,40 @@ def _log_stall_tracker(stall_after_s: float):
     return check
 
 
-def _k8s_execution_attestation(pods_payload: dict, expected_sha: str) -> dict:
-    """Validate init-container source proof and capture actual pod identity."""
+def _k8s_execution_attestation(
+    pods_payload: dict,
+    expected_sha: str,
+    expected_image: str,
+    receipt: dict,
+    expected_receipt_sha256: str,
+) -> dict:
+    """Validate source, receipt, and actual Kubernetes runtime identity."""
+    reasons: list[str] = []
+    actual_receipt_sha256 = receiptmod.receipt_sha256(receipt)
+    if (not expected_receipt_sha256
+            or actual_receipt_sha256 != expected_receipt_sha256):
+        reasons.append("receipt SHA-256 mismatch")
+    receipt_launch = dict(receipt.get("launch") or {})
+    if receipt_launch.get("runtime") != "kubernetes":
+        reasons.append("receipt runtime is not kubernetes")
+    if receipt_launch.get("image") != expected_image:
+        reasons.append("receipt image differs from policy")
+
     items = pods_payload.get("items") or []
     if not items:
         return {
             "schema": "ablator.execution-attestation/v1",
             "verdict": "REJECTED",
+            "receipt_sha256": expected_receipt_sha256 or None,
             "source": None,
             "runtime": None,
-            "error": "k8s source attestation unavailable: no job pod found",
+            "binding": {
+                "receipt": deepcopy(receipt),
+                "actual_launch": None,
+            },
+            "error": "; ".join(
+                [*reasons, "k8s source attestation unavailable: no job pod found"]
+            ),
         }
     pod = items[0]
     status = pod.get("status") or {}
@@ -1385,7 +1452,6 @@ def _k8s_execution_attestation(pods_payload: dict, expected_sha: str) -> dict:
         "dirty": ({"true": True, "false": False}.get(fields.get("dirty", ""))),
         "submodules_sha256": fields.get("submodules_sha256"),
     }
-    reasons: list[str] = []
     if not fields:
         reasons.append("git-sync termination message is missing or malformed")
     if source["requested_git_sha"] != expected_sha:
@@ -1403,23 +1469,77 @@ def _k8s_execution_attestation(pods_payload: dict, expected_sha: str) -> dict:
     trainer = next(
         (item for item in trainer_statuses if item.get("name") == "trainer"), {}
     )
+    pod_spec = pod.get("spec") or {}
+    trainer_specs = pod_spec.get("containers") or []
+    trainer_spec = next(
+        (item for item in trainer_specs if item.get("name") == "trainer"), {}
+    )
+    actual_mounts = [
+        {
+            "name": item.get("name"),
+            "target": item.get("mountPath"),
+            "read_only": bool(item.get("readOnly", False)),
+        }
+        for item in trainer_spec.get("volumeMounts") or []
+    ]
     runtime = {
         "pod": (pod.get("metadata") or {}).get("name"),
-        "node": (pod.get("spec") or {}).get("nodeName"),
+        "node": pod_spec.get("nodeName"),
         "image": trainer.get("image"),
         "image_id": trainer.get("imageID"),
     }
+    actual_launch = {
+        **runtime,
+        "runtime": "kubernetes",
+        "cwd": trainer_spec.get("workingDir"),
+        "mounts": actual_mounts,
+        "argv_sha256": receiptmod.argv_sha256(trainer_spec.get("command") or []),
+    }
+    if not runtime["pod"]:
+        reasons.append("pod identity is missing")
+    if not runtime["node"]:
+        reasons.append("node identity is missing")
+    if not runtime["image"]:
+        reasons.append("image identity is missing")
+    elif runtime["image"] != expected_image:
+        reasons.append("actual image differs from policy")
+    if not runtime["image_id"]:
+        reasons.append("image ID is missing")
+    if not trainer_spec:
+        reasons.append("actual trainer launch form is missing")
+    else:
+        if trainer_spec.get("image") != expected_image:
+            reasons.append("pod command image differs from policy")
+        if actual_launch["cwd"] != receipt_launch.get("cwd"):
+            reasons.append("actual working directory differs from receipt")
+        if actual_launch["mounts"] != receipt_launch.get("mounts"):
+            reasons.append("actual mounts differ from receipt")
+        expected_actual_argv = receipt_launch.get("actual_argv_sha256")
+        if not expected_actual_argv:
+            reasons.append("receipt actual command fingerprint is missing")
+        elif actual_launch["argv_sha256"] != expected_actual_argv:
+            reasons.append("actual command differs from receipt")
     return {
         "schema": "ablator.execution-attestation/v1",
         "verdict": "REJECTED" if reasons else "ACCEPTED",
+        "receipt_sha256": expected_receipt_sha256 or None,
         "source": source,
         "runtime": runtime,
+        "binding": {
+            "receipt": deepcopy(receipt),
+            "actual_launch": actual_launch,
+        },
         "error": "; ".join(reasons) if reasons else None,
     }
 
 
 def _capture_k8s_execution_attestation(
-    name: str, ns: str, expected_sha: str,
+    name: str,
+    ns: str,
+    expected_sha: str,
+    expected_image: str,
+    receipt: dict,
+    expected_receipt_sha256: str,
 ) -> dict:
     pods = _kubectl([
         "get", "pods", "-n", ns, "-l", f"job-name={name}", "-o", "json"
@@ -1428,8 +1548,10 @@ def _capture_k8s_execution_attestation(
         return {
             "schema": "ablator.execution-attestation/v1",
             "verdict": "REJECTED",
+            "receipt_sha256": expected_receipt_sha256 or None,
             "source": None,
             "runtime": None,
+            "binding": {"receipt": deepcopy(receipt), "actual_launch": None},
             "error": "k8s source attestation query failed: "
                      f"{(pods.stderr or pods.stdout).strip()[:400]}",
         }
@@ -1439,11 +1561,19 @@ def _capture_k8s_execution_attestation(
         return {
             "schema": "ablator.execution-attestation/v1",
             "verdict": "REJECTED",
+            "receipt_sha256": expected_receipt_sha256 or None,
             "source": None,
             "runtime": None,
+            "binding": {"receipt": deepcopy(receipt), "actual_launch": None},
             "error": f"k8s source attestation JSON is invalid: {exc}",
         }
-    return _k8s_execution_attestation(payload, expected_sha)
+    return _k8s_execution_attestation(
+        payload,
+        expected_sha,
+        expected_image,
+        receipt,
+        expected_receipt_sha256,
+    )
 
 
 def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
@@ -1554,7 +1684,15 @@ def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
     finally:
         expected_sha = job.get("requested_git_sha")
         if expected_sha:
-            attestation = _capture_k8s_execution_attestation(name, ns, expected_sha)
+            expected_image = tcfg.get("image") or mcfg.get("image") or ""
+            attestation = _capture_k8s_execution_attestation(
+                name,
+                ns,
+                expected_sha,
+                expected_image,
+                job.get("execution_receipt") or {},
+                job.get("execution_receipt_sha256") or "",
+            )
             job["execution_attestation"] = attestation
             if attestation["verdict"] == "ACCEPTED":
                 job["executed_git_sha"] = expected_sha
@@ -1657,6 +1795,7 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
     execution_receipt["launch"].update({
         "runtime": "kubernetes",
         "image": trainer["image"],
+        "actual_argv_sha256": receiptmod.argv_sha256(trainer["command"]),
         "mounts": [
             {
                 "name": mount["name"],
@@ -1667,8 +1806,10 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
         ],
         "namespace": mcfg["namespace"],
     })
+    execution_receipt_sha256 = receiptmod.receipt_sha256(execution_receipt)
     job["runner_provenance"] = runner_provenance
     job["execution_receipt"] = execution_receipt
+    job["execution_receipt_sha256"] = execution_receipt_sha256
     if q is not None:
         q.update(
             job["id"],
@@ -1676,6 +1817,7 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
             requested_git_sha=job.get("requested_git_sha"),
             runner_provenance=runner_provenance,
             execution_receipt=execution_receipt,
+            execution_receipt_sha256=execution_receipt_sha256,
             source_prepare_error=None,
         )
     manifest = build_k8s_job_manifest(
@@ -1723,6 +1865,11 @@ def run_job(cfg: dict, job: dict, machine: str,
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
     prepared_source: sourcecheckout.PreparedSource | None = None
     execution_receipt: dict | None = None
+    execution_receipt_sha256 = ""
+    semantic_argv: list[str] | None = None
+    actual_launch: dict | None = None
+    runner_provenance: dict | None = None
+    tcfg: dict | None = None
     status = "failed"
     exit_code: int | None = None
     try:
@@ -1755,6 +1902,7 @@ def run_job(cfg: dict, job: dict, machine: str,
         argv, _discard_env, cwd = render_command(
             tcfg, job, machine, include_protected_env=False
         )
+        semantic_argv = argv
         prov_state = capture_and_record_provenance(
             cfg, job, machine, cwd or os.getcwd(), q
         )
@@ -1786,7 +1934,9 @@ def run_job(cfg: dict, job: dict, machine: str,
             ),
             runner_provenance=runner_provenance,
         )
+        execution_receipt_sha256 = receiptmod.receipt_sha256(execution_receipt)
         job["execution_receipt"] = execution_receipt
+        job["execution_receipt_sha256"] = execution_receipt_sha256
         if q is not None:
             q.update(
                 job["id"],
@@ -1798,11 +1948,16 @@ def run_job(cfg: dict, job: dict, machine: str,
                 provenance=prov_state,
                 runner_provenance=runner_provenance,
                 execution_receipt=execution_receipt,
+                execution_receipt_sha256=execution_receipt_sha256,
                 source_prepare_error=None,
             )
         # Re-render only after the local queue envelope contains actual
         # source/runner/receipt identity. This is the form the child executes.
         argv, env, cwd = render_command(tcfg, job, machine)
+        actual_launch = receiptmod.build_actual_launch(argv, cwd or os.getcwd())
+        job["actual_launch"] = actual_launch
+        if q is not None:
+            q.update(job["id"], actual_launch=actual_launch)
         check_checkout_drift(cfg, job, machine, prov_state, q)
         container_name = container_name_from_argv(argv)
         if container_name:
@@ -1866,11 +2021,22 @@ def run_job(cfg: dict, job: dict, machine: str,
                             ),
                         }
                     },
+                    expected_receipt_sha256=execution_receipt_sha256,
                     source_state=final_state,
+                    actual_launch=actual_launch,
+                    type_config=tcfg,
+                    semantic_argv=semantic_argv,
+                    runner_provenance=runner_provenance,
                 )
             except Exception as exc:
                 attestation = receiptmod.build_final_attestation(
-                    execution_receipt or {"source": {}}, error=str(exc)
+                    execution_receipt or {"source": {}},
+                    expected_receipt_sha256=execution_receipt_sha256,
+                    actual_launch=actual_launch,
+                    type_config=tcfg,
+                    semantic_argv=semantic_argv,
+                    runner_provenance=runner_provenance,
+                    error=str(exc),
                 )
             if attestation["verdict"] != "ACCEPTED":
                 status = "failed"

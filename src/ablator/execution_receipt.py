@@ -26,6 +26,16 @@ def _sha256_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def receipt_sha256(receipt: Mapping[str, Any]) -> str:
+    """Return the canonical digest that identifies one immutable receipt."""
+    return _sha256_json(receipt)
+
+
+def argv_sha256(argv: list[str]) -> str:
+    """Return the canonical digest for one argument vector."""
+    return _sha256_json(argv)
+
+
 def _volume_mount(spec: str) -> dict[str, Any] | None:
     parts = spec.split(":")
     if len(parts) < 2:
@@ -115,6 +125,33 @@ def container_launch(argv: list[str]) -> tuple[str | None, str | None, list[dict
     return os.path.basename(argv[0]), image, mounts
 
 
+def build_actual_launch(argv: list[str], cwd: str | None) -> dict[str, Any]:
+    """Capture the exact launch form handed to the process runtime."""
+    runtime, image, mounts = container_launch(argv)
+    return {
+        "cwd": cwd,
+        "runtime": runtime or "process",
+        "image": image,
+        "mounts": mounts,
+        "argv_sha256": argv_sha256(argv),
+    }
+
+
+def _runner_identity(
+    runner_provenance: Mapping[str, Any], machine: str | None = None,
+) -> dict[str, Any]:
+    """Select the credential-free runner fields covered by a receipt."""
+    return {
+        "machine": runner_provenance.get("machine", machine),
+        "hostname": runner_provenance.get("hostname"),
+        "package_version": runner_provenance.get("package_version"),
+        "source_sha256": runner_provenance.get("source_sha256"),
+        "git_commit": runner_provenance.get("git_commit"),
+        "git_dirty": runner_provenance.get("git_dirty"),
+        "config_sha256": runner_provenance.get("config_sha256"),
+    }
+
+
 def build_prelaunch_receipt(
     *,
     cfg: Mapping[str, Any],
@@ -147,21 +184,13 @@ def build_prelaunch_receipt(
             "checkout": source_checkout,
             "lease_id": source_lease_id,
         },
-        "runner": {
-            "machine": runner_provenance.get("machine", machine),
-            "hostname": runner_provenance.get("hostname"),
-            "package_version": runner_provenance.get("package_version"),
-            "source_sha256": runner_provenance.get("source_sha256"),
-            "git_commit": runner_provenance.get("git_commit"),
-            "git_dirty": runner_provenance.get("git_dirty"),
-            "config_sha256": runner_provenance.get("config_sha256"),
-        },
+        "runner": _runner_identity(runner_provenance, machine),
         "launch": {
             "cwd": cwd,
             "runtime": runtime or "process",
             "image": image,
             "mounts": mounts,
-            "argv_sha256": _sha256_json(argv),
+            "argv_sha256": argv_sha256(argv),
             # Hashing the merged type config captures all runtime knobs while
             # avoiding credential-bearing env values in the receipt itself.
             "type_config_sha256": _sha256_json(type_config),
@@ -172,15 +201,23 @@ def build_prelaunch_receipt(
 def build_final_attestation(
     receipt: Mapping[str, Any],
     *,
+    expected_receipt_sha256: str,
     source_state: Mapping[str, Any] | None = None,
+    actual_launch: Mapping[str, Any] | None = None,
+    type_config: Mapping[str, Any] | None = None,
+    semantic_argv: list[str] | None = None,
+    runner_provenance: Mapping[str, Any] | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
-    """Compare final source state with the pre-launch immutable contract."""
+    """Bind final source and launch evidence to the immutable prelaunch receipt."""
     expected = dict(receipt.get("source") or {})
     actual = dict(source_state or {})
     reasons: list[str] = []
     if error:
         reasons.append(error)
+    actual_receipt_sha256 = receipt_sha256(receipt)
+    if not expected_receipt_sha256 or actual_receipt_sha256 != expected_receipt_sha256:
+        reasons.append("receipt SHA-256 mismatch")
     if actual:
         if actual.get("commit") != expected.get("requested_git_sha"):
             reasons.append("final commit differs from requested Git SHA")
@@ -192,9 +229,48 @@ def build_final_attestation(
             reasons.append("final recursive submodule state changed")
     elif not reasons:
         reasons.append("final source state is unavailable")
+
+    launch = dict(receipt.get("launch") or {})
+    binding: dict[str, Any] = {
+        "actual_launch": deepcopy(dict(actual_launch or {})) or None,
+        "runner": deepcopy(dict(receipt.get("runner") or {})),
+        "type_config_sha256": None,
+        "semantic_argv_sha256": None,
+    }
+    if type_config is not None:
+        binding["type_config_sha256"] = _sha256_json(type_config)
+        if binding["type_config_sha256"] != launch.get("type_config_sha256"):
+            reasons.append("runtime config differs from prelaunch receipt")
+    elif launch.get("type_config_sha256") is not None:
+        reasons.append("runtime config is unavailable")
+    if semantic_argv is not None:
+        binding["semantic_argv_sha256"] = _sha256_json(semantic_argv)
+        if binding["semantic_argv_sha256"] != launch.get("argv_sha256"):
+            reasons.append("semantic argv differs from prelaunch receipt")
+    elif launch.get("argv_sha256") is not None:
+        reasons.append("semantic argv is unavailable")
+    if runner_provenance is not None:
+        receipt_runner = dict(receipt.get("runner") or {})
+        if _runner_identity(
+            runner_provenance, receipt_runner.get("machine")
+        ) != receipt_runner:
+            reasons.append("runner identity differs from prelaunch receipt")
+    elif receipt.get("runner"):
+        reasons.append("runner identity is unavailable")
+    if actual_launch is not None:
+        actual_launch_dict = dict(actual_launch)
+        for field in ("cwd", "runtime", "image", "mounts"):
+            if actual_launch_dict.get(field) != launch.get(field):
+                reasons.append(
+                    f"actual launch {field} differs from prelaunch receipt"
+                )
+    elif launch:
+        reasons.append("actual launch is unavailable")
     return {
         "schema": "ablator.execution-attestation/v1",
         "verdict": "REJECTED" if reasons else "ACCEPTED",
+        "receipt_sha256": expected_receipt_sha256 or None,
         "source": actual or None,
+        "binding": binding,
         "error": "; ".join(reasons) if reasons else None,
     }

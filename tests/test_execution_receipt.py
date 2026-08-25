@@ -183,13 +183,103 @@ def test_prelaunch_receipt_never_contains_environment_values():
     assert secret not in json.dumps(receipt)
 
 
+def test_final_attestation_binds_receipt_config_runner_and_actual_launch():
+    argv = [
+        "podman", "run", "--rm", "-v", "/src:/workspace:ro",
+        "image@sha256:expected", "python", "train.py",
+    ]
+    type_config = {"command": argv, "require_pinned_git": True}
+    source_state = {
+        "commit": "a" * 40, "ref": "DETACHED", "dirty": False,
+        "submodules": [],
+    }
+    runner_provenance = {
+        "machine": "main", "hostname": "runner-1", "config_sha256": "c" * 64,
+    }
+    receipt = receipts.build_prelaunch_receipt(
+        cfg={}, job={"id": "bound", "requested_git_sha": "a" * 40},
+        machine="main", type_config=type_config, argv=argv, cwd="/src",
+        source_state=source_state, source_repo="repo", source_checkout="/src",
+        source_lease_id="lease", runner_provenance=runner_provenance,
+    )
+    digest = receipts.receipt_sha256(receipt)
+    actual = receipts.build_actual_launch(argv, "/src")
+
+    accepted = receipts.build_final_attestation(
+        receipt,
+        expected_receipt_sha256=digest,
+        source_state=source_state,
+        actual_launch=actual,
+        type_config=type_config,
+        semantic_argv=argv,
+        runner_provenance=runner_provenance,
+    )
+    assert accepted["verdict"] == "ACCEPTED"
+    assert accepted["receipt_sha256"] == digest
+    assert accepted["binding"]["actual_launch"] == actual
+    assert accepted["binding"]["runner"] == receipt["runner"]
+
+    receipt["launch"]["image"] = "image@sha256:tampered"
+    rejected = receipts.build_final_attestation(
+        receipt,
+        expected_receipt_sha256=digest,
+        source_state=source_state,
+        actual_launch=actual,
+        type_config=type_config,
+        semantic_argv=argv,
+        runner_provenance=runner_provenance,
+    )
+    assert rejected["verdict"] == "REJECTED"
+    assert "receipt SHA-256" in rejected["error"]
+
+
+def test_final_attestation_rejects_actual_launch_image_or_mount_drift():
+    argv = ["podman", "run", "-v", "/src:/src:ro", "expected:image", "true"]
+    type_config = {"command": argv}
+    state = {"commit": "a" * 40, "ref": "DETACHED", "dirty": False, "submodules": []}
+    runner_provenance = {"machine": "main"}
+    receipt = receipts.build_prelaunch_receipt(
+        cfg={}, job={"id": "drift", "requested_git_sha": "a" * 40},
+        machine="main", type_config=type_config, argv=argv, cwd="/src",
+        source_state=state, source_repo="repo", source_checkout="/src",
+        source_lease_id="lease", runner_provenance=runner_provenance,
+    )
+    actual = receipts.build_actual_launch(argv, "/src")
+    actual["image"] = "other:image"
+    actual["mounts"] = [{"source": "/other", "target": "/src", "read_only": False}]
+
+    attestation = receipts.build_final_attestation(
+        receipt,
+        expected_receipt_sha256=receipts.receipt_sha256(receipt),
+        source_state=state,
+        actual_launch=actual,
+        type_config=type_config,
+        semantic_argv=argv,
+        runner_provenance=runner_provenance,
+    )
+    assert attestation["verdict"] == "REJECTED"
+    assert "actual launch" in attestation["error"]
+
+
 def test_k8s_attestation_records_actual_source_and_image_digest():
     sha = "a" * 40
     submodules_hash = "b" * 64
     payload = {
         "items": [{
             "metadata": {"name": "job-pod"},
-            "spec": {"nodeName": "gpu-1"},
+            "spec": {
+                "nodeName": "gpu-1",
+                "containers": [{
+                    "name": "trainer",
+                    "image": "registry/image:tag",
+                    "workingDir": "/workspace",
+                    "command": ["python", "train.py"],
+                    "volumeMounts": [{
+                        "name": "repo-src", "mountPath": "/workspace",
+                        "readOnly": True,
+                    }],
+                }],
+            },
             "status": {
                 "initContainerStatuses": [{
                     "name": "git-sync",
@@ -206,7 +296,18 @@ def test_k8s_attestation_records_actual_source_and_image_digest():
             },
         }],
     }
-    attestation = runner._k8s_execution_attestation(payload, sha)
+    receipt = {"launch": {
+        "runtime": "kubernetes", "image": "registry/image:tag",
+        "cwd": "/workspace",
+        "mounts": [{
+            "name": "repo-src", "target": "/workspace", "read_only": True,
+        }],
+        "actual_argv_sha256": receipts.argv_sha256(["python", "train.py"]),
+    }}
+    digest = receipts.receipt_sha256(receipt)
+    attestation = runner._k8s_execution_attestation(
+        payload, sha, "registry/image:tag", receipt, digest,
+    )
     assert attestation["verdict"] == "ACCEPTED"
     assert attestation["source"]["executed_git_sha"] == sha
     assert attestation["source"]["dirty"] is False
@@ -217,6 +318,49 @@ def test_k8s_attestation_records_actual_source_and_image_digest():
         "image": "registry/image:tag",
         "image_id": "registry/image@sha256:deadbeef",
     }
+    assert attestation["receipt_sha256"] == digest
+    assert attestation["binding"]["actual_launch"]["argv_sha256"] == (
+        receipt["launch"]["actual_argv_sha256"]
+    )
+
+
+def test_k8s_attestation_rejects_actual_command_drift():
+    sha = "a" * 40
+    payload = {
+        "items": [{
+            "metadata": {"name": "pod"},
+            "spec": {
+                "nodeName": "node",
+                "containers": [{
+                    "name": "trainer", "image": "expected:image",
+                    "workingDir": "/workspace", "command": ["python", "other.py"],
+                    "volumeMounts": [],
+                }],
+            },
+            "status": {
+                "initContainerStatuses": [{
+                    "name": "git-sync", "state": {"terminated": {"message": (
+                        f"ABLATOR_SOURCE_V1 requested={sha} executed={sha} "
+                        "ref=DETACHED dirty=false submodules_sha256=x\n"
+                    )}},
+                }],
+                "containerStatuses": [{
+                    "name": "trainer", "image": "expected:image",
+                    "imageID": "expected@sha256:digest",
+                }],
+            },
+        }],
+    }
+    receipt = {"launch": {
+        "runtime": "kubernetes", "image": "expected:image",
+        "cwd": "/workspace", "mounts": [],
+        "actual_argv_sha256": receipts.argv_sha256(["python", "train.py"]),
+    }}
+    attestation = runner._k8s_execution_attestation(
+        payload, sha, "expected:image", receipt, receipts.receipt_sha256(receipt),
+    )
+    assert attestation["verdict"] == "REJECTED"
+    assert "actual command differs" in attestation["error"]
 
 
 def test_k8s_attestation_rejects_wrong_commit_or_missing_proof():
@@ -233,5 +377,80 @@ def test_k8s_attestation_rejects_wrong_commit_or_missing_proof():
             }]},
         }],
     }
-    assert runner._k8s_execution_attestation(payload, expected)["verdict"] == "REJECTED"
-    assert runner._k8s_execution_attestation({"items": []}, expected)["verdict"] == "REJECTED"
+    receipt = {"launch": {"runtime": "kubernetes", "image": "registry/image:tag"}}
+    digest = receipts.receipt_sha256(receipt)
+    assert runner._k8s_execution_attestation(
+        payload, expected, "registry/image:tag", receipt, digest,
+    )["verdict"] == "REJECTED"
+    assert runner._k8s_execution_attestation(
+        {"items": []}, expected, "registry/image:tag", receipt, digest,
+    )["verdict"] == "REJECTED"
+
+
+@pytest.mark.parametrize(
+    ("missing_path", "reason"),
+    [
+        (("metadata", "name"), "pod"),
+        (("spec", "nodeName"), "node"),
+        (("status", "containerStatuses", 0, "image"), "image"),
+        (("status", "containerStatuses", 0, "imageID"), "image ID"),
+    ],
+)
+def test_k8s_attestation_rejects_missing_runtime_identity(missing_path, reason):
+    sha = "a" * 40
+    payload = {
+        "items": [{
+            "metadata": {"name": "pod"},
+            "spec": {"nodeName": "node"},
+            "status": {
+                "initContainerStatuses": [{
+                    "name": "git-sync",
+                    "state": {"terminated": {"message": (
+                        f"ABLATOR_SOURCE_V1 requested={sha} executed={sha} "
+                        "ref=DETACHED dirty=false submodules_sha256=x\n"
+                    )}},
+                }],
+                "containerStatuses": [{
+                    "name": "trainer", "image": "expected:image",
+                    "imageID": "expected@sha256:digest",
+                }],
+            },
+        }],
+    }
+    target = payload["items"][0]
+    for part in missing_path[:-1]:
+        target = target[part]
+    target[missing_path[-1]] = ""
+    receipt = {"launch": {"runtime": "kubernetes", "image": "expected:image"}}
+    attestation = runner._k8s_execution_attestation(
+        payload, sha, "expected:image", receipt, receipts.receipt_sha256(receipt),
+    )
+    assert attestation["verdict"] == "REJECTED"
+    assert reason in attestation["error"]
+
+
+def test_k8s_attestation_rejects_image_different_from_policy():
+    sha = "a" * 40
+    payload = {
+        "items": [{
+            "metadata": {"name": "pod"}, "spec": {"nodeName": "node"},
+            "status": {
+                "initContainerStatuses": [{
+                    "name": "git-sync", "state": {"terminated": {"message": (
+                        f"ABLATOR_SOURCE_V1 requested={sha} executed={sha} "
+                        "ref=DETACHED dirty=false submodules_sha256=x\n"
+                    )}},
+                }],
+                "containerStatuses": [{
+                    "name": "trainer", "image": "other:image",
+                    "imageID": "other@sha256:digest",
+                }],
+            },
+        }],
+    }
+    receipt = {"launch": {"runtime": "kubernetes", "image": "expected:image"}}
+    attestation = runner._k8s_execution_attestation(
+        payload, sha, "expected:image", receipt, receipts.receipt_sha256(receipt),
+    )
+    assert attestation["verdict"] == "REJECTED"
+    assert "image differs from policy" in attestation["error"]

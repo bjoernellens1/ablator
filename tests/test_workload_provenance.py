@@ -118,6 +118,7 @@ def test_new_transport_variables_are_protected():
     assert declarations.JOB_ID_ENV in declarations.PROTECTED_ENV
     assert declarations.JOB_JSON_ENV in declarations.PROTECTED_ENV
     assert declarations.SUBMISSION_ENV in declarations.PROTECTED_ENV
+    assert declarations.SOURCE_PROOF_ENV in declarations.PROTECTED_ENV
 
 
 def test_claimed_legacy_direct_child_replaces_stale_protected_environment(monkeypatch):
