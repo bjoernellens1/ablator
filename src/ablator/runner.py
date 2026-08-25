@@ -365,7 +365,7 @@ def _ensure_container_name(argv: list[str], job: dict) -> list[str]:
     docker/podman command is assembled, rather than requiring every current
     and future command template to remember `--name` itself.
     """
-    if not argv or argv[0] not in _CONTAINER_RUNTIMES or "run" not in argv[:2]:
+    if not argv or not _is_container_runtime(argv[0]) or "run" not in argv[:2]:
         return argv
     if container_name_from_argv(argv) is not None:
         return argv  # template already set an explicit name -- respect it
@@ -376,7 +376,7 @@ def _ensure_container_name(argv: list[str], job: dict) -> list[str]:
 
 def _inject_container_environment(argv: list[str], child_env: dict[str, str]) -> list[str]:
     """Inject protected declaration env into a direct Docker/Podman run."""
-    if not argv or argv[0] not in _CONTAINER_RUNTIMES:
+    if not argv or not _is_container_runtime(argv[0]):
         return argv
     if "run" not in argv[:2]:
         return argv
@@ -501,13 +501,17 @@ def read_control(cfg: dict, job_id: str) -> str | None:
 _CONTAINER_RUNTIMES = ("podman", "docker")
 
 
+def _is_container_runtime(value: object) -> bool:
+    return os.path.basename(str(value)) in _CONTAINER_RUNTIMES
+
+
 def container_name_from_argv(argv: list[str]) -> str | None:
     """Extract the `--name X` / `--name=X` value from a rendered command,
     if the command is a podman/docker `run` invocation. Returns None for
     non-container commands or container commands with no explicit name
     (in which case guaranteed-teardown-by-name is not possible and only
     the process-group signal path applies)."""
-    if not argv or argv[0] not in _CONTAINER_RUNTIMES:
+    if not argv or not _is_container_runtime(argv[0]):
         return None
     if "run" not in argv[:2]:
         return None

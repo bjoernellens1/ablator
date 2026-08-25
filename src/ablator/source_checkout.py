@@ -32,6 +32,7 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
+from urllib.parse import unquote, urlsplit
 
 try:  # Linux is the production target; keep import failure explicit on others.
     import fcntl
@@ -145,6 +146,76 @@ def _origin_url(repo: str) -> str | None:
     return result.stdout.strip() or None
 
 
+def git_common_dir(repo: str) -> str:
+    """Return the canonical Git common directory for a repository/worktree."""
+    value = _require_ok(
+        _git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir", timeout=15),
+        f"resolve Git common directory at {repo}",
+    )
+    if not os.path.isabs(value):
+        value = os.path.join(repo, value)
+    return os.path.realpath(value)
+
+
+def repository_lock_path(cache_root: str, repo: str) -> str:
+    """Derive the repository lock solely from its verified Git common dir."""
+    common_dir = git_common_dir(repo)
+    digest = hashlib.sha256(common_dir.encode("utf-8")).hexdigest()[:24]
+    return os.path.join(cache_root, "_locks", f"common-{digest}.lock")
+
+
+def _local_repo_from_identity(value: str, *, base: str) -> str | None:
+    parsed = urlsplit(value)
+    if parsed.scheme == "file":
+        return os.path.realpath(os.path.expanduser(unquote(parsed.path)))
+    if parsed.scheme or re.match(r"^[^/@:]+@[^:]+:", value):
+        return None
+    candidate = os.path.expanduser(value)
+    if not os.path.isabs(candidate):
+        candidate = os.path.join(base, candidate)
+    return os.path.realpath(candidate)
+
+
+def _canonical_remote_identity(value: str, *, base: str) -> str:
+    """Normalize transport spellings without retaining embedded credentials."""
+    local = _local_repo_from_identity(value, base=base)
+    if local is not None:
+        return f"file:{local}"
+    scp = re.match(r"^(?:[^/@:]+@)?([^:]+):(.+)$", value)
+    if scp and "://" not in value:
+        host, path = scp.groups()
+    else:
+        parsed = urlsplit(value)
+        host = parsed.hostname or ""
+        path = parsed.path
+    normalized_path = path.strip("/")
+    if normalized_path.endswith(".git"):
+        normalized_path = normalized_path[:-4]
+    return f"remote:{host.lower()}/{normalized_path}"
+
+
+def validate_repo_identity(repo: str, declared: str) -> None:
+    """Require an explicit git.repo to identify the configured source repo."""
+    declared_local = _local_repo_from_identity(declared, base=repo)
+    if declared_local is not None and _is_git_repo(declared_local):
+        if git_common_dir(declared_local) != git_common_dir(repo):
+            raise SourcePreparationError(
+                f"git.repo {declared!r} does not match configured checkout common directory"
+            )
+        return
+    origin = _origin_url(repo)
+    if not origin:
+        raise SourcePreparationError(
+            f"git.repo {declared!r} cannot be verified: configured checkout has no origin"
+        )
+    if _canonical_remote_identity(origin, base=repo) != _canonical_remote_identity(
+        declared, base=repo
+    ):
+        raise SourcePreparationError(
+            f"git.repo {declared!r} does not match configured checkout origin {origin!r}"
+        )
+
+
 def _cache_root(cfg: dict, machine: str) -> str:
     machine_cfg = (cfg.get("machines") or {}).get(machine) or {}
     configured = (
@@ -195,6 +266,8 @@ def _ensure_source_repo(source_cwd: str | None, git_repo: str | None,
     if _is_git_repo(source_cwd):
         assert source_cwd is not None
         source = os.path.realpath(source_cwd)
+        if git_repo:
+            validate_repo_identity(source, git_repo)
         identity = git_repo or _origin_url(source) or source
         return source, identity
 
@@ -378,7 +451,7 @@ def _materialize(
         cache_root, repo_key, sha, f"{safe_job_id}-{lease_id}"
     )
     sidecar = f"{checkout}.ablator.json"
-    lock = os.path.join(cache_root, "_locks", f"repo-{repo_key}.lock")
+    lock = repository_lock_path(cache_root, repo)
     lease = SourceLease(
         checkout=checkout,
         sidecar=sidecar,
@@ -387,13 +460,13 @@ def _materialize(
     )
 
     with _locked(lock):
-        _ensure_commit(repo, sha)
-        if os.path.exists(checkout):
-            raise SourcePreparationError(
-                f"unique execution checkout path already exists: {checkout}"
-            )
         os.makedirs(os.path.dirname(checkout), exist_ok=True)
         try:
+            _ensure_commit(repo, sha)
+            if os.path.exists(checkout):
+                raise SourcePreparationError(
+                    f"unique execution checkout path already exists: {checkout}"
+                )
             result = _git(repo, "worktree", "add", "--detach", checkout, sha, timeout=90)
             _require_ok(result, f"materialize worktree for {sha}")
             _initialize_submodules(checkout)
@@ -412,18 +485,39 @@ def _materialize(
                 "repo": identity,
                 "checkout": checkout,
                 "source_repo_path": repo,
+                "source_common_dir": git_common_dir(repo),
                 "lock_path": lock,
                 "created_at": time.time(),
                 "last_used_at": time.time(),
+                "materialization_state": "ready",
             })
-        except Exception:
-            if _is_git_repo(checkout):
-                _git(repo, "worktree", "remove", "--force", checkout, timeout=90)
+        except Exception as exc:
+            safe_error = re.sub(r"(://)[^/@\s]+@", r"\1<redacted>@", str(exc))
             try:
-                os.remove(sidecar)
-            except FileNotFoundError:
-                pass
-            raise
+                _atomic_json_write(sidecar, {
+                    "schema": "ablator.source-lease/v1",
+                    "lease_id": lease_id,
+                    "job_id": str(job_id),
+                    "active": False,
+                    "sha": sha,
+                    "repo": identity,
+                    "checkout": checkout,
+                    "source_repo_path": repo,
+                    "source_common_dir": git_common_dir(repo),
+                    "lock_path": lock,
+                    "created_at": time.time(),
+                    "last_used_at": time.time(),
+                    "materialization_state": "failed",
+                    "materialization_error": safe_error[:600],
+                })
+            except Exception as evidence_exc:
+                raise SourcePreparationError(
+                    f"{exc}; failed to retain materialization evidence at "
+                    f"{sidecar}: {evidence_exc}"
+                ) from exc
+            raise SourcePreparationError(
+                f"{exc}; failed materialization evidence retained at {sidecar}"
+            ) from exc
 
     return lease, state
 
@@ -499,7 +593,8 @@ def _replace_checkout(value, old: str | None, new: str):
 
 def _container_reaches_checkout(tcfg: dict, source_cwd: str | None) -> bool:
     command = tcfg.get("command") or []
-    if not command or command[0] not in _CONTAINER_RUNTIMES or "run" not in command[:2]:
+    if (not command or os.path.basename(str(command[0])) not in _CONTAINER_RUNTIMES
+            or "run" not in command[:2]):
         return True
     for token in command:
         if isinstance(token, str) and (
@@ -509,9 +604,30 @@ def _container_reaches_checkout(tcfg: dict, source_cwd: str | None) -> bool:
     return False
 
 
+def _path_is_within(path: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath((path, parent)) == parent
+    except ValueError:
+        return False
+
+
+def _checkout_bind(source: str, checkout: str) -> bool:
+    lexical_source = os.path.abspath(os.path.expanduser(source))
+    lexical_checkout = os.path.abspath(os.path.expanduser(checkout))
+    resolved_source = os.path.realpath(lexical_source)
+    resolved_checkout = os.path.realpath(lexical_checkout)
+    lexical_descendant = _path_is_within(lexical_source, lexical_checkout)
+    resolved_descendant = _path_is_within(resolved_source, resolved_checkout)
+    if lexical_descendant and not resolved_descendant:
+        raise SourcePreparationError(
+            f"container bind {source!r} escapes immutable checkout through a symlink"
+        )
+    return resolved_descendant
+
+
 def _read_only_volume(spec: str, checkout: str) -> tuple[str, bool]:
     parts = spec.split(":")
-    if len(parts) < 2 or os.path.realpath(parts[0]) != os.path.realpath(checkout):
+    if len(parts) < 2 or not _checkout_bind(parts[0], checkout):
         return spec, False
     options = [item for item in ",".join(parts[2:]).split(",") if item]
     if "ro" not in options and "readonly" not in options:
@@ -526,7 +642,7 @@ def _read_only_long_mount(spec: str, checkout: str) -> tuple[str, bool]:
     source = fields.get("src") or fields.get("source")
     if fields.get("type", "bind") != "bind" or not source:
         return spec, False
-    if os.path.realpath(source) != os.path.realpath(checkout):
+    if not _checkout_bind(source, checkout):
         return spec, False
     if not any(item in {"readonly", "ro"} or item.startswith(("readonly=", "ro="))
                for item in items):

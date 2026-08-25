@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
 import time
 from dataclasses import dataclass
@@ -17,6 +16,8 @@ class GCEntry:
     checkout: str
     sidecar: str
     source_repo_path: str | None
+    source_common_dir: str | None
+    repo_identity: str | None
     lock_path: str
     active: bool
     lease_id: str | None
@@ -30,6 +31,13 @@ class GCResult:
     protected: tuple[str, ...]
     retained: tuple[str, ...]
     errors: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TrustedRepository:
+    repo_path: str
+    common_dir: str
+    lock_path: str
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -96,10 +104,14 @@ def _read_sidecar(path: Path, root: Path) -> GCEntry:
         except OSError:
             last_used_at = 0.0
     repo = data.get("source_repo_path")
+    common_dir = data.get("source_common_dir")
+    repo_identity = data.get("repo")
     return GCEntry(
         checkout=str(resolved_checkout),
         sidecar=str(resolved_sidecar),
         source_repo_path=(str(repo) if repo else None),
+        source_common_dir=(str(common_dir) if common_dir else None),
+        repo_identity=(str(repo_identity) if repo_identity else None),
         lock_path=str(lock_path),
         active=active,
         lease_id=lease_id,
@@ -146,7 +158,74 @@ def _run_git(repo: str, *args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _remove_entry(root: Path, entry: GCEntry) -> tuple[str, str | None]:
+def _listed_worktrees(repo: str) -> set[str]:
+    result = _run_git(repo, "worktree", "list", "--porcelain")
+    if result.returncode != 0:
+        return set()
+    return {
+        str(Path(line.removeprefix("worktree ")).resolve(strict=False))
+        for line in result.stdout.splitlines()
+        if line.startswith("worktree ")
+    }
+
+
+def _trusted_repository(root: Path, entry: GCEntry) -> TrustedRepository:
+    """Derive repository ownership from Git and cross-check all sidecar hints."""
+    if not entry.source_repo_path or not os.path.isdir(entry.source_repo_path):
+        raise ValueError(f"{entry.checkout}: cannot prove owning Git repository")
+    repo_path = os.path.realpath(entry.source_repo_path)
+    try:
+        repo_common = source_checkout.git_common_dir(repo_path)
+    except source_checkout.SourcePreparationError as exc:
+        raise ValueError(
+            f"{entry.checkout}: cannot prove owning Git repository: {exc}"
+        ) from exc
+
+    if os.path.exists(entry.checkout):
+        try:
+            checkout_common = source_checkout.git_common_dir(entry.checkout)
+        except source_checkout.SourcePreparationError as exc:
+            raise ValueError(
+                f"{entry.checkout}: cannot prove checkout is a Git worktree: {exc}"
+            ) from exc
+        if checkout_common != repo_common:
+            raise ValueError(
+                f"{entry.checkout}: sidecar source_repo_path does not own checkout"
+            )
+    elif entry.checkout not in _listed_worktrees(repo_path):
+        raise ValueError(
+            f"{entry.checkout}: cannot prove missing checkout belongs to repository"
+        )
+
+    if (not entry.source_common_dir
+            or os.path.realpath(entry.source_common_dir) != repo_common):
+        raise ValueError(
+            f"{entry.checkout}: source common directory is missing or inconsistent"
+        )
+    if not entry.repo_identity:
+        raise ValueError(f"{entry.checkout}: repository identity is missing")
+    try:
+        source_checkout.validate_repo_identity(repo_path, entry.repo_identity)
+    except source_checkout.SourcePreparationError as exc:
+        raise ValueError(f"{entry.checkout}: repository identity mismatch: {exc}") from exc
+
+    expected_lock = str(
+        Path(source_checkout.repository_lock_path(str(root), repo_path)).resolve(strict=False)
+    )
+    if entry.lock_path != expected_lock:
+        raise ValueError(
+            f"{entry.checkout}: repository lock does not match verified common directory"
+        )
+    return TrustedRepository(
+        repo_path=repo_path,
+        common_dir=repo_common,
+        lock_path=expected_lock,
+    )
+
+
+def _remove_entry(
+    root: Path, entry: GCEntry, trusted: TrustedRepository,
+) -> tuple[str, str | None]:
     """Remove one inactive worktree under its repository lease lock.
 
     Returns ``(outcome, error)`` where outcome is ``removed``, ``protected``,
@@ -154,7 +233,7 @@ def _remove_entry(root: Path, entry: GCEntry) -> tuple[str, str | None]:
     removal and Git administrative pruning succeed.
     """
     try:
-        with source_checkout._locked(entry.lock_path):
+        with source_checkout._locked(trusted.lock_path):
             try:
                 current = _read_sidecar(Path(entry.sidecar), root)
             except ValueError as exc:
@@ -167,26 +246,27 @@ def _remove_entry(root: Path, entry: GCEntry) -> tuple[str, str | None]:
             if current.active:
                 return "protected", None
 
+            try:
+                current_trusted = _trusted_repository(root, current)
+            except ValueError as exc:
+                return "error", str(exc)
+            if current_trusted != trusted:
+                return "error", f"{entry.checkout}: repository trust changed during cleanup"
+
             checkout = current.checkout
-            repo = current.source_repo_path
-            if repo and os.path.isdir(repo):
-                if os.path.exists(checkout):
-                    result = _run_git(repo, "worktree", "remove", "--force", checkout)
-                    if result.returncode != 0:
-                        detail = (result.stderr or result.stdout).strip()
-                        return (
-                            "error",
-                            f"{checkout}: git worktree remove failed: {detail[:400]}",
-                        )
-                pruned = _run_git(repo, "worktree", "prune")
-                if pruned.returncode != 0:
-                    detail = (pruned.stderr or pruned.stdout).strip()
-                    return "error", f"{checkout}: git worktree prune failed: {detail[:400]}"
-            elif os.path.exists(checkout):
-                try:
-                    shutil.rmtree(checkout)
-                except OSError as exc:
-                    return "error", f"{checkout}: orphan removal failed: {exc}"
+            repo = trusted.repo_path
+            if os.path.exists(checkout):
+                result = _run_git(repo, "worktree", "remove", "--force", checkout)
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout).strip()
+                    return (
+                        "error",
+                        f"{checkout}: git worktree remove failed: {detail[:400]}",
+                    )
+            pruned = _run_git(repo, "worktree", "prune")
+            if pruned.returncode != 0:
+                detail = (pruned.stderr or pruned.stdout).strip()
+                return "error", f"{checkout}: git worktree prune failed: {detail[:400]}"
 
             try:
                 os.remove(current.sidecar)
@@ -241,10 +321,16 @@ def gc_worktrees(
         if entry.last_used_at > cutoff:
             retained.append(entry.checkout)
             continue
+        try:
+            trusted = _trusted_repository(resolved_root, entry)
+        except ValueError as exc:
+            retained.append(entry.checkout)
+            errors.append(str(exc))
+            continue
         candidates.append(entry.checkout)
         if dry_run:
             continue
-        outcome, error = _remove_entry(resolved_root, entry)
+        outcome, error = _remove_entry(resolved_root, entry, trusted)
         if outcome == "protected":
             protected.append(entry.checkout)
         elif error:

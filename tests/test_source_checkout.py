@@ -164,22 +164,30 @@ def test_submodule_drift_is_rejected_by_checkout_state(tmp_path):
         source.capture_checkout_state(prepared.checkout_path)
 
 
-def test_failed_submodule_initialization_removes_partial_worktree(tmp_path, monkeypatch):
+def test_failed_submodule_initialization_retains_recoverable_evidence(tmp_path, monkeypatch):
     repo, sha = _repo(tmp_path)
 
     def fail(_checkout):
         raise source.SourcePreparationError("submodule setup failed")
 
     monkeypatch.setattr(source, "_initialize_submodules", fail)
-    with pytest.raises(source.SourcePreparationError, match="submodule setup failed"):
+    with pytest.raises(
+        source.SourcePreparationError,
+        match="submodule setup failed.*retained.*ablator.json",
+    ):
         source.prepare_job_source(
             _cfg(tmp_path), {"id": "broken", "requested_git_sha": sha},
             "main", _tcfg(repo),
         )
 
     cache = tmp_path / "cache"
-    assert not list(cache.rglob("*.ablator.json"))
-    assert not [path for path in cache.rglob("*") if (path / ".git").exists()]
+    sidecars = list(cache.rglob("*.ablator.json"))
+    assert len(sidecars) == 1
+    evidence = json.loads(sidecars[0].read_text())
+    assert evidence["active"] is False
+    assert evidence["materialization_state"] == "failed"
+    assert evidence["materialization_error"] == "submodule setup failed"
+    assert os.path.isdir(evidence["checkout"])
 
 
 def test_post_materialization_config_error_releases_lease(tmp_path):
@@ -205,7 +213,7 @@ def test_post_materialization_config_error_releases_lease(tmp_path):
     assert lease["released_at"] >= lease["created_at"]
 
 
-def test_unavailable_commit_fails_without_creating_checkout_or_lease(tmp_path):
+def test_unavailable_commit_retains_failed_lease_evidence(tmp_path):
     repo, _sha = _repo(tmp_path)
     with pytest.raises(source.SourcePreparationError, match="fetch requested Git SHA"):
         source.prepare_job_source(
@@ -215,8 +223,12 @@ def test_unavailable_commit_fails_without_creating_checkout_or_lease(tmp_path):
         )
 
     cache = tmp_path / "cache"
-    assert not list(cache.rglob("*.ablator.json"))
-    assert not [path for path in cache.rglob("*") if (path / ".git").exists()]
+    sidecars = list(cache.rglob("*.ablator.json"))
+    assert len(sidecars) == 1
+    evidence = json.loads(sidecars[0].read_text())
+    assert evidence["active"] is False
+    assert evidence["materialization_state"] == "failed"
+    assert evidence["sha"] == "1" * 40
 
 
 def test_repo_cwd_template_is_supported_for_container_mounts(tmp_path):
@@ -248,6 +260,73 @@ def test_long_container_mount_form_is_read_only(tmp_path):
         f"type=bind,src={prepared.checkout_path},dst=/workspace/project,readonly"
         in prepared.type_config["command"]
     )
+
+
+def test_every_checkout_descendant_bind_is_read_only(tmp_path):
+    repo, sha = _repo(tmp_path)
+    (repo / "configs").mkdir()
+    tcfg = {
+        "cwd": str(repo),
+        "command": [
+            "podman", "run",
+            "-v", "{repo_cwd}:/workspace/project",
+            "--mount", "type=bind,src={repo_cwd}/configs,dst=/configs",
+            "image:test",
+        ],
+    }
+    prepared = source.prepare_job_source(
+        _cfg(tmp_path), {"id": "descendants", "requested_git_sha": sha},
+        "main", tcfg,
+    )
+    command = prepared.type_config["command"]
+    assert f"{prepared.checkout_path}:/workspace/project:ro" in command
+    assert (
+        f"type=bind,src={prepared.checkout_path}/configs,dst=/configs,readonly"
+        in command
+    )
+
+
+def test_checkout_descendant_symlink_escape_is_rejected(tmp_path):
+    repo, _sha = _repo(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink(outside, repo / "escape")
+    _run("git", "add", "escape", cwd=repo)
+    _run("git", "commit", "-m", "add escape", cwd=repo)
+    sha = _run("git", "rev-parse", "HEAD", cwd=repo)
+    tcfg = {
+        "cwd": str(repo),
+        "command": [
+            "podman", "run",
+            "-v", "{repo_cwd}:/workspace/project",
+            "-v", "{repo_cwd}/escape:/escape",
+            "image:test",
+        ],
+    }
+    with pytest.raises(source.SourcePreparationError, match="bind.*escapes"):
+        source.prepare_job_source(
+            _cfg(tmp_path), {"id": "escape", "requested_git_sha": sha},
+            "main", tcfg,
+        )
+
+
+def test_explicit_git_repo_must_match_configured_checkout_origin(tmp_path):
+    repo, sha = _repo(tmp_path)
+    _run(
+        "git", "remote", "add", "origin",
+        "https://github.com/example/actual.git", cwd=repo,
+    )
+
+    with pytest.raises(source.SourcePreparationError, match="git.repo.*origin"):
+        source.prepare_job_source(
+            _cfg(tmp_path),
+            {
+                "id": "wrong-repo",
+                "requested_git_sha": sha,
+                "git_repo": "https://github.com/example/unrelated.git",
+            },
+            "main", _tcfg(repo),
+        )
 
 
 def test_pinned_direct_process_disables_bytecode_writes(tmp_path):

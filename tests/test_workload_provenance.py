@@ -167,6 +167,28 @@ def test_claimed_legacy_container_receives_trusted_job_environment(runtime):
     }
 
 
+def test_absolute_container_runtime_receives_protected_environment():
+    job = {
+        "id": "absolute-runtime",
+        "type": "replay",
+        "machine": "main",
+        "status": "running",
+    }
+    argv, _, _ = runner.render_command(
+        {
+            "command": [
+                "/usr/bin/podman", "run", "--rm", "image:tag", "true",
+            ],
+        },
+        job,
+        "main",
+    )
+
+    assert argv[0] == "/usr/bin/podman"
+    assert any(token.startswith("ABLATOR_JOB_JSON=") for token in argv)
+    assert runner.container_name_from_argv(argv) == "splat_train_absolute-runtime"
+
+
 def test_claimed_legacy_kubernetes_trainer_receives_job_environment():
     job = {
         "id": "legacy_k8s",
