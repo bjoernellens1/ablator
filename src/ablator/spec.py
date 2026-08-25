@@ -31,8 +31,11 @@ model_path_template, default "output/scratch/{name}_{arm}").
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
+from copy import deepcopy
 
 from . import experiment_declaration as declarations
 from . import source_checkout as sourcecheckout
@@ -41,9 +44,50 @@ DEFAULT_MODEL_PATH_TEMPLATE = "output/scratch/{name}_{arm}"
 _FULL_GIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
+class LoadedSpec(dict):
+    """Dict-compatible spec carrying only non-semantic source-path metadata."""
+
+    source_path: str | None = None
+
+
+def _canonical_json(value: dict) -> str:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
 def load_spec(path: str) -> dict:
     with open(path) as f:
-        return json.load(f)
+        parsed = json.load(f)
+    spec = LoadedSpec(parsed)
+    spec.source_path = os.path.abspath(path)
+    return spec
+
+
+def _plan_submission(spec: dict) -> dict | None:
+    """Freeze the exact loaded plan input without polluting pure in-memory specs.
+
+    ``expand_spec`` is also used directly in tests and library code. Only a
+    spec that came through ``load_spec`` has an original queue interaction to
+    preserve; arbitrary in-memory dicts therefore keep the historical job
+    shape and do not pretend they were submitted through the CLI.
+    """
+    source_path = getattr(spec, "source_path", None)
+    if not source_path:
+        return None
+    exact_spec = deepcopy(dict(spec))
+    canonical = _canonical_json(exact_spec)
+    return {
+        "schema": "ablator.submission/v1",
+        "surface": "plan",
+        "spec_path": source_path,
+        "spec_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "spec": exact_spec,
+        "ablation": exact_spec.get("name"),
+    }
 
 
 def _git_target_from_scope(scope: dict, *, where: str) -> tuple[str, str | None] | None:
@@ -105,6 +149,7 @@ def expand_spec(spec: dict,
     name = spec["name"]
     base = spec.get("base", {})
     parallel = spec.get("parallel", True)
+    submission = _plan_submission(spec)
     jobs: list[dict] = []
     prev_id: str | None = None
     prev_git_target: tuple[str, str | None] | None = None
@@ -139,6 +184,8 @@ def expand_spec(spec: dict,
             job["requested_git_sha"] = git_sha
             if git_repo is not None:
                 job["git_repo"] = git_repo
+        if submission is not None:
+            job["submission_provenance"] = deepcopy(submission)
         try:
             declaration = declarations.resolve_declaration(
                 spec.get("experiment"), arm.get("declaration"), arm_id
