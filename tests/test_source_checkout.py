@@ -1,5 +1,6 @@
 """Tests for immutable per-job Git checkout materialization."""
 
+import json
 import os
 import subprocess
 
@@ -173,6 +174,43 @@ def test_failed_submodule_initialization_removes_partial_worktree(tmp_path, monk
     with pytest.raises(source.SourcePreparationError, match="submodule setup failed"):
         source.prepare_job_source(
             _cfg(tmp_path), {"id": "broken", "requested_git_sha": sha},
+            "main", _tcfg(repo),
+        )
+
+    cache = tmp_path / "cache"
+    assert not list(cache.rglob("*.ablator.json"))
+    assert not [path for path in cache.rglob("*") if (path / ".git").exists()]
+
+
+def test_post_materialization_config_error_releases_lease(tmp_path):
+    repo, sha = _repo(tmp_path)
+    # The source path makes the container-reachability preflight pass, but it
+    # is only a working-directory flag, not a bind. Read-only bind validation
+    # therefore fails after the unique worktree has been materialized.
+    tcfg = {
+        "cwd": str(repo),
+        "command": ["docker", "run", "-w", str(repo), "image:test"],
+    }
+
+    with pytest.raises(source.SourcePreparationError, match="does not bind"):
+        source.prepare_job_source(
+            _cfg(tmp_path), {"id": "bad-mount", "requested_git_sha": sha},
+            "main", tcfg,
+        )
+
+    sidecars = list((tmp_path / "cache").rglob("*.ablator.json"))
+    assert len(sidecars) == 1
+    lease = json.loads(sidecars[0].read_text())
+    assert lease["active"] is False
+    assert lease["released_at"] >= lease["created_at"]
+
+
+def test_unavailable_commit_fails_without_creating_checkout_or_lease(tmp_path):
+    repo, _sha = _repo(tmp_path)
+    with pytest.raises(source.SourcePreparationError, match="fetch requested Git SHA"):
+        source.prepare_job_source(
+            _cfg(tmp_path),
+            {"id": "missing", "requested_git_sha": "1" * 40},
             "main", _tcfg(repo),
         )
 

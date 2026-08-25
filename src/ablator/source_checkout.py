@@ -611,11 +611,33 @@ def prepare_job_source(cfg: dict, job: dict, machine: str, tcfg: dict) -> Prepar
     repo, identity = _ensure_source_repo(source_cwd, job.get("git_repo"), root)
     lease, state = _materialize(repo, identity, requested, root, str(job.get("id") or "job"))
     checkout = lease.checkout
-    _validate_required_fixes(cfg, repo, checkout, requested)
-    rewritten = _replace_checkout(copy.deepcopy(tcfg), source_cwd, checkout)
-    rewritten["cwd"] = checkout
-    rewritten = _make_checkout_mount_read_only(rewritten, checkout)
-    rewritten.setdefault("env", {})["PYTHONDONTWRITEBYTECODE"] = "1"
+    partial = PreparedSource(
+        type_config={},
+        checkout_path=checkout,
+        requested_git_sha=requested,
+        source_repo=identity,
+        source_repo_path=repo,
+        lease=lease,
+        state=state,
+    )
+    try:
+        _validate_required_fixes(cfg, repo, checkout, requested)
+        rewritten = _replace_checkout(copy.deepcopy(tcfg), source_cwd, checkout)
+        rewritten["cwd"] = checkout
+        rewritten = _make_checkout_mount_read_only(rewritten, checkout)
+        rewritten.setdefault("env", {})["PYTHONDONTWRITEBYTECODE"] = "1"
+    except Exception as exc:
+        # Materialization is already durable at this point. Mark the lease
+        # inactive when later policy/config wiring rejects the launch so a
+        # never-executed checkout is not retained as an active orphan forever.
+        # Keep the checkout and sidecar as evidence for normal age-based GC.
+        try:
+            release_source(partial)
+        except SourcePreparationError as release_exc:
+            raise SourcePreparationError(
+                f"{exc}; source preparation cleanup also failed: {release_exc}"
+            ) from exc
+        raise
     return PreparedSource(
         type_config=rewritten,
         checkout_path=checkout,
