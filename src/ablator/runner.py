@@ -31,6 +31,7 @@ from . import experiment_declaration as declarations
 from . import health as healthmod
 from . import provenance as provmod
 from . import resources
+from . import source_checkout as sourcecheckout
 from . import self_check as selfcheckmod
 from .pause_revalidation import revalidate_pause
 from .queue import Queue, is_paused, pause_flag_path, write_pause_flag
@@ -236,6 +237,9 @@ def check_checkout_drift(cfg: dict, job: dict, machine: str, state: dict,
     `scripts/audit_run_drift.py`) makes the drift impossible to miss
     without blocking a job the user may have wanted to run as-is.
     """
+    if job.get("requested_git_sha"):
+        return
+
     warnings: list[str] = []
     fields: dict = {}
     commit = state.get("commit")
@@ -1135,7 +1139,7 @@ def build_k8s_job_manifest(mcfg: dict, job: dict, argv: list[str],
         volumes.append({"name": "repo-src", "emptyDir": {}})
         trainer_volume_mounts.append(
             {"name": "repo-src", "mountPath": workspace_path})
-        sha = local_commit or "HEAD"
+        sha = job.get("requested_git_sha") or local_commit or "HEAD"
         # git_sync_http_secret_name takes precedence if both are somehow set --
         # rewrite the remote URL to embed the token as an x-access-token
         # credential, rather than relying on GIT_SSH_COMMAND (which needs an
@@ -1467,9 +1471,23 @@ def run_job_k8s(cfg: dict, job: dict, machine: str, mcfg: dict,
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
     try:
         tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+        if job.get("requested_git_sha"):
+            if not mcfg.get("git_sync_repo_url"):
+                raise sourcecheckout.SourcePreparationError(
+                    "pinned k8s job requires machine git_sync_repo_url so the "
+                    "pod can materialize the requested SHA")
+            source_cwd = (cfg.get("types", {}).get(job.get("type", ""), {})
+                          .get("cwd"))
+            source_identity = sourcecheckout.validate_requested_revision_policy(
+                cfg, job, machine, source_cwd)
+            if q is not None:
+                q.update(job["id"], source_repo=source_identity,
+                         requested_git_sha=job.get("requested_git_sha"))
         argv, _env, cwd = render_command(tcfg, job, machine)
-    except (KeyError, TemplateError) as e:
+    except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:
         print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
+        if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):
+            q.update(job["id"], source_prepare_error=str(e))
         return "failed", None
 
     local_commit = _dispatch_host_commit(cfg, job)
@@ -1517,13 +1535,36 @@ def run_job(cfg: dict, job: dict, machine: str,
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
     try:
         tcfg = cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+        prepared_source = sourcecheckout.prepare_job_source(cfg, job, machine, tcfg)
+        tcfg = prepared_source.type_config
+        if prepared_source.checkout_path:
+            job = dict(job)
+            job["_prepared_repo_cwd"] = prepared_source.checkout_path
+            if q is not None:
+                q.update(
+                    job["id"],
+                    source_checkout=prepared_source.checkout_path,
+                    source_repo=prepared_source.source_repo,
+                    requested_git_sha=prepared_source.requested_git_sha,
+                )
         argv, env, cwd = render_command(tcfg, job, machine)
-    except (KeyError, TemplateError) as e:
+    except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:
         print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
+        if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):
+            q.update(job["id"], source_prepare_error=str(e))
         return "failed", None
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} (log {log_path})",
           flush=True)
     prov_state = capture_and_record_provenance(cfg, job, machine, cwd or os.getcwd(), q)
+    try:
+        executed_git_sha = sourcecheckout.verify_executed_provenance(job, prov_state)
+    except sourcecheckout.SourcePreparationError as e:
+        print(f"[ablator] {job['id']} source provenance rejected before launch: {e}", flush=True)
+        if q is not None:
+            q.update(job["id"], source_prepare_error=str(e))
+        return "failed", None
+    if executed_git_sha is not None and q is not None:
+        q.update(job["id"], executed_git_sha=executed_git_sha)
     check_checkout_drift(cfg, job, machine, prov_state, q)
     container_name = container_name_from_argv(argv)
     if container_name:
@@ -1685,10 +1726,15 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
     marked running-and-claimed-by-us predates this process and has no
     live supervise() loop watching it).
 
-    Only ever touches jobs with claimed_by == machine — a different
-    machine's claim is untouched, it self-heals on its own restart.
+    Requeue/crash handling below is only ever applied to jobs with
+    claimed_by == machine — a different machine's claim is left to that
+    behavior, self-healing on its own restart. But a job with a real
+    completion artifact is marked done regardless of which machine
+    claimed it (see the cross-machine dead-man's-switch pass below) —
+    that transition can never cause a duplicate launch, so it does not
+    need to wait for the owning machine's own runner to restart.
 
-    Never runs while the machine's busy-guards say something is still
+    Never requeues while the machine's busy-guards say something is still
     actually executing (e.g. the training container is still up): we
     cannot tell *which* job that process belongs to, and reconciling
     while it might still be writing results would risk a second runner
@@ -1712,13 +1758,56 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
     """
     if busy is None:
         busy = resources.machine_busy(cfg, machine)
-    if busy:
-        return
     is_k8s = cfgmod.machine_cfg(cfg, machine).get("backend") == "k8s"
     mcfg = cfgmod.machine_cfg(cfg, machine) if is_k8s else None
     grace_s = cfg.get("queue", {}).get("reconcile_grace_s", DEFAULT_RECONCILE_GRACE_S)
     for job in q.read():
-        if job.get("status") != "running" or job.get("claimed_by") != machine:
+        if job.get("status") != "running":
+            continue
+        claimed_by = job.get("claimed_by")
+
+        if claimed_by != machine:
+            # Cross-machine dead-man's-switch (found 2026-08-22,
+            # pixel10a_champ_champion): the OWN-claim self-heal below only
+            # ever runs from within a freshly (re)started/idle-ticking
+            # run_loop for the machine that claimed the job. If that
+            # machine's runner process dies outright (crashes silently,
+            # gets killed, or the host itself never restarts it) and
+            # nothing ever launches `ablator run`/`ablator start` there
+            # again, that machine's own self-heal never gets a chance to
+            # fire — confirmed live: main's runner process died mid-job
+            # with no traceback, the container it had launched kept
+            # training independently and finished cleanly with a real
+            # completion artifact, and the ledger entry stayed stuck at
+            # status="running" (serving an increasingly stale cached
+            # health snapshot) for over 24h until a human ran `ablator
+            # stop` by hand. A completion artifact is authoritative
+            # regardless of which machine claimed the job or whether that
+            # machine's own runner is still alive to notice it, and
+            # marking it done here can never race a duplicate dispatch
+            # (unlike the requeue-to-pending transition below, this one
+            # only ever moves a job further away from being claimable).
+            # Still respect the grace window so a job claimed moments ago
+            # (result_glob/log not written yet) isn't misread — though
+            # that can only ever produce a false "not done" here, never a
+            # false "done".
+            age_s = _claimed_age_s(job)
+            if age_s is not None and age_s < grace_s:
+                continue
+            base_dir = _job_base_dir(cfg, job, claimed_by or machine)
+            h = healthmod.job_health(job, base_dir, cfg.get("queue", {}),
+                                     process_alive=False)
+            if h["state"] == "done":
+                print(f"[ablator] reconcile: {job['id']} (claimed by "
+                      f"{claimed_by!r}) has a completion artifact but is "
+                      "stuck at 'running' -- that machine's own runner may "
+                      f"be dead with nothing left to notice; marking done "
+                      f"from {machine}'s idle tick", flush=True)
+                q.finish(job["id"], "done", health=h, reconciled=True,
+                        reconciled_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+            continue
+
+        if busy:
             continue
 
         # Grace window (issue splatograph#295): a job that was claimed only
@@ -2132,6 +2221,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
             # dispatch (step 2 below), which always runs regardless of
             # baremetal_busy.
             job = None
+            currency_ok = True
             if not baremetal_busy:
                 # Re-run bare-metal self-heal on every idle tick, not just at
                 # startup. The startup-only call can legitimately skip a job
@@ -2172,12 +2262,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 # auto-pull here can never yank code out from under a running
                 # bind-mounted job. See urgent_fixes.py for the full incident
                 # writeup and design rationale.
-                if not enforce_urgent_fixes(cfg, machine, q):
-                    if once:
-                        inflight.join_all()
-                        return
-                    time.sleep(IDLE_POLL_S)
-                    continue
+                currency_ok = enforce_urgent_fixes(cfg, machine, q)
 
                 # 1. Claim (non-blocking) this runner's own bare-metal job
                 # FIRST, before k8s claiming — this is what actually gives an
@@ -2187,7 +2272,10 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 # to step 3 (it's blocking) so it doesn't starve k8s
                 # concurrency in the meantime — see the design comment above
                 # for why that split matters.
-                job = q.claim_next(machine, can_run=make_can_run(cfg, machine))
+                job = q.claim_next(
+                    machine, can_run=make_can_run(cfg, machine),
+                    allow_pinned_git_while_paused=not currency_ok,
+                )
 
             # Preserve bare-metal priority through the new runner-provenance
             # write as well as through queue claiming.  If a k8s thread wins
@@ -2211,7 +2299,13 @@ def run_loop(cfg: dict, once: bool = False) -> None:
             defer_any = _other_idle_baremetal(cfg, machine)
             for k8s_name in k8s_machines:
                 cap = _k8s_max_concurrent(cfg, k8s_name)
-                can_run = make_can_run(cfg, k8s_name)
+                base_can_run = make_can_run(cfg, k8s_name)
+                if currency_ok:
+                    can_run = base_can_run
+                else:
+                    can_run = lambda candidate, inner=base_can_run: (
+                        bool(candidate.get("requested_git_sha")) and inner(candidate)
+                    )
                 while inflight.count(k8s_name) < cap:
                     kjob = q.claim_next(k8s_name, can_run=can_run,
                                         only_pinned=defer_any)

@@ -4,6 +4,7 @@ Spec format (JSON):
   {
     "name": "consol_sweep",
     "parallel": true,               // false = strictly sequential chain
+    "git_sha": "0123456789abcdef0123456789abcdef01234567", // optional
     "base": {"type": "replay", "scene": "/mnt/.../fr3",
              "iterations": 30000, "machine": "any",
              "base_args": "--opacity_reg 0.001"},
@@ -14,6 +15,17 @@ Spec format (JSON):
     ]
   }
 
+A Git target may also use the structured form::
+
+  "git": {
+    "repo": "https://github.com/example/project.git",
+    "sha": "0123456789abcdef0123456789abcdef01234567"
+  }
+
+Git targets inherit spec -> base -> arm, with the nearest declaration winning.
+Only immutable full 40-character commit SHAs are accepted.  Floating refs are
+intentionally not stored in queue jobs.
+
 model_path per job comes from a template (config [queue]
 model_path_template, default "output/scratch/{name}_{arm}").
 """
@@ -22,11 +34,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from copy import deepcopy
 
 from . import experiment_declaration as declarations
 
 DEFAULT_MODEL_PATH_TEMPLATE = "output/scratch/{name}_{arm}"
+_FULL_GIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 class LoadedSpec(dict):
@@ -75,6 +89,59 @@ def _plan_submission(spec: dict) -> dict | None:
     }
 
 
+def _git_target_from_scope(scope: dict, *, where: str) -> tuple[str, str | None] | None:
+    """Return ``(sha, repo)`` for one declaration scope.
+
+    ``git_sha`` is the compact form.  ``git`` is the extensible structured
+    form.  A single scope may not provide both: making one spelling canonical
+    at each level avoids a subtle class of configuration where two fields look
+    equivalent but disagree.
+    """
+    has_simple = "git_sha" in scope
+    has_structured = "git" in scope
+    if not has_simple and not has_structured:
+        return None
+    if has_simple and has_structured:
+        raise SystemExit(f"{where}: specify only one of 'git_sha' or 'git'")
+
+    repo: str | None = None
+    if has_simple:
+        sha = scope.get("git_sha")
+    else:
+        target = scope.get("git")
+        if not isinstance(target, dict):
+            raise SystemExit(f"{where}: 'git' must be an object with a 'sha' field")
+        unknown = sorted(set(target) - {"sha", "repo"})
+        if unknown:
+            raise SystemExit(f"{where}: unsupported git field(s): {', '.join(unknown)}")
+        sha = target.get("sha")
+        repo = target.get("repo")
+        if repo is not None and (not isinstance(repo, str) or not repo.strip()):
+            raise SystemExit(f"{where}: git.repo must be a non-empty string")
+        if isinstance(repo, str):
+            repo = repo.strip()
+
+    if not isinstance(sha, str) or _FULL_GIT_SHA.fullmatch(sha) is None:
+        raise SystemExit(
+            f"{where}: Git target must be a full 40-character hexadecimal commit SHA"
+        )
+    return sha.lower(), repo
+
+
+def _resolve_git_target(spec: dict, base: dict, arm: dict, *, name: str,
+                        arm_id: str) -> tuple[str, str | None] | None:
+    """Resolve the nearest Git target using arm > base > spec precedence."""
+    for scope, where in (
+        (arm, f"spec '{name}' arm '{arm_id}'"),
+        (base, f"spec '{name}' base"),
+        (spec, f"spec '{name}'"),
+    ):
+        target = _git_target_from_scope(scope, where=where)
+        if target is not None:
+            return target
+    return None
+
+
 def expand_spec(spec: dict,
                 model_path_template: str = DEFAULT_MODEL_PATH_TEMPLATE) -> list[dict]:
     """Pure expansion of an ablation spec into queue-job dicts."""
@@ -111,6 +178,12 @@ def expand_spec(spec: dict,
         }
         if submission is not None:
             job["submission_provenance"] = deepcopy(submission)
+        git_target = _resolve_git_target(spec, base, arm, name=name, arm_id=arm_id)
+        if git_target is not None:
+            git_sha, git_repo = git_target
+            job["requested_git_sha"] = git_sha
+            if git_repo is not None:
+                job["git_repo"] = git_repo
         try:
             declaration = declarations.resolve_declaration(
                 spec.get("experiment"), arm.get("declaration"), arm_id
