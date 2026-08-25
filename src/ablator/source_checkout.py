@@ -28,6 +28,7 @@ import os
 import re
 import subprocess
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator
@@ -43,12 +44,22 @@ class SourcePreparationError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class SourceLease:
+    checkout: str
+    sidecar: str
+    lock_path: str
+    lease_id: str
+
+
+@dataclass(frozen=True)
 class PreparedSource:
     type_config: dict
     checkout_path: str | None = None
     requested_git_sha: str | None = None
     source_repo: str | None = None
     source_repo_path: str | None = None
+    lease: SourceLease | None = None
+    state: dict | None = None
 
 
 _CONTAINER_RUNTIMES = {"docker", "podman"}
@@ -222,61 +233,187 @@ def _ensure_commit(repo: str, sha: str) -> None:
         )
 
 
-def _checkout_state(path: str) -> tuple[str, str]:
-    head = _require_ok(_git(path, "rev-parse", "HEAD", timeout=15),
-                       f"read checkout HEAD at {path}")
-    status = _require_ok(_git(path, "status", "--porcelain", timeout=15),
-                         f"read checkout status at {path}")
-    return head, status
+def _initialize_submodules(checkout: str) -> None:
+    """Materialize exactly the recursive submodule commits in the superproject."""
+    if not os.path.isfile(os.path.join(checkout, ".gitmodules")):
+        return
+    sync = _git(checkout, "submodule", "sync", "--recursive", timeout=90)
+    _require_ok(sync, f"synchronize submodules at {checkout}")
+    update = _git(
+        checkout,
+        "-c", "protocol.file.allow=always",
+        "submodule", "update", "--init", "--recursive", "--checkout",
+        timeout=300,
+    )
+    _require_ok(update, f"initialize submodules at {checkout}")
 
 
-def _materialize(repo: str, identity: str, sha: str, cache_root: str) -> str:
+def _submodule_state(checkout: str) -> list[dict]:
+    result = _git(checkout, "submodule", "status", "--recursive", timeout=60)
+    if result.returncode != 0:
+        _require_ok(result, f"read recursive submodule state at {checkout}")
+    # The first character is semantic (' ', '-', '+', or 'U'), so do not use
+    # _require_ok()'s whitespace-stripped successful value here.
+    output = result.stdout.rstrip()
+    state: list[dict] = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        marker = line[0]
+        fields = line[1:].split()
+        if len(fields) < 2:
+            raise SourcePreparationError(
+                f"could not parse submodule state at {checkout}: {line!r}"
+            )
+        sha, path = fields[:2]
+        if marker != " ":
+            meaning = {
+                "-": "uninitialized",
+                "+": "at a different commit",
+                "U": "conflicted",
+            }.get(marker, f"unexpected marker {marker!r}")
+            raise SourcePreparationError(f"submodule {path} is {meaning}")
+        submodule_path = os.path.join(checkout, path)
+        dirty_status = _require_ok(
+            _git(
+                submodule_path,
+                "status", "--porcelain", "--untracked-files=all",
+                timeout=30,
+            ),
+            f"read submodule status at {submodule_path}",
+        )
+        if dirty_status:
+            raise SourcePreparationError(f"submodule {path} is dirty")
+        state.append({"path": path, "sha": sha, "dirty": False})
+    return state
+
+
+def capture_checkout_state(path: str) -> dict:
+    """Capture and validate the complete source state of one worktree."""
+    head = _require_ok(
+        _git(path, "rev-parse", "HEAD", timeout=15),
+        f"read checkout HEAD at {path}",
+    )
+    symbolic = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD", timeout=15)
+    ref = symbolic.stdout.strip() if symbolic.returncode == 0 else "DETACHED"
+    submodules = _submodule_state(path)
+    status = _require_ok(
+        _git(path, "status", "--porcelain", "--untracked-files=all", timeout=15),
+        f"read checkout status at {path}",
+    )
+    if status:
+        raise SourcePreparationError(f"immutable checkout {path} is dirty")
+    return {
+        "commit": head,
+        "ref": ref,
+        "dirty": False,
+        "submodules": submodules,
+    }
+
+
+def _atomic_json_write(path: str, payload: dict) -> None:
+    temporary = f"{path}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        with open(temporary, "x") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def read_source_lease(lease: SourceLease | None) -> dict:
+    if lease is None:
+        raise SourcePreparationError("source lease is missing")
+    try:
+        with open(lease.sidecar) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError) as exc:
+        raise SourcePreparationError(
+            f"could not read source lease {lease.sidecar}: {exc}"
+        ) from exc
+    if data.get("lease_id") != lease.lease_id:
+        raise SourcePreparationError(
+            f"source lease identity changed at {lease.sidecar}"
+        )
+    return data
+
+
+def release_source(prepared: PreparedSource) -> None:
+    """Mark one execution worktree inactive after final attestation."""
+    lease = prepared.lease
+    if lease is None:
+        return
+    with _locked(lease.lock_path):
+        data = read_source_lease(lease)
+        data["active"] = False
+        data["released_at"] = time.time()
+        data["last_used_at"] = data["released_at"]
+        _atomic_json_write(lease.sidecar, data)
+
+
+def _materialize(
+    repo: str, identity: str, sha: str, cache_root: str, job_id: str,
+) -> tuple[SourceLease, dict]:
     repo_key = _repo_key(identity)
-    checkout = os.path.join(cache_root, repo_key, sha)
-    lock = os.path.join(cache_root, "_locks", f"{repo_key}-{sha}.lock")
+    lease_id = uuid.uuid4().hex
+    safe_job_id = _SAFE_NAME_RE.sub("-", str(job_id)).strip("-._")[:80] or "job"
+    checkout = os.path.join(
+        cache_root, repo_key, sha, f"{safe_job_id}-{lease_id}"
+    )
+    sidecar = f"{checkout}.ablator.json"
+    lock = os.path.join(cache_root, "_locks", f"repo-{repo_key}.lock")
+    lease = SourceLease(
+        checkout=checkout,
+        sidecar=sidecar,
+        lock_path=lock,
+        lease_id=lease_id,
+    )
 
     with _locked(lock):
         _ensure_commit(repo, sha)
         if os.path.exists(checkout):
-            if not _is_git_repo(checkout):
-                raise SourcePreparationError(
-                    f"cached checkout path exists but is not a Git worktree: {checkout}"
-                )
-            head, status = _checkout_state(checkout)
-            if head != sha:
-                raise SourcePreparationError(
-                    f"cached checkout {checkout} is at {head}, expected {sha}"
-                )
-            if status:
-                raise SourcePreparationError(
-                    f"cached immutable checkout {checkout} is dirty; refusing reuse"
-                )
-        else:
-            os.makedirs(os.path.dirname(checkout), exist_ok=True)
+            raise SourcePreparationError(
+                f"unique execution checkout path already exists: {checkout}"
+            )
+        os.makedirs(os.path.dirname(checkout), exist_ok=True)
+        try:
             result = _git(repo, "worktree", "add", "--detach", checkout, sha, timeout=90)
             _require_ok(result, f"materialize worktree for {sha}")
-            head, status = _checkout_state(checkout)
-            if head != sha or status:
+            _initialize_submodules(checkout)
+            state = capture_checkout_state(checkout)
+            if state["commit"] != sha or state["ref"] != "DETACHED":
                 raise SourcePreparationError(
-                    f"new worktree verification failed: head={head!r} dirty={bool(status)}"
+                    "new worktree verification failed: "
+                    f"head={state['commit']!r} ref={state['ref']!r}"
                 )
+            _atomic_json_write(sidecar, {
+                "schema": "ablator.source-lease/v1",
+                "lease_id": lease_id,
+                "job_id": str(job_id),
+                "active": True,
+                "sha": sha,
+                "repo": identity,
+                "checkout": checkout,
+                "source_repo_path": repo,
+                "lock_path": lock,
+                "created_at": time.time(),
+                "last_used_at": time.time(),
+            })
+        except Exception:
+            if _is_git_repo(checkout):
+                _git(repo, "worktree", "remove", "--force", checkout, timeout=90)
+            try:
+                os.remove(sidecar)
+            except FileNotFoundError:
+                pass
+            raise
 
-        # Sidecar metadata lives outside the checkout so it cannot make the
-        # immutable worktree dirty. #31 can build cache GC/leases on this.
-        sidecar = f"{checkout}.ablator.json"
-        try:
-            with open(sidecar, "w") as handle:
-                json.dump({
-                    "sha": sha,
-                    "repo": identity,
-                    "checkout": checkout,
-                    "source_repo_path": repo,
-                    "last_used_at": time.time(),
-                }, handle)
-        except OSError:
-            pass  # provenance safety does not depend on cache metadata
-
-    return checkout
+    return lease, state
 
 
 def _required_fix_shas(cfg: dict) -> list[tuple[str, str]]:
@@ -381,7 +518,8 @@ def prepare_job_source(cfg: dict, job: dict, machine: str, tcfg: dict) -> Prepar
 
     root = _cache_root(cfg, machine)
     repo, identity = _ensure_source_repo(source_cwd, job.get("git_repo"), root)
-    checkout = _materialize(repo, identity, requested, root)
+    lease, state = _materialize(repo, identity, requested, root, str(job.get("id") or "job"))
+    checkout = lease.checkout
     _validate_required_fixes(cfg, repo, checkout, requested)
     rewritten = _replace_checkout(copy.deepcopy(tcfg), source_cwd, checkout)
     rewritten["cwd"] = checkout
@@ -391,6 +529,8 @@ def prepare_job_source(cfg: dict, job: dict, machine: str, tcfg: dict) -> Prepar
         requested_git_sha=requested,
         source_repo=identity,
         source_repo_path=repo,
+        lease=lease,
+        state=state,
     )
 
 

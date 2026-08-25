@@ -70,7 +70,115 @@ def test_pinned_job_materializes_detached_clean_worktree_and_rewrites_paths(tmp_
     assert all(str(repo) not in token for token in prepared.type_config["command"])
 
     again = source.prepare_job_source(_cfg(tmp_path), job, "main", _tcfg(repo))
-    assert again.checkout_path == prepared.checkout_path
+    assert again.checkout_path != prepared.checkout_path
+    assert prepared.lease is not None
+    assert again.lease is not None
+    assert prepared.lease.lease_id != again.lease.lease_id
+
+
+def test_distinct_jobs_at_same_sha_never_share_execution_worktree(tmp_path):
+    repo, sha = _repo(tmp_path)
+    first = source.prepare_job_source(
+        _cfg(tmp_path), {"id": "first", "requested_git_sha": sha}, "main", _tcfg(repo)
+    )
+    second = source.prepare_job_source(
+        _cfg(tmp_path), {"id": "second", "requested_git_sha": sha}, "main", _tcfg(repo)
+    )
+    assert first.checkout_path != second.checkout_path
+
+
+def test_release_marks_only_own_lease_inactive(tmp_path):
+    repo, sha = _repo(tmp_path)
+    first = source.prepare_job_source(
+        _cfg(tmp_path), {"id": "first", "requested_git_sha": sha}, "main", _tcfg(repo)
+    )
+    second = source.prepare_job_source(
+        _cfg(tmp_path), {"id": "second", "requested_git_sha": sha}, "main", _tcfg(repo)
+    )
+
+    source.release_source(first)
+
+    assert source.read_source_lease(first.lease)["active"] is False
+    assert source.read_source_lease(second.lease)["active"] is True
+
+
+def test_recursive_submodules_are_initialized_at_recorded_commits(tmp_path):
+    child = tmp_path / "child"
+    child.mkdir()
+    _run("git", "init", "-b", "main", cwd=child)
+    _run("git", "config", "user.email", "test@example.com", cwd=child)
+    _run("git", "config", "user.name", "Ablator Test", cwd=child)
+    (child / "child.txt").write_text("child\n")
+    _run("git", "add", "child.txt", cwd=child)
+    _run("git", "commit", "-m", "child", cwd=child)
+    child_sha = _run("git", "rev-parse", "HEAD", cwd=child)
+
+    repo, _ = _repo(tmp_path)
+    _run(
+        "git", "-c", "protocol.file.allow=always", "submodule", "add",
+        str(child), "deps/child", cwd=repo,
+    )
+    _run("git", "commit", "-am", "add child", cwd=repo)
+    sha = _run("git", "rev-parse", "HEAD", cwd=repo)
+
+    prepared = source.prepare_job_source(
+        _cfg(tmp_path), {"id": "submodules", "requested_git_sha": sha},
+        "main", _tcfg(repo),
+    )
+
+    assert (prepared.checkout_path and
+            os.path.exists(os.path.join(prepared.checkout_path, "deps/child/child.txt")))
+    assert prepared.state is not None
+    assert prepared.state["submodules"] == [{
+        "path": "deps/child",
+        "sha": child_sha,
+        "dirty": False,
+    }]
+
+
+def test_submodule_drift_is_rejected_by_checkout_state(tmp_path):
+    child = tmp_path / "child"
+    child.mkdir()
+    _run("git", "init", "-b", "main", cwd=child)
+    _run("git", "config", "user.email", "test@example.com", cwd=child)
+    _run("git", "config", "user.name", "Ablator Test", cwd=child)
+    (child / "child.txt").write_text("child\n")
+    _run("git", "add", "child.txt", cwd=child)
+    _run("git", "commit", "-m", "child", cwd=child)
+    repo, _ = _repo(tmp_path)
+    _run(
+        "git", "-c", "protocol.file.allow=always", "submodule", "add",
+        str(child), "deps/child", cwd=repo,
+    )
+    _run("git", "commit", "-am", "add child", cwd=repo)
+    sha = _run("git", "rev-parse", "HEAD", cwd=repo)
+    prepared = source.prepare_job_source(
+        _cfg(tmp_path), {"id": "submodules", "requested_git_sha": sha},
+        "main", _tcfg(repo),
+    )
+    with open(os.path.join(prepared.checkout_path, "deps/child/child.txt"), "a") as handle:
+        handle.write("drift\n")
+
+    with pytest.raises(source.SourcePreparationError, match="submodule.*dirty"):
+        source.capture_checkout_state(prepared.checkout_path)
+
+
+def test_failed_submodule_initialization_removes_partial_worktree(tmp_path, monkeypatch):
+    repo, sha = _repo(tmp_path)
+
+    def fail(_checkout):
+        raise source.SourcePreparationError("submodule setup failed")
+
+    monkeypatch.setattr(source, "_initialize_submodules", fail)
+    with pytest.raises(source.SourcePreparationError, match="submodule setup failed"):
+        source.prepare_job_source(
+            _cfg(tmp_path), {"id": "broken", "requested_git_sha": sha},
+            "main", _tcfg(repo),
+        )
+
+    cache = tmp_path / "cache"
+    assert not list(cache.rglob("*.ablator.json"))
+    assert not [path for path in cache.rglob("*") if (path / ".git").exists()]
 
 
 def test_repo_cwd_template_is_supported_for_container_mounts(tmp_path):
@@ -94,14 +202,17 @@ def test_pinned_container_without_source_mount_is_rejected(tmp_path):
         )
 
 
-def test_dirty_cached_worktree_is_never_reused(tmp_path):
+def test_dirty_prior_worktree_is_never_reused(tmp_path):
     repo, sha = _repo(tmp_path)
     job = {"id": "pin", "requested_git_sha": sha}
     prepared = source.prepare_job_source(_cfg(tmp_path), job, "main", _tcfg(repo))
     with open(os.path.join(prepared.checkout_path, "payload.txt"), "a") as handle:
         handle.write("dirty\n")
     with pytest.raises(source.SourcePreparationError, match="dirty"):
-        source.prepare_job_source(_cfg(tmp_path), job, "main", _tcfg(repo))
+        source.capture_checkout_state(prepared.checkout_path)
+    replacement = source.prepare_job_source(_cfg(tmp_path), job, "main", _tcfg(repo))
+    assert replacement.checkout_path != prepared.checkout_path
+    assert replacement.state["dirty"] is False
 
 
 def test_git_repo_can_bootstrap_when_type_cwd_is_absent(tmp_path):
