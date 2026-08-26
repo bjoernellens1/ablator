@@ -113,6 +113,84 @@ def test_enforce_noop_when_not_configured(tmp_path):
     assert ufmod.enforce_urgent_fixes(cfg, "main", q) is True
 
 
+def _external_researchflow_job():
+    from ablator import experiment_declaration as declarations
+    job = {
+        "id": "rf-job",
+        "external_id": "rf-job",
+        "external_schema": "ablator.external-job/v1",
+        "external_metadata": {},
+        "params": {},
+        "source": "external",
+        "type": "researchflow",
+        "machine": "main",
+        "lane": 2,
+        "depends_on": None,
+        "status": "pending",
+    }
+    submission, digest = declarations.freeze_external_submission(job)
+    job["submission_provenance"] = submission
+    job["external_spec_sha256"] = digest
+    return job
+
+
+def test_queue_can_claim_external_researchflow_during_urgent_fix_pause(tmp_path):
+    from ablator.queue import write_pause_flag
+    path = str(tmp_path / "queue.jsonl")
+    q = Queue(path)
+    q.append([_external_researchflow_job()])
+    write_pause_flag(path, "main", "urgent_fix_unsynced", "stale checkout")
+
+    assert q.claim_next("main") is None
+    job = q.claim_next("main", allow_pinned_git_while_paused=True)
+    assert job["id"] == "rf-job"
+
+    ordinary_path = str(tmp_path / "ordinary-queue.jsonl")
+    ordinary_q = Queue(ordinary_path)
+    ordinary_q.append([{
+        "id": "replay-job",
+        "source": "internal",
+        "type": "replay",
+        "machine": "main",
+        "status": "pending",
+    }])
+    write_pause_flag(ordinary_path, "main", "urgent_fix_unsynced", "stale checkout")
+    assert ordinary_q.claim_next(
+        "main", allow_pinned_git_while_paused=True
+    ) is None
+
+
+def test_manual_pause_still_blocks_external_researchflow(tmp_path):
+    from ablator.queue import write_pause_flag
+    path = str(tmp_path / "queue.jsonl")
+    q = Queue(path)
+    q.append([_external_researchflow_job()])
+    write_pause_flag(path, "main", "manual_pause", "operator request")
+
+    assert q.claim_next(
+        "main", allow_pinned_git_while_paused=True
+    ) is None
+
+
+def test_mutated_ordinary_job_cannot_forge_researchflow_pause_bypass(tmp_path):
+    from ablator.queue import write_pause_flag
+    path = str(tmp_path / "queue.jsonl")
+    q = Queue(path)
+    q.append([{
+        "id": "ordinary",
+        "source": "internal",
+        "type": "replay",
+        "machine": "main",
+        "status": "pending",
+    }])
+    q.update("ordinary", source="external", type="researchflow")
+    write_pause_flag(path, "main", "urgent_fix_unsynced", "stale checkout")
+
+    assert q.claim_next(
+        "main", allow_pinned_git_while_paused=True
+    ) is None
+
+
 def test_enforce_noop_when_already_current(tmp_path):
     repo = tmp_path / "repo"
     _init_repo(repo)
