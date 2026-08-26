@@ -36,7 +36,13 @@ from . import resources
 from . import source_checkout as sourcecheckout
 from . import self_check as selfcheckmod
 from .pause_revalidation import revalidate_pause
-from .queue import Queue, is_paused, pause_flag_path, write_pause_flag
+from .queue import (
+    Queue,
+    can_bypass_urgent_fix_pause,
+    is_paused,
+    pause_flag_path,
+    write_pause_flag,
+)
 from .urgent_fixes import enforce_urgent_fixes, load_urgent_fixes
 
 IDLE_POLL_S = 30
@@ -2928,7 +2934,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                     can_run = base_can_run
                 else:
                     can_run = lambda candidate, inner=base_can_run: (
-                        bool(candidate.get("requested_git_sha")) and inner(candidate)
+                        can_bypass_urgent_fix_pause(candidate) and inner(candidate)
                     )
                 while inflight.count(k8s_name) < cap:
                     kjob = q.claim_next(k8s_name, can_run=can_run,

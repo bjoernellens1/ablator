@@ -54,6 +54,25 @@ def read_pause_flag(queue_path: str, machine: str) -> dict | None:
     return info or None
 
 
+def can_bypass_urgent_fix_pause(job: dict) -> bool:
+    """Whether a job has an independent source-currency contract.
+
+    Git-pinned jobs validate their requested revision in the immutable source
+    preparation path. External ResearchFlow jobs likewise execute a pinned
+    ResearchFlow runtime and validate their pinned gs-slam-bench checkout in
+    the jobscript. Neither should be stranded by the runner's unrelated
+    mutable Splatograph checkout pause. All other jobs remain gated.
+    """
+    if job.get("requested_git_sha"):
+        return True
+    if job.get("source") != "external" or job.get("type") != "researchflow":
+        return False
+    try:
+        return declarations.validate_external_submission(job) is not None
+    except declarations.ExperimentDeclarationError:
+        return False
+
+
 def _pause_audit_path(queue_path: str) -> str:
     return os.path.join(os.path.dirname(queue_path), "pause_audit.log")
 
@@ -355,10 +374,10 @@ class Queue:
         A machine-level pause flag (see pause_flag_path) normally blocks new
         claims without disturbing already-running jobs. When
         ``allow_pinned_git_while_paused`` is true, the one auto-generated
-        ``urgent_fix_unsynced`` category becomes a pinned-Git-only filter:
-        legacy mutable jobs remain blocked, while immutable jobs may be
-        claimed and validate their requested revision independently before
-        launch. Manual and unknown pause categories remain absolute.
+        ``urgent_fix_unsynced`` category becomes an independent-currency
+        filter: legacy mutable jobs remain blocked, while Git-pinned jobs and
+        external ResearchFlow jobs may use their own source validation.
+        Manual and unknown pause categories remain absolute.
 
         A queue-flock timeout
         (contended/hung NFS lock) returns None rather than blocking
@@ -385,7 +404,7 @@ class Queue:
                         continue
                     if j.get("status") != "pending":
                         continue
-                    if paused_pinned_only and not j.get("requested_git_sha"):
+                    if paused_pinned_only and not can_bypass_urgent_fix_pause(j):
                         continue
                     jm = j.get("machine", "any")
                     if only_pinned:
