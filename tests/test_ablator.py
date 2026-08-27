@@ -429,6 +429,29 @@ def test_run_loop_once_executes_and_retries(tmp_path, monkeypatch):
     assert read_queue(q.path)[0]["status"] == "done"
 
 
+def test_run_loop_never_retries_immutable_external_job(tmp_path, monkeypatch):
+    """A failed immutable ResearchFlow job must keep its first-attempt evidence."""
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    cfg["types"]["replay"] = {"command": ["false"]}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{
+        "id": "immutable", "machine": "any", "type": "replay",
+        "scene": "/s", "model_path": "m", "status": "pending",
+        "external_metadata": {"retry_policy": "never"},
+    }])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+
+    runner.run_loop(cfg, once=True)
+
+    job = read_queue(q.path)[0]
+    assert job["status"] == "quarantined"
+    assert job.get("retried") is not True
+    assert job["retry_suppressed"] is True
+    assert job["suggested_action"] == "retry_suppressed_immutable"
+
+
 # -------------------------------------------------------------- config load
 
 def test_load_config_json_and_toml(tmp_path, monkeypatch):
