@@ -67,7 +67,7 @@ def test_explicit_urgent_fix_is_required_of_pinned_revision(tmp_path):
     _run("git", "commit", "-m", "feature", cwd=repo)
     feature_sha = _run("git", "rev-parse", "HEAD", cwd=repo)
 
-    cfg = _cfg(tmp_path, urgent_fixes={"fixes": [
+    cfg = _cfg(tmp_path, urgent_fixes={"repo_cwd": str(repo), "fixes": [
         {"sha": fix_sha, "subject": "required safety fix"}
     ]})
     with pytest.raises(source.SourcePreparationError, match="omits mandatory urgent fix"):

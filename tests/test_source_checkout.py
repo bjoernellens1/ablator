@@ -345,6 +345,49 @@ def test_explicit_local_git_repo_matching_checkout_origin_is_accepted(tmp_path):
     assert source.capture_checkout_state(prepared.checkout_path)["commit"] == sha
 
 
+def test_urgent_fixes_are_not_applied_to_an_unrelated_pinned_repository(tmp_path):
+    urgent_root = tmp_path / "urgent"
+    unrelated_root = tmp_path / "unrelated"
+    urgent_root.mkdir()
+    unrelated_root.mkdir()
+    urgent_repo, required_sha = _repo(urgent_root)
+    unrelated_repo, unrelated_sha = _repo(unrelated_root)
+    cfg = _cfg(tmp_path)
+    cfg["urgent_fixes"] = {
+        "repo_cwd": str(urgent_repo),
+        "fixes": [{"sha": required_sha, "subject": "Splatograph fix"}],
+    }
+
+    prepared = source.prepare_job_source(
+        cfg, {"id": "other-project", "requested_git_sha": unrelated_sha},
+        "main", _tcfg(unrelated_repo),
+    )
+
+    assert prepared.checkout_path
+    assert source.validate_requested_revision_policy(
+        cfg, {"id": "other-project", "requested_git_sha": unrelated_sha},
+        "main", str(unrelated_repo),
+    ) == str(unrelated_repo)
+
+
+def test_urgent_fixes_remain_required_for_the_configured_repository(tmp_path):
+    repo, base_sha = _repo(tmp_path)
+    (repo / "payload.txt").write_text("required fix\n")
+    _run("git", "commit", "-am", "required fix", cwd=repo)
+    required_sha = _run("git", "rev-parse", "HEAD", cwd=repo)
+    cfg = _cfg(tmp_path)
+    cfg["urgent_fixes"] = {
+        "repo_cwd": str(repo),
+        "fixes": [{"sha": required_sha, "subject": "Splatograph fix"}],
+    }
+
+    with pytest.raises(source.SourcePreparationError, match="omits mandatory urgent fix"):
+        source.prepare_job_source(
+            cfg, {"id": "stale", "requested_git_sha": base_sha},
+            "main", _tcfg(repo),
+        )
+
+
 def test_pinned_direct_process_disables_bytecode_writes(tmp_path):
     repo, sha = _repo(tmp_path)
     prepared = source.prepare_job_source(

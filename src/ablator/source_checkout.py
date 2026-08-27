@@ -543,8 +543,30 @@ def _required_fix_shas(cfg: dict) -> list[tuple[str, str]]:
     return out
 
 
+def _urgent_fixes_apply_to_repo(cfg: dict, machine: str, repo: str) -> bool:
+    """Return whether ``repo`` is the configured urgent-fix repository."""
+    urgent_cfg = cfg.get("urgent_fixes") or {}
+    machine_cfg = (urgent_cfg.get("machines") or {}).get(machine) or {}
+    configured = machine_cfg.get("repo_cwd") or urgent_cfg.get("repo_cwd")
+    if not configured or not _is_git_repo(configured):
+        return False
+    configured = os.path.realpath(configured)
+    repo = os.path.realpath(repo)
+    if git_common_dir(configured) == git_common_dir(repo):
+        return True
+    configured_origin = _origin_url(configured)
+    repo_origin = _origin_url(repo)
+    return bool(
+        configured_origin and repo_origin
+        and _canonical_remote_identity(configured_origin, base=configured)
+        == _canonical_remote_identity(repo_origin, base=repo)
+    )
+
+
 def _validate_required_fixes(cfg: dict, repo: str, checkout: str,
-                             requested: str) -> None:
+                             requested: str, machine: str) -> None:
+    if not _urgent_fixes_apply_to_repo(cfg, machine, repo):
+        return
     for required, subject in _required_fix_shas(cfg):
         _ensure_commit(repo, required)
         result = _git(checkout, "merge-base", "--is-ancestor", required, "HEAD", timeout=20)
@@ -572,14 +594,15 @@ def validate_requested_revision_policy(
     root = _cache_root(cfg, machine)
     repo, identity = _ensure_source_repo(source_cwd, job.get("git_repo"), root)
     _ensure_commit(repo, requested)
-    for required, subject in _required_fix_shas(cfg):
-        _ensure_commit(repo, required)
-        result = _git(repo, "merge-base", "--is-ancestor", required, requested, timeout=20)
-        if result.returncode != 0:
-            raise SourcePreparationError(
-                f"requested Git SHA {requested} omits mandatory urgent fix "
-                f"{required} ({subject}); refusing this job without pausing the machine"
-            )
+    if _urgent_fixes_apply_to_repo(cfg, machine, repo):
+        for required, subject in _required_fix_shas(cfg):
+            _ensure_commit(repo, required)
+            result = _git(repo, "merge-base", "--is-ancestor", required, requested, timeout=20)
+            if result.returncode != 0:
+                raise SourcePreparationError(
+                    f"requested Git SHA {requested} omits mandatory urgent fix "
+                    f"{required} ({subject}); refusing this job without pausing the machine"
+                )
     return identity
 
 
@@ -742,7 +765,7 @@ def prepare_job_source(cfg: dict, job: dict, machine: str, tcfg: dict) -> Prepar
         state=state,
     )
     try:
-        _validate_required_fixes(cfg, repo, checkout, requested)
+        _validate_required_fixes(cfg, repo, checkout, requested, machine)
         rewritten = _replace_checkout(copy.deepcopy(tcfg), source_cwd, checkout)
         rewritten["cwd"] = checkout
         rewritten = _make_checkout_mount_read_only(rewritten, checkout)
