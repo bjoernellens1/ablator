@@ -259,7 +259,7 @@ def _canonical_json(value: Any) -> str:
 
 def _external_submission_content(job: Mapping[str, Any]) -> dict[str, Any]:
     """Return every external input whose identity is frozen at submission."""
-    return {
+    content = {
         "schema": "ablator.submission/v1",
         "surface": "submit",
         "job_id": str(job.get("id") or ""),
@@ -274,6 +274,13 @@ def _external_submission_content(job: Mapping[str, Any]) -> dict[str, Any]:
         "git_repo": job.get("git_repo"),
         "external_schema": job.get("external_schema"),
     }
+    # Keep legacy undeclared external jobs hash-compatible while binding a
+    # declaration into the immutable submit identity whenever one is present.
+    if job.get("experiment_declaration_sha256") is not None:
+        content["experiment_declaration_sha256"] = job[
+            "experiment_declaration_sha256"
+        ]
+    return content
 
 
 def freeze_external_submission(job: Mapping[str, Any]) -> tuple[dict[str, Any], str]:

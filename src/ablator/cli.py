@@ -469,6 +469,11 @@ def main(argv: list[str] | None = None) -> None:
     sp.add_argument("--machine", default="any")
     sp.add_argument("--param", action="append", default=[])
     sp.add_argument("--metadata-json", default="{}")
+    sp.add_argument(
+        "--experiment-declaration-json", "--declaration-json",
+        dest="experiment_declaration_json",
+        help="validated immutable experiment declaration JSON object",
+    )
     sp.add_argument("--lane", type=int, default=2)
     sp.add_argument("--depends-on")
     sp.add_argument("--git-sha")
@@ -543,10 +548,14 @@ def main(argv: list[str] | None = None) -> None:
     if a.cmd == "submit":
         params = externalmod.parse_key_values(a.param)
         metadata = externalmod.parse_metadata_json(a.metadata_json)
+        declaration = externalmod.parse_experiment_declaration_json(
+            a.experiment_declaration_json
+        )
         job = externalmod.build_job(
             cfg, job_id=a.id, job_type=a.job_type, machine=a.machine,
             params=params, metadata=metadata, lane=a.lane, depends_on=a.depends_on,
-            git_sha=a.git_sha, git_repo=a.git_repo)
+            git_sha=a.git_sha, git_repo=a.git_repo,
+            experiment_declaration=declaration)
         record, created = externalmod.submit_job(cfg, job)
         externalmod.print_json({
             "schema": externalmod.SCHEMA, "job_id": record["id"],
