@@ -93,6 +93,30 @@ def test_running_cancel_uses_existing_control_protocol(tmp_path: Path) -> None:
     assert (tmp_path / "control_job-running").read_text() == "skip\n"
 
 
+def test_rerun_clears_stale_receipt_and_provenance(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(cfg, job_id="job-rerun", job_type="researchflow", params={"jobscript": "a.sh"})
+    submit_job(cfg, job)
+    Queue(cfg["queue"]["path"]).update(
+        "job-rerun", status="quarantined", error_category="unknown",
+        error_evidence="old failure", executed_git_sha=None,
+        runner_provenance={"git_commit": "old"},
+        provenance={"commit": "old"}, image_provenance={"baked_commit": "old"},
+        dispatch_host_commit="old", finished_at="yesterday",
+    )
+
+    cli.cmd_rerun(cfg, "job-rerun")
+    record = Queue(cfg["queue"]["path"]).read()[0]
+    assert record["status"] == "pending"
+    assert record["rerun_count"] == 1
+    assert record["rerun_started_at"]
+    for key in ("error_category", "error_evidence", "executed_git_sha",
+                "runner_provenance", "provenance", "image_provenance",
+                "dispatch_host_commit", "finished_at"):
+        assert key not in record
+    assert inspect_job(cfg, "job-rerun")["status"] == "pending"
+
+
 def test_external_params_become_generic_template_variables(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     job = build_job(

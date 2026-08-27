@@ -341,8 +341,14 @@ def cmd_rerun(cfg: dict, job_id: str, lane_str: str | None = None) -> None:
         target["status"] = "pending"
         target["rerun_count"] = int(target.get("rerun_count", 0)) + 1
         target["rerun_of_status"] = prev_status
+        target["rerun_started_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        target["execution_attempt"] = target["rerun_count"] + 1
         for k in ("claimed_by", "claimed_at", "finished_at", "health",
-                  "retried", "note", "resume_checkpoint", "last_resumed_iter"):
+                  "retried", "note", "resume_checkpoint", "last_resumed_iter",
+                  "error_category", "error_evidence", "error_confidence",
+                  "suggested_action", "runner_provenance", "provenance",
+                  "image_provenance", "dispatch_host_commit", "executed_git_sha",
+                  "source_checkout", "source_prepare_error"):
             target.pop(k, None)
         if lane_str is not None:
             target["lane"] = int(lane_str)
