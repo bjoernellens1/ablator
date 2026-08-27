@@ -24,6 +24,23 @@ from ablator.queue import Queue
 SHA_A = "0123456789abcdef0123456789abcdef01234567"
 
 
+def _declaration(arm_id: str = "control") -> dict:
+    return {
+        "schema_version": 1,
+        "run_class": "experiment",
+        "experiment_id": "external_transport",
+        "title": "External declaration transport",
+        "purpose": "Verify immutable declaration forwarding",
+        "owner_refs": ["splatograph#705"],
+        "expected_evidence": ["declaration hash"],
+        "arm": {
+            "id": arm_id,
+            "comparison_role": "control",
+            "manipulation": "none",
+        },
+    }
+
+
 def _cfg(tmp_path: Path, *, require_pin: bool = False) -> dict:
     config = tmp_path / "ablator.json"
     queue = tmp_path / "queue.jsonl"
@@ -198,6 +215,42 @@ def test_complete_external_submission_is_frozen_and_protected(tmp_path: Path) ->
     ):
         with pytest.raises(SystemExit, match=f"immutable {field}"):
             queue.update("frozen", **{field: changed})
+
+
+def test_external_submit_freezes_declaration_for_runner_and_idempotency(
+    tmp_path: Path,
+) -> None:
+    cfg = _cfg(tmp_path)
+    job = build_job(
+        cfg,
+        job_id="declared-external",
+        job_type="researchflow",
+        experiment_declaration=_declaration(),
+        git_sha=SHA_A,
+    )
+
+    assert job["experiment_declaration"] == _declaration()
+    assert job["experiment_declaration_sha256"] == experiment_declaration.declaration_sha256(
+        _declaration()
+    )
+    env = experiment_declaration.experiment_environment(job)
+    assert env[experiment_declaration.DECLARATION_ENV] == job[
+        "experiment_declaration_json"
+    ]
+    assert env[experiment_declaration.DECLARATION_SHA_ENV] == job[
+        "experiment_declaration_sha256"
+    ]
+
+    submit_job(cfg, job)
+    changed = build_job(
+        cfg,
+        job_id="declared-external",
+        job_type="researchflow",
+        experiment_declaration=_declaration("candidate"),
+        git_sha=SHA_A,
+    )
+    with pytest.raises(ExternalJobError, match="different specification"):
+        submit_job(cfg, changed)
 
 
 def test_legacy_external_record_without_frozen_envelope_fails_closed():
@@ -384,3 +437,22 @@ def test_cli_submit_transports_git_target(tmp_path: Path, capsys: pytest.Capture
     inspected = _last_json(capsys.readouterr().out)
     assert inspected["requested_git_sha"] == SHA_A
     assert inspected["git_repo"] == "https://github.com/example/project.git"
+
+
+def test_cli_submit_transports_external_experiment_declaration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _cfg(tmp_path)
+    cli.main(
+        [
+            "--config", cfg["_path"], "submit", "--format", "json",
+            "--id", "cli-declared", "--type", "researchflow",
+            "--git-sha", SHA_A,
+            "--experiment-declaration-json", json.dumps(_declaration()),
+        ]
+    )
+    _last_json(capsys.readouterr().out)
+    cli.main(["--config", cfg["_path"], "inspect", "--format", "json", "cli-declared"])
+    inspected = _last_json(capsys.readouterr().out)
+    assert inspected["gradeability"] == "GRADEABLE_DECLARED"
+    assert inspected["experiment_declaration"] == _declaration()

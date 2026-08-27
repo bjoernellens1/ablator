@@ -17,7 +17,7 @@ import subprocess
 import time
 from copy import deepcopy
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from . import config as cfgmod
 from . import experiment_declaration as declarations
@@ -86,6 +86,7 @@ def build_job(
     machine: str = "any",
     params: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
+    experiment_declaration: Mapping[str, Any] | None = None,
     lane: int = 2,
     depends_on: str | None = None,
     git_sha: str | None = None,
@@ -143,6 +144,11 @@ def build_job(
         job["requested_git_sha"] = git_target[0]
         if git_target[1] is not None:
             job["git_repo"] = git_target[1]
+    if experiment_declaration is not None:
+        try:
+            job.update(declarations.freeze_declaration(experiment_declaration))
+        except declarations.ExperimentDeclarationError as exc:
+            raise ExternalJobError(str(exc)) from exc
     submission, digest = declarations.freeze_external_submission(job)
     job["external_spec_sha256"] = digest
     job["submission_provenance"] = submission
@@ -190,7 +196,7 @@ def inspect_job(cfg: dict[str, Any], job_id: str) -> dict[str, Any]:
     )
     if record is None:
         raise ExternalJobError(f"no job {job_id!r} in queue")
-    return {
+    result = {
         "schema": SCHEMA,
         "job_id": job_id,
         "status": str(record.get("status") or "unknown"),
@@ -215,6 +221,20 @@ def inspect_job(cfg: dict[str, Any], job_id: str) -> dict[str, Any]:
         **sourcedisplay.inspect_fields(record),
         "terminal": str(record.get("status")) in TERMINAL_STATES,
     }
+    if record.get("experiment_declaration") is not None:
+        result.update(
+            {
+                "experiment_declaration": record.get("experiment_declaration"),
+                "experiment_declaration_json": record.get(
+                    "experiment_declaration_json"
+                ),
+                "experiment_declaration_sha256": record.get(
+                    "experiment_declaration_sha256"
+                ),
+                "gradeability": record.get("gradeability"),
+            }
+        )
+    return result
 
 
 def cancel_jobs(cfg: dict[str, Any], job_ids: list[str]) -> list[dict[str, Any]]:
@@ -318,6 +338,21 @@ def parse_metadata_json(raw: str | None) -> dict[str, Any]:
         raise ExternalJobError(f"invalid --metadata-json: {exc}") from exc
     if not isinstance(value, dict):
         raise ExternalJobError("--metadata-json must contain a JSON object")
+    return value
+
+
+def parse_experiment_declaration_json(raw: str | None) -> dict[str, Any] | None:
+    """Parse an optional immutable experiment declaration JSON object."""
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ExternalJobError(f"invalid --experiment-declaration-json: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ExternalJobError(
+            "--experiment-declaration-json must contain a JSON object"
+        )
     return value
 
 
