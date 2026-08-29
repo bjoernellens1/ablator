@@ -54,6 +54,24 @@ completion signal to OR against `result_glob` rather than replace it with.
 Set `complete_marker = ""` under `[queue]` (or a per-type override) to
 disable this check entirely and fall back to `result_glob`-only behavior.
 
+`complete_marker` also accepts a list of names (ANY existing counts as
+`done`), e.g. `complete_marker = [".COMPLETE", "causal_replay_summary.json"]`.
+This is needed because `.COMPLETE` itself is not equally reliable across
+every trainer: confirmed live 2026-08-29 that splatograph's `causal_mapping`
+trainer does not go through the same shared output-staging finalization
+path as `train.py`/`train_streaming.py` and does not reliably rewrite
+`.COMPLETE` on every attempt (one job's `.COMPLETE` was ~35 minutes stale
+across two back-to-back genuinely-successful reruns), while its own
+`causal_replay_summary.json` was rewritten fresh on both. **Caveat**:
+`causal_replay_summary.json` is written by that trainer BEFORE its
+post-mapping refinement phase runs, so a job configured with a non-zero
+refinement budget that gets killed during refinement would read as `done`
+under this marker — a real, narrower gap, not a full fix. The correct
+long-term fix is for `causal_entry.py` to route through the same shared
+completion tail (`splatograph.runtime.finalize`) the other two trainers use;
+until then, only add `causal_replay_summary.json` to `complete_marker` for
+job types/specs known not to configure real post-mapping refinement.
+
 ## `ablator errors [name]`
 
 Classifies **terminal** (failed/quarantined) jobs and machine-level

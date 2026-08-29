@@ -47,6 +47,43 @@ DEFAULT_RESULT_GLOB = "comparison/*/report.json"
 DEFAULT_COMPLETE_MARKER = ".COMPLETE"
 CRASH_TAIL_BYTES = 4096
 
+
+def complete_markers(qcfg: dict) -> tuple[str, ...]:
+    """Resolve the configured `complete_marker` into a tuple of candidate
+    filenames, ANY of which existing at the resolved model_path counts as
+    completion evidence.
+
+    Accepts a single string (the common case, e.g. ".COMPLETE") or a
+    list/tuple of strings. Needed because `.COMPLETE` is reliable evidence
+    for splatograph's train.py/train_streaming.py (written once, at the very
+    end of ANY trainer's output-staging finalization) but NOT for every
+    trainer: confirmed live 2026-08-29 that the causal_mapping trainer's
+    `.COMPLETE` is written on some attempts and not others (its own
+    finalization does not go through the shared output-staging tail that
+    guarantees this for the other two trainers) — one real job had a
+    `.COMPLETE` mtime ~35 minutes stale across two back-to-back genuinely-
+    successful reruns, while its `causal_replay_summary.json` (written near
+    the end of that trainer's mapping phase, before any post-mapping
+    refinement) was freshly rewritten on both. A site that runs
+    causal_mapping jobs can list both:
+        complete_marker = [".COMPLETE", "causal_replay_summary.json"]
+    Caveat carried over into any such config: `causal_replay_summary.json`
+    is written BEFORE that trainer's post-mapping refinement phase, so a job
+    killed during refinement would read as done under this marker. This is
+    a strictly narrower failure than every causal_mapping job with no
+    refinement configured (the case in production today) being quarantined
+    unconditionally -- but it is a real, known gap, not a full fix; the
+    correct long-term fix is for causal_entry.py to route through the same
+    shared output-staging completion tail (splatograph.runtime.finalize)
+    that train.py/train_streaming.py already use.
+    """
+    v = qcfg.get("complete_marker", DEFAULT_COMPLETE_MARKER)
+    if not v:
+        return ()
+    if isinstance(v, str):
+        return (v,)
+    return tuple(v)
+
 DEFAULT_CRASH_MARKERS = [
     "Traceback (most recent call last)",
     "CUDA error",
@@ -126,14 +163,15 @@ def job_health(job: dict, base_dir: str, qcfg: dict | None = None,
     if result_glob and glob.glob(os.path.join(mp, result_glob)):
         h["state"] = "done"
 
-    complete_marker = qcfg.get("complete_marker", DEFAULT_COMPLETE_MARKER)
-    if complete_marker and os.path.exists(os.path.join(mp, complete_marker)):
+    if any(os.path.exists(os.path.join(mp, marker))
+           for marker in complete_markers(qcfg)):
         # Trainer-agnostic completion evidence -- see DEFAULT_COMPLETE_MARKER
-        # docstring above. This is intentionally an OR with result_glob, not
-        # a replacement: a result_glob match stays the richer, preferred
-        # signal (and is what `ablator collect`/gradeability tooling reads),
-        # this is only a second, independent way to reach "done" for run
-        # types whose completion contract never produces that artifact.
+        # / complete_markers() docstrings above. This is intentionally an OR
+        # with result_glob, not a replacement: a result_glob match stays the
+        # richer, preferred signal (and is what `ablator collect`/
+        # gradeability tooling reads), this is only a second, independent
+        # way to reach "done" for run types whose completion contract never
+        # produces that artifact.
         h["state"] = "done"
 
     try:
