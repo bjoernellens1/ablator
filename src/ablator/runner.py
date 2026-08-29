@@ -631,8 +631,9 @@ def force_remove_container(runtime: str, name: str) -> None:
 
 def _clear_stale_complete_marker(job: dict, base_dir: str, qcfg: dict) -> None:
     """Pre-launch safety net, symmetric to the container-name clear above:
-    delete a leftover `.COMPLETE` marker (health.py's DEFAULT_COMPLETE_MARKER)
-    from a PRIOR attempt at this job's model_path before this attempt starts.
+    delete every configured completion marker (health.complete_markers(),
+    default just `.COMPLETE`) left over from a PRIOR attempt at this job's
+    model_path before this attempt starts.
 
     Without this, a fresh attempt that genuinely fails early (crashes,
     hangs, gets killed) can still be misread as `done` by this attempt's own
@@ -647,20 +648,18 @@ def _clear_stale_complete_marker(job: dict, base_dir: str, qcfg: dict) -> None:
     since the marker was never actually re-validated against this attempt.
     Best-effort: never raises, mirrors force_remove_container's contract.
     """
-    marker = qcfg.get("complete_marker", healthmod.DEFAULT_COMPLETE_MARKER)
-    if not marker:
-        return
     mp = healthmod.resolve_model_path(job.get("model_path", ""), base_dir)
-    path = os.path.join(mp, marker)
-    try:
-        os.remove(path)
-        print(f"[ablator] {job['id']}: cleared stale completion marker {path} "
-              f"from a prior attempt before launch", flush=True)
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        print(f"[ablator] {job['id']}: could not clear stale completion "
-              f"marker {path}: {e!r}", flush=True)
+    for marker in healthmod.complete_markers(qcfg):
+        path = os.path.join(mp, marker)
+        try:
+            os.remove(path)
+            print(f"[ablator] {job['id']}: cleared stale completion marker "
+                  f"{path} from a prior attempt before launch", flush=True)
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            print(f"[ablator] {job['id']}: could not clear stale completion "
+                  f"marker {path}: {e!r}", flush=True)
 
 
 def kill_job(proc: subprocess.Popen, job: dict, argv: list[str] | None = None) -> None:

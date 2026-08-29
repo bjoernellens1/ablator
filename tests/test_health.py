@@ -124,6 +124,29 @@ def test_complete_marker_name_configurable(tmp_path):
     assert health.job_health(job, str(tmp_path), {"complete_marker": ""})["state"] != "done"
 
 
+def test_complete_marker_accepts_list_any_match(tmp_path):
+    """A site running trainers whose completion contracts differ (e.g.
+    splatograph's causal_mapping trainer, whose `.COMPLETE` is not reliably
+    rewritten on every attempt but whose `causal_replay_summary.json` is —
+    confirmed live 2026-08-29) needs to accept ANY of several marker names,
+    not just one."""
+    job = make_run(tmp_path, "Training: 5/30000")
+    qcfg = {"complete_marker": [".COMPLETE", "causal_replay_summary.json"]}
+    assert health.job_health(job, str(tmp_path), qcfg)["state"] != "done"
+    open(os.path.join(job["model_path"], "causal_replay_summary.json"), "w").close()
+    assert health.job_health(job, str(tmp_path), qcfg)["state"] == "done"
+
+
+def test_clear_stale_complete_marker_clears_all_configured_markers(tmp_path):
+    job = make_run(tmp_path, "Training: 5/30000")
+    for name in (".COMPLETE", "causal_replay_summary.json"):
+        open(os.path.join(job["model_path"], name), "w").close()
+    qcfg = {"complete_marker": [".COMPLETE", "causal_replay_summary.json"]}
+    runner._clear_stale_complete_marker(job, str(tmp_path), qcfg)
+    assert not os.path.exists(os.path.join(job["model_path"], ".COMPLETE"))
+    assert not os.path.exists(os.path.join(job["model_path"], "causal_replay_summary.json"))
+
+
 def test_clear_stale_complete_marker_removes_prior_attempt_marker(tmp_path):
     """Pre-launch safety net symmetric to force_remove_container: a leftover
     `.COMPLETE` from a PRIOR attempt must not survive into a fresh attempt,
