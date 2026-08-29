@@ -22,18 +22,37 @@ result-file glob, and caller-supplied process liveness):
 | `starting` | No log written yet (or nothing parseable). |
 | `training` | Log is progressing; an iteration counter was parsed. |
 | `reporting` | Iteration counter reached its total — post-training report phase. |
-| `done` | The configured `result_glob` matched a file under the job's `model_path`. |
+| `done` | The configured `result_glob` matched a file under the job's `model_path`, OR the `complete_marker` file (default `.COMPLETE`) exists there. |
 | `hung` | Log hasn't been written to in longer than `hung_after_min` (default 20, per-job or `[queue]`-level override). |
 | `crashed` | A crash marker (`Traceback...`, `CUDA error`, `HIP error`, `std::exception`, `Segmentation fault`, `core dumped`, or config-overridden via `[queue] crash_markers`) appeared in the log tail, or the caller reported the process/container as no longer alive with no success marker present. |
 
 Relevant `[queue]` config knobs: `progress_log`, `progress_regex`,
 `progress_cap_regex` (see `ablator.progress`), `result_glob`,
-`hung_after_min`, `crash_markers`.
+`complete_marker`, `hung_after_min`, `crash_markers`.
 
 `result_glob` accepts either a bare pattern relative to the resolved
 `model_path` (e.g. `comparison/*/report.json`) or the
 `{model_path}/...`-prefixed form documented for `ablator collect` — both
 resolve to the same thing here.
+
+`complete_marker` (default `.COMPLETE`) is a second, independent way to
+reach `done`, checked with plain `os.path.exists` (not a glob) against the
+resolved `model_path`. It exists because `result_glob` alone assumes every
+job type eventually produces a artifact matching that pattern (e.g.
+`comparison/*/report.json`) — true for splatograph's `train.py`/
+`train_streaming.py` when a full report is generated, but NOT true for
+every trainer/configuration: e.g. its `causal_mapping` trainer with no
+evaluation holdout configured never writes a `report.json` at all, even on
+a fully successful run (confirmed live 2026-08-29 on two genuinely-complete
+smoke-check jobs that were false-classified as `crashed` with
+`error_category: unknown` for exactly this reason). Splatograph's shared
+output-staging finalizer writes `.COMPLETE` at the resolved `model_path`
+for ANY trainer the instant a staged run's local scratch has been fully
+mirrored to its canonical path — independent of what richer artifacts that
+trainer does or doesn't also produce — making it a safe, trainer-agnostic
+completion signal to OR against `result_glob` rather than replace it with.
+Set `complete_marker = ""` under `[queue]` (or a per-type override) to
+disable this check entirely and fall back to `result_glob`-only behavior.
 
 ## `ablator errors [name]`
 

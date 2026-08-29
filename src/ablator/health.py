@@ -26,6 +26,25 @@ from . import progress as progmod
 
 DEFAULT_HUNG_AFTER_MIN = 20.0
 DEFAULT_RESULT_GLOB = "comparison/*/report.json"
+# Splatograph's shared output-staging finalizer (train.py's
+# _finalize_output_staging / splatograph.runtime.finalize) writes this
+# zero-byte marker at the resolved model_path, for ANY trainer entry point
+# (legacy train.py, train_streaming.py, the causal_mapping trainer), the
+# instant a staged run's local scratch has been fully mirrored onto its
+# canonical persist_model_path -- independent of whether that trainer also
+# produces a `comparison/*/report.json`. Some trainer/run-type combinations
+# never produce a report.json at all (e.g. the causal_mapping trainer with
+# no evaluation holdout configured, `holdout_reserved: 0` in its own
+# `causal_replay_summary.json`) while still completing entirely correctly
+# (exit 0, real progress the whole way through). Treating result_glob as
+# the ONLY completion evidence false-classified two such genuinely-complete
+# smoke-check runs as "crashed" (found 2026-08-29, r9700
+# fr3batchsmoke_smoke / scannetppsmoke_smoke -- both had `.COMPLETE` and a
+# valid causal_replay_summary.json on disk, real train.log progress right
+# up to a clean exit 0, and zero kernel/OOM/traceback evidence anywhere,
+# yet were quarantined as `error_category: unknown` twice each). See
+# docs/health.md.
+DEFAULT_COMPLETE_MARKER = ".COMPLETE"
 CRASH_TAIL_BYTES = 4096
 
 DEFAULT_CRASH_MARKERS = [
@@ -105,6 +124,16 @@ def job_health(job: dict, base_dir: str, qcfg: dict | None = None,
     h: dict = {"state": "starting", "iter": None, "total": None, "log_age_s": None}
 
     if result_glob and glob.glob(os.path.join(mp, result_glob)):
+        h["state"] = "done"
+
+    complete_marker = qcfg.get("complete_marker", DEFAULT_COMPLETE_MARKER)
+    if complete_marker and os.path.exists(os.path.join(mp, complete_marker)):
+        # Trainer-agnostic completion evidence -- see DEFAULT_COMPLETE_MARKER
+        # docstring above. This is intentionally an OR with result_glob, not
+        # a replacement: a result_glob match stays the richer, preferred
+        # signal (and is what `ablator collect`/gradeability tooling reads),
+        # this is only a second, independent way to reach "done" for run
+        # types whose completion contract never produces that artifact.
         h["state"] = "done"
 
     try:

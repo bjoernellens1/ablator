@@ -92,6 +92,38 @@ def test_done_with_model_path_prefixed_result_glob(tmp_path):
     assert health.job_health(job, str(tmp_path), qcfg)["state"] == "done"
 
 
+def test_done_via_complete_marker_without_report_glob(tmp_path):
+    """A trainer/run type that completes cleanly without ever producing a
+    `comparison/*/report.json` (e.g. the causal_mapping trainer with no
+    evaluation holdout configured) must not be classified as crashed just
+    because result_glob never matches. Splatograph's shared output-staging
+    finalizer writes a `.COMPLETE` marker at the resolved model_path for
+    ANY trainer, independent of report.json -- confirmed live 2026-08-29
+    (r9700 fr3batchsmoke_smoke/scannetppsmoke_smoke: real, healthy,
+    steadily-progressing train.log, a valid causal_replay_summary.json,
+    clean exit 0, and a `.COMPLETE` marker on disk, yet twice quarantined
+    as `error_category: unknown` because result_glob never matched)."""
+    job = make_run(tmp_path, "Training: 5/30000")
+    # No report.json anywhere -- would otherwise be "training"/"crashed".
+    open(os.path.join(job["model_path"], ".COMPLETE"), "w").close()
+    h = health.job_health(job, str(tmp_path))
+    assert h["state"] == "done"
+    # Also settles the process_alive=False path used by
+    # runner.py's require_result_artifact post-exit check.
+    h = health.job_health(job, str(tmp_path), process_alive=False)
+    assert h["state"] == "done"
+
+
+def test_complete_marker_name_configurable(tmp_path):
+    job = make_run(tmp_path, "Training: 5/30000")
+    open(os.path.join(job["model_path"], "DONE.flag"), "w").close()
+    assert health.job_health(job, str(tmp_path))["state"] != "done"
+    qcfg = {"complete_marker": "DONE.flag"}
+    assert health.job_health(job, str(tmp_path), qcfg)["state"] == "done"
+    # Empty string disables the marker check entirely.
+    assert health.job_health(job, str(tmp_path), {"complete_marker": ""})["state"] != "done"
+
+
 def test_online_sentinel_uses_cap(tmp_path):
     job = make_run(tmp_path, f"Training: 500/{2**31 - 1}")
     job["extra_args"] = "--streaming_max_iterations 6000"

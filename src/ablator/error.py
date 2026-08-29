@@ -85,11 +85,35 @@ def patterns_from_config(cfg: dict | None) -> dict[str, tuple[str, ...]]:
 
 
 def _snippet(text: str, marker: str, width: int = 160) -> str:
-    """Return a short evidence snippet centered on the (case-insensitive) marker."""
+    """Return a short evidence snippet centered on the (case-insensitive) marker.
+
+    ``marker == ""`` means "no pattern matched" (the ``unknown`` category's
+    fallback call) -- there is nothing to center on, so this must not reuse
+    the marker-found arithmetic below: ``str.find("")`` always returns 0,
+    which used to make this return ``text[:width]``, the FIRST `width`
+    characters. For a real job log that is dominated by one giant, no-
+    newline JSON header line (ablator writes the job's full
+    ABLATOR_JOB_JSON/ABLATOR_SUBMISSION_JSON env-var payload as the log's
+    first lines, and `text` here is already only the LAST `CRASH_TAIL_BYTES`
+    of that log) the "first width chars of the tail" can still land inside
+    that header rather than in the run's own real output after it --
+    confirmed live 2026-08-29 (r9700 fr3batchfull_b2/scannetppfull_full):
+    both jobs printed a clear, specific one-line failure
+    ("--streaming_replay is retired for production runs...") as their very
+    last output, but the recorded `error_evidence` was an unrelated
+    substring of that job's own spec `notes` field, because the header was
+    still large enough relative to the (very short, near-instant-exit) real
+    output that byte-4096 tail slicing left the header dominating even the
+    first 160 chars of the slice. `text` is already the tail end of the
+    whole log, so the most useful fallback is the tail END of `text`, not
+    its start -- most recent output sorts last.
+    """
+    if not marker:
+        return text[-width:].strip()
     low = text.lower()
     idx = low.find(marker.lower())
     if idx == -1:
-        return text[:width].strip()
+        return text[-width:].strip()
     start = max(0, idx - width // 2)
     end = min(len(text), idx + len(marker) + width // 2)
     return text[start:end].strip()
