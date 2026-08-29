@@ -124,6 +124,32 @@ def test_complete_marker_name_configurable(tmp_path):
     assert health.job_health(job, str(tmp_path), {"complete_marker": ""})["state"] != "done"
 
 
+def test_clear_stale_complete_marker_removes_prior_attempt_marker(tmp_path):
+    """Pre-launch safety net symmetric to force_remove_container: a leftover
+    `.COMPLETE` from a PRIOR attempt must not survive into a fresh attempt,
+    or a genuinely-failing rerun could still be misread as done purely from
+    stale evidence. Confirmed live 2026-08-29 on a real r9700 rerun where
+    this coincidentally didn't matter (the rerun happened to succeed on its
+    own merits) but the marker's mtime proved it was never re-validated."""
+    job = make_run(tmp_path, "Training: 5/30000")
+    marker_path = os.path.join(job["model_path"], ".COMPLETE")
+    open(marker_path, "w").close()
+    assert os.path.exists(marker_path)
+    runner._clear_stale_complete_marker(job, str(tmp_path), {})
+    assert not os.path.exists(marker_path)
+
+
+def test_clear_stale_complete_marker_noop_when_absent_or_disabled(tmp_path):
+    job = make_run(tmp_path, "Training: 5/30000")
+    # No marker present: must not raise.
+    runner._clear_stale_complete_marker(job, str(tmp_path), {})
+    # Disabled via empty complete_marker: must not touch a present marker.
+    marker_path = os.path.join(job["model_path"], ".COMPLETE")
+    open(marker_path, "w").close()
+    runner._clear_stale_complete_marker(job, str(tmp_path), {"complete_marker": ""})
+    assert os.path.exists(marker_path)
+
+
 def test_online_sentinel_uses_cap(tmp_path):
     job = make_run(tmp_path, f"Training: 500/{2**31 - 1}")
     job["extra_args"] = "--streaming_max_iterations 6000"
