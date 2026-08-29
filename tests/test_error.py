@@ -87,6 +87,27 @@ def test_unknown():
     assert r["suggested_action"] == "retry_once_then_quarantine"
 
 
+def test_unknown_evidence_shows_tail_not_head_of_giant_header():
+    """`log_tail` here is already the LAST CRASH_TAIL_BYTES of a job's log.
+    ablator's own log preamble is one giant, no-newline JSON line (the
+    ABLATOR_JOB_JSON/ABLATOR_SUBMISSION_JSON env var dump); for a job whose
+    real output after that preamble is short, that byte-window can still
+    fall mostly inside the header. `_snippet(text, "")` used to return
+    `text[:width]` -- the FIRST chars of that window, i.e. still the header
+    -- instead of the run's own final, most-recent, most-diagnostic output
+    at the very end. Confirmed live 2026-08-29 (r9700 fr3batchfull_b2 /
+    scannetppfull_full): each printed a specific, actionable one-line
+    failure as its last output, but the recorded evidence was an unrelated
+    substring of that job's own spec `notes` field."""
+    header_json = '{"notes": "' + ("x" * 4000) + '"}\n'
+    real_error = "--streaming_replay is retired for production runs."
+    log_tail = (header_json + real_error)[-4096:]
+    r = errormod.classify_failure(_job(), log_tail, 0, {})
+    assert r["category"] == "unknown"
+    assert "streaming_replay is retired" in r["evidence_snippet"]
+    assert "notes" not in r["evidence_snippet"]
+
+
 # --- config-driven patterns ---------------------------------------------
 
 def test_patterns_from_config_overrides_category():
