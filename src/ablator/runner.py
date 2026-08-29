@@ -629,6 +629,40 @@ def force_remove_container(runtime: str, name: str) -> None:
             print(f"[ablator] force_remove_container {args}: {e!r}", flush=True)
 
 
+def _clear_stale_complete_marker(job: dict, base_dir: str, qcfg: dict) -> None:
+    """Pre-launch safety net, symmetric to the container-name clear above:
+    delete a leftover `.COMPLETE` marker (health.py's DEFAULT_COMPLETE_MARKER)
+    from a PRIOR attempt at this job's model_path before this attempt starts.
+
+    Without this, a fresh attempt that genuinely fails early (crashes,
+    hangs, gets killed) can still be misread as `done` by this attempt's own
+    post-exit `require_result_artifact` check purely because an OLD, stale
+    marker from a previous successful run is still sitting there — the
+    marker's mere existence says nothing about whether THIS attempt
+    completed. Confirmed live 2026-08-29: a rerun of `fr3batchsmoke_smoke`
+    genuinely re-executed and completed on its own merits (fresh train.log/
+    causal_replay_summary.json spanning the full run), but was graded
+    `done` via a `.COMPLETE` file whose mtime was ~35 minutes older than
+    this attempt's own `claimed_at` — right this time only by coincidence,
+    since the marker was never actually re-validated against this attempt.
+    Best-effort: never raises, mirrors force_remove_container's contract.
+    """
+    marker = qcfg.get("complete_marker", healthmod.DEFAULT_COMPLETE_MARKER)
+    if not marker:
+        return
+    mp = healthmod.resolve_model_path(job.get("model_path", ""), base_dir)
+    path = os.path.join(mp, marker)
+    try:
+        os.remove(path)
+        print(f"[ablator] {job['id']}: cleared stale completion marker {path} "
+              f"from a prior attempt before launch", flush=True)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        print(f"[ablator] {job['id']}: could not clear stale completion "
+              f"marker {path}: {e!r}", flush=True)
+
+
 def kill_job(proc: subprocess.Popen, job: dict, argv: list[str] | None = None) -> None:
     """Kill the job's process group (SIGTERM, then SIGKILL), AND — if this
     is a podman/docker `run` command with a `--name` — forcibly stop/rm the
@@ -2143,6 +2177,7 @@ def run_job(cfg: dict, job: dict, machine: str,
         if container_name:
             # Clear only a leaked prior attempt with this deterministic name.
             force_remove_container(argv[0], container_name)
+        _clear_stale_complete_marker(job, cwd or os.getcwd(), cfg.get("queue", {}))
 
         print(f"[ablator] running {job['id']} -> {job.get('model_path')} "
               f"(log {log_path})", flush=True)
