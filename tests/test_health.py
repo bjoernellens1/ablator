@@ -210,6 +210,22 @@ def test_machine_busy_treats_high_memory_as_busy(monkeypatch):
                                   mem_sampler=lambda: 40.0) is False
 
 
+def test_beszel_snapshot_uses_cli_then_local_fallback():
+    from ablator import resources
+
+    def beszel(command, timeout=15):
+        return '{"systems":[{"name":"node","status":"up","cpu_percent":5,"memory_percent":10,"gpu_percent":3,"vram_used_gb":1,"vram_total_gb":24,"gpu_power_watts":40}]}'
+
+    snapshot = resources.machine_telemetry_snapshot(
+        {"machines": {"node": {"beszel_system": "node"}}}, "node", run=beszel
+    )
+    assert snapshot["source"] == "beszel" and snapshot["gpu_power_watts"] == 40
+    fallback = resources.machine_telemetry_snapshot(
+        {}, "node", run=lambda *args, **kwargs: None, cpu_sampler=lambda: 2, memory_sampler=lambda: (3, 8), gpu_sampler=lambda: 4
+    )
+    assert fallback["source"] == "local-fallback" and fallback["gpu_percent"] == 4
+
+
 def test_supervise_normal_exit(cfg):
     result, recorded, kills = drive(cfg, FakePopen(exits_after=3),
                                     [H("training")] * 10)

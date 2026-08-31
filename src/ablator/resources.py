@@ -35,6 +35,7 @@ import json
 import os
 import subprocess
 import time
+from datetime import UTC, datetime
 
 DEFAULT_GPU_BUSY_PCT = 20.0
 DEFAULT_SAMPLE_GAP_S = 3.0
@@ -90,6 +91,62 @@ def sample_gpu_util() -> float | None:
         except ValueError:
             pass
     return None
+
+
+def _cpu_percent() -> float | None:
+    try:
+        return float(os.getloadavg()[0])
+    except OSError:
+        return None
+
+
+def _memory_gb() -> tuple[float | None, float | None]:
+    try:
+        values = dict(line.split(":", 1) for line in open("/proc/meminfo") if ":" in line)
+        total = float(values["MemTotal"].split()[0]) / 1048576
+        available = float(values["MemAvailable"].split()[0]) / 1048576
+        return total - available, total
+    except (OSError, KeyError, ValueError):
+        return None, None
+
+
+def machine_telemetry_snapshot(cfg: dict, machine: str, run=_run,
+                               cpu_sampler=_cpu_percent, memory_sampler=_memory_gb,
+                               gpu_sampler=sample_gpu_util) -> dict:
+    """Best-effort machine state: token-only Beszel CLI, then local probes.
+
+    Absence of Beszel, credentials, or a CLI binary never blocks a runner;
+    consumers must retain the returned source instead of treating fallback
+    values as fleet-authoritative telemetry.
+    """
+    mcfg = cfg.get("machines", {}).get(machine, {})
+    resource_cfg = cfg.get("resources", {})
+    provider = resource_cfg.get("telemetry_provider", "auto")
+    now = datetime.now(UTC).isoformat()
+    if provider != "local":
+        cli = resource_cfg.get("beszel_cli", os.environ.get("BESZEL_CLI", "clusterstat"))
+        system = mcfg.get("beszel_system", machine)
+        output = run([cli, "--json", system])
+        if output:
+            try:
+                payload = json.loads(output)
+                systems = payload.get("systems", [])
+                item = systems[0] if len(systems) == 1 and isinstance(systems[0], dict) else None
+                if item:
+                    return {"schema": "ablator.machine-telemetry/v1", "captured_at": now,
+                            "source": "beszel", "machine": machine, "system": item.get("name"),
+                            "status": item.get("status"), "cpu_percent": item.get("cpu_percent"),
+                            "memory_percent": item.get("memory_percent"), "gpu_percent": item.get("gpu_percent"),
+                            "vram_used_gb": item.get("vram_used_gb"), "vram_total_gb": item.get("vram_total_gb"),
+                            "gpu_power_watts": item.get("gpu_power_watts")}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+    memory_used, memory_total = memory_sampler()
+    return {"schema": "ablator.machine-telemetry/v1", "captured_at": now,
+            "source": "local-fallback", "machine": machine, "system": None, "status": "unknown",
+            "cpu_percent": cpu_sampler(), "memory_percent": None, "memory_used_gb": memory_used,
+            "memory_total_gb": memory_total, "gpu_percent": gpu_sampler(),
+            "vram_used_gb": None, "vram_total_gb": None, "gpu_power_watts": None}
 
 
 def gpu_util_busy(cfg: dict | None = None, sampler=sample_gpu_util,

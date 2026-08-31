@@ -1555,6 +1555,9 @@ def run_job(cfg: dict, job: dict, machine: str,
         return "failed", None
     print(f"[ablator] running {job['id']} -> {job.get('model_path')} (log {log_path})",
           flush=True)
+    telemetry = resources.machine_telemetry_snapshot(cfg, machine)
+    if q is not None:
+        q.update(job["id"], machine_telemetry=telemetry)
     prov_state = capture_and_record_provenance(cfg, job, machine, cwd or os.getcwd(), q)
     try:
         executed_git_sha = sourcecheckout.verify_executed_provenance(job, prov_state)

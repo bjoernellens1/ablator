@@ -28,6 +28,16 @@ about any particular training system.
   forwarding (fragile with rootless podman/SELinux) and buys nothing —
   no GPU work happens in the runner process.
 
+## Fleet telemetry
+
+Ablator records a `machine_telemetry` snapshot in each job ledger entry at
+launch. Its default `telemetry_provider = "auto"` invokes `clusterstat --json`
+with the runner's `BESZEL_URL` and `BESZEL_TOKEN`; map an Ablator machine to a
+Beszel system with `beszel_system = "host-name"`. If the CLI, token, or hub is
+unavailable, Ablator records `source = "local-fallback"` using local CPU/RAM
+and GPU-utilization probes. Monitoring loss never fabricates values or blocks a
+job by itself.
+
 ## Quickstart
 
 ```bash
