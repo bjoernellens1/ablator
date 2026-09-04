@@ -59,11 +59,25 @@ contains = "splat_train"          # omit -> busy if any non-empty output
 [resources]
 gpu_busy_pct = 20     # busy iff BOTH samples > threshold (debounced spike filter)
 sample_gap_s = 3.0    # env ABLATOR_GPU_BUSY_PCT overrides the threshold
+cpu_max_concurrent = 1  # requires_gpu=false jobs run alongside the GPU job, at most this many
 ```
 
 A runner only claims a job when the machine is idle: GPU utilization
 below `gpu_busy_pct` in **both** of two samples ~`sample_gap_s` apart
 (debounces momentary spikes) **and** no `busy_guard` fires.
+
+### CPU-only job types (`requires_gpu = false`)
+
+A type declared `requires_gpu = false` (a unit-test suite, a report or
+plot step, a CPU sandbox simulation) is claimed by this machine's runner
+**even while its GPU job is running** and executed on a background
+thread, bounded by `[resources] cpu_max_concurrent` (default 1). The
+GPU-util sampler, `busy_guards` and the GPU-memory guard are not
+consulted for it; the machine pause flag, the per-type capability probe
+(`require_images`) and every `[types.<type>]` field still apply, and the
+job goes through the same retry/quarantine/receipt bookkeeping. Without
+this, a 10-second CPU job pinned to a machine with a deep GPU queue waits
+for the GPU to go idle -- on a busy workstation, hours.
 
 ## `[types.<type>]`
 
@@ -76,7 +90,12 @@ cwd = "/path/to/repo"
 command = ["podman", "run", "...", "{scene}", "-m", "{model_path}",
            "--iterations", "{iterations}", "{extra_args}"]
 env = { SCENE_SOURCE = "{scene}" }
-result_glob = "..."               # per-type override for `collect`
+result_glob = "..."               # per-type override for `collect` AND the
+                                  # done/failed verdict (health.job_health)
+complete_marker = ["..."]         # per-type override, same two consumers
+requires_gpu = false              # CPU-only type: claimed even while this
+                                  # machine's GPU job runs, executed on a
+                                  # background thread (default true)
 require_pinned_git = true         # reject jobs without a full registered SHA
 
 [types.<type>.machines.<name>]    # shallow per-machine override
