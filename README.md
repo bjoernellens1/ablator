@@ -21,6 +21,9 @@ about any particular training system.
   the runner must work on any host `python3` with zero installs, because
   it runs *outside* the containers it launches. Python >= 3.10
   (TOML configs need 3.11's `tomllib`; use a `.json` config on 3.10).
+- **CPU-only job types** (`[types.<t>] requires_gpu = false`) run alongside
+  a machine's GPU job on a background thread instead of waiting for the
+  GPU to go idle -- for test suites, report steps and CPU sandboxes.
 - **Host runner, containerized workloads** (design invariant): nothing
   about a job executes outside a container except the flock'd queue-file
   bookkeeping and the `podman/docker run` launch itself. Running the

@@ -457,11 +457,39 @@ def type_capable(tcfg: dict, runtime_default: str = "docker") -> bool:
     return resources.images_present(runtime, images)
 
 
-def make_can_run(cfg: dict, machine: str):
+def type_requires_gpu(tcfg: dict) -> bool:
+    """`[types.<t>] requires_gpu` (default True).
+
+    A type declared `requires_gpu = false` is a CPU-only workload (a unit-test
+    suite, a report/plot step, a sandbox simulation). The runner claims such
+    jobs even while its own GPU is busy with a bare-metal job and runs them
+    on a background thread (see run_loop step 1b), so they never wait hours
+    behind a deep GPU queue and never need a second runner racing for the
+    idle gap. GPU-util / busy-guard / GPU-memory checks are not consulted
+    for them; the machine pause flag and the per-type capability probe are.
+    """
+    return bool(tcfg.get("requires_gpu", True))
+
+
+def cpu_max_concurrent(cfg: dict) -> int:
+    """`[resources] cpu_max_concurrent` (default 1): how many
+    requires_gpu=false jobs this runner runs at once alongside its GPU job."""
+    try:
+        return max(0, int(cfg.get("resources", {}).get("cpu_max_concurrent", 1)))
+    except (TypeError, ValueError):
+        return 1
+
+
+def make_can_run(cfg: dict, machine: str, requires_gpu: bool | None = None):
     """Per-scan claim predicate: job type defined here + capability probe.
 
     Capability results are cached for the lifetime of the predicate
     (one claim scan) so image probes run at most once per type.
+
+    `requires_gpu` narrows the predicate to GPU types (True) or CPU-only
+    types (False); None accepts both. run_loop uses True for the serial
+    bare-metal claim and False for the concurrent CPU-job claim, so a type
+    is only ever claimed by the path built for it.
     """
     cache: dict[str, bool] = {}
 
@@ -479,6 +507,8 @@ def make_can_run(cfg: dict, machine: str):
                 if not ok:
                     print(f"[ablator] type '{jt}' not capable on {machine} "
                           f"(missing images)", flush=True)
+                if ok and requires_gpu is not None and type_requires_gpu(tcfg) != requires_gpu:
+                    ok = False
                 cache[jt] = ok
         return cache[jt]
 
@@ -1903,7 +1933,8 @@ def _poll_k8s_job(cfg: dict, job: dict, machine: str, mcfg: dict, tcfg: dict,
         # the symlink into the same NFS tree the k8s pod's scratch PVC
         # mounts, so both paths land on the identical files).
         host_base_dir = _job_base_dir(cfg, job, machine)
-        h = healthmod.job_health(job, host_base_dir, cfg.get("queue", {}),
+        h = healthmod.job_health(job, host_base_dir,
+                                 _health_qcfg(cfg, _type_cfg_or_empty(cfg, job, machine)),
                                  process_alive=False)
         if h["state"] != "done":
             print(f"[ablator] {job['id']} k8s Job succeeded but no completion "
@@ -2219,7 +2250,7 @@ def run_job(cfg: dict, job: dict, machine: str,
             # consulted here, so a manual kill can never read as "done".
             status = override
         elif exit_code == 0 and _require_result_artifact(cfg, tcfg):
-            h = healthmod.job_health(job, cwd or os.getcwd(), cfg.get("queue", {}),
+            h = healthmod.job_health(job, cwd or os.getcwd(), _health_qcfg(cfg, tcfg),
                                      process_alive=False)
             if h["state"] != "done":
                 print(f"[ablator] {job['id']} exited 0 but no completion "
@@ -2306,6 +2337,32 @@ def _job_base_dir(cfg: dict, job: dict, machine: str) -> str:
     except KeyError:
         tcfg = {}
     return tcfg.get("cwd") or os.getcwd()
+
+
+def _health_qcfg(cfg: dict, tcfg: dict | None) -> dict:
+    """[queue] health settings with the job type's own `result_glob` /
+    `complete_marker` layered on top.
+
+    health.job_health() decides done-vs-failed from these two keys. They
+    used to be read from [queue] only, while the documented per-type
+    `result_glob` override was consulted by `collect` alone -- so a type
+    whose artifact differs from the queue default (e.g. a test suite
+    writing junit.xml, not comparison/*/report.json) exited 0 and was still
+    classified failed, then quarantined after one retry (found live
+    2026-09-04). One merged view for every verdict site fixes that.
+    """
+    merged = dict(cfg.get("queue", {}))
+    for key in ("result_glob", "complete_marker"):
+        if tcfg and key in tcfg:
+            merged[key] = tcfg[key]
+    return merged
+
+
+def _type_cfg_or_empty(cfg: dict, job: dict, machine: str) -> dict:
+    try:
+        return cfgmod.type_cfg(cfg, job.get("type", ""), machine)
+    except KeyError:
+        return {}
 
 
 def _require_result_artifact(cfg: dict, tcfg: dict) -> bool:
@@ -2475,7 +2532,8 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
             if age_s is not None and age_s < grace_s:
                 continue
             base_dir = _job_base_dir(cfg, job, claimed_by or machine)
-            h = healthmod.job_health(job, base_dir, cfg.get("queue", {}),
+            h = healthmod.job_health(job, base_dir,
+                                     _health_qcfg(cfg, _type_cfg_or_empty(cfg, job, machine)),
                                      process_alive=False)
             if h["state"] == "done":
                 print(f"[ablator] reconcile: {job['id']} (claimed by "
@@ -2562,7 +2620,8 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
                       "cluster — treating as crashed", flush=True)
 
         base_dir = _job_base_dir(cfg, job, machine)
-        h = healthmod.job_health(job, base_dir, cfg.get("queue", {}),
+        h = healthmod.job_health(job, base_dir,
+                                 _health_qcfg(cfg, _type_cfg_or_empty(cfg, job, machine)),
                                  process_alive=False)
         if h["state"] == "done":
             print(f"[ablator] reconcile: {job['id']} has a completion artifact "
@@ -2953,7 +3012,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                 # concurrency in the meantime — see the design comment above
                 # for why that split matters.
                 job = q.claim_next(
-                    machine, can_run=make_can_run(cfg, machine),
+                    machine, can_run=make_can_run(cfg, machine, requires_gpu=True),
                     allow_pinned_git_while_paused=not currency_ok,
                 )
 
@@ -2965,6 +3024,37 @@ def run_loop(cfg: dict, once: bool = False) -> None:
             if job is not None:
                 _record_runner_provenance(cfg, job, machine, q)
                 baremetal_provenance_recorded = True
+
+            # 1b. Claim and run (non-blocking) CPU-only jobs -- types with
+            # `requires_gpu = false` -- regardless of baremetal_busy. These
+            # never touch the GPU, so gating them behind the GPU-idle check
+            # starved them for hours behind a deep GPU queue (found live
+            # 2026-09-04: splatograph-lab's 10-second CPU test suite could not
+            # get a slot on main for a whole afternoon; a second runner racing
+            # for the ~2 s gap between back-to-back GPU jobs never won it).
+            # Each is handed to a background thread exactly like a k8s
+            # dispatch, bounded by [resources] cpu_max_concurrent, and goes
+            # through the same _dispatch_and_finalize bookkeeping.
+            cpu_slot = f"cpu:{machine}"
+            cpu_cap = cpu_max_concurrent(cfg)
+            while inflight.count(cpu_slot) < cpu_cap:
+                cjob = q.claim_next(
+                    machine, can_run=make_can_run(cfg, machine, requires_gpu=False),
+                    allow_pinned_git_while_paused=not currency_ok,
+                )
+                if cjob is None:
+                    break
+                print(f"[ablator] dispatching CPU-only {cjob['id']} on {machine} "
+                      f"({inflight.count(cpu_slot) + 1}/{cpu_cap} in flight, "
+                      f"gpu_busy={baremetal_busy})", flush=True)
+                t = threading.Thread(
+                    target=_dispatch_and_finalize,
+                    args=(cfg, machine, cjob, machine, q),
+                    daemon=True,
+                    name=f"cpu-{cjob['id']}",
+                )
+                t.start()
+                inflight.add(cpu_slot, t, cjob["id"])
 
             # 2. Fill k8s concurrency slots — non-blocking: each claimed job
             # is handed to a background thread and this loop moves straight
