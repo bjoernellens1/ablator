@@ -271,3 +271,33 @@ def test_urgent_fix_unsynced_registered_with_pause_revalidation():
     assert "urgent_fix_unsynced" in pr._AUTO_REVALIDATORS
     assert pr._AUTO_REVALIDATORS["urgent_fix_unsynced"] is (
         ufmod._revalidate_urgent_fix_unsynced)
+
+
+def test_urgent_fix_unsynced_recheck_honours_per_machine_repo_cwd(tmp_path):
+    """The pause re-validator must resolve repo_cwd through the same
+    per-machine `[urgent_fixes.machines.<machine>]` override the claim-time
+    gate and the runner use. Regression: it called load_urgent_fixes(cfg)
+    without `machine`, so a machine whose global repo_cwd is unreadable
+    (rtx4090c runs as bjoern1; the global /home/bjoern/... is
+    Permission-denied there) re-paused itself every idle tick with
+    "dirty or unreadable working tree" -- even though its own override
+    pointed at a clean, fully-synced checkout (observed 2026-09-03/04)."""
+    origin = tmp_path / "origin"
+    _init_repo(origin)
+    fix_sha = _commit(origin, "the fix")
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
+
+    cfg = _cfg(
+        tmp_path,
+        repo_cwd=str(tmp_path / "does-not-exist"),
+        fixes=[{"sha": fix_sha}],
+        machines={"rtx4090c": {"repo_cwd": str(clone)}},
+    )
+    q = Queue(str(tmp_path / "queue.jsonl"))
+    write_pause_flag(cfg["queue"]["path"], "rtx4090c", "urgent_fix_unsynced",
+                     "dirty or unreadable working tree at /does-not-exist")
+
+    assert pr.revalidate_pause(cfg, "rtx4090c", q) is True
+    assert not is_paused(cfg["queue"]["path"], "rtx4090c")
