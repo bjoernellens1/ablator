@@ -305,7 +305,7 @@ def _revalidate_urgent_fix_unsynced(cfg: dict, machine: str) -> tuple[bool, str]
     anything enforce_urgent_fixes() wouldn't also have done on a fresh
     idle tick with no pre-existing pause.
     """
-    repo_cwd, fixes, auto_sync_ref = load_urgent_fixes(cfg)
+    repo_cwd, fixes, auto_sync_ref = load_urgent_fixes(cfg, machine)
     if repo_cwd is None:
         # Feature has been unconfigured since the pause was set -- the
         # condition it was guarding no longer applies.
