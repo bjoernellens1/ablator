@@ -294,6 +294,67 @@ def test_gpu_mem_busy_threshold(monkeypatch):
     assert resources.gpu_mem_busy(cfg, "main", mem_sampler=lambda: None) is False
 
 
+# --------------------------------------------------- per-machine dispatch lock
+
+def test_dispatch_lock_serializes_two_processes(tmp_path, monkeypatch):
+    """Regression for the 2026-09-06 r9700 incident: psnr26tum9_fr3_b16_alphagate
+    and psnr26oracle_fr3_offline_hold8 both launched within the same minute and
+    ran concurrently on one GPU. Root cause: nothing prevented a second
+    `ablator run` process for the same machine identity from starting and
+    independently racing the first through its own busy-check -> claim ->
+    launch sequence. _acquire_dispatch_lock() must make a second concurrent
+    holder for the SAME machine block until the first releases -- and must
+    never contend with a different machine's lock.
+    """
+    monkeypatch.setattr(runner, "_dispatch_lock_path",
+                        lambda machine: str(tmp_path / f"dispatch_{machine}.lock"))
+    fd1 = runner._acquire_dispatch_lock("r9700")
+    try:
+        acquired_second = threading.Event()
+
+        def try_acquire():
+            fd2 = runner._acquire_dispatch_lock("r9700")
+            acquired_second.set()
+            os.close(fd2)
+
+        t = threading.Thread(target=try_acquire, daemon=True)
+        t.start()
+        time.sleep(0.3)
+        assert not acquired_second.is_set(), (
+            "a second process for the SAME machine must block while the "
+            "first still holds the dispatch lock -- this is exactly the "
+            "gap that let two GPU jobs launch concurrently on r9700"
+        )
+
+        # A different machine's lock must never contend with this one --
+        # main and r9700 dispatch independently.
+        fd_other = runner._acquire_dispatch_lock("main")
+        os.close(fd_other)
+    finally:
+        os.close(fd1)
+
+    t.join(timeout=2)
+    assert acquired_second.is_set(), (
+        "the second process must acquire the lock once the first releases it"
+    )
+
+
+def test_run_loop_holds_dispatch_lock_only_across_one_tick(tmp_path, monkeypatch):
+    """run_loop() must acquire and release the dispatch lock every tick (not
+    leak it across iterations), so a legitimate second dispatcher (e.g. a
+    `--once` invocation) is never starved forever by a long-lived first
+    process that has since gone idle."""
+    cfg = make_cfg(tmp_path)
+    monkeypatch.setattr(runner, "_dispatch_lock_path",
+                        lambda machine: str(tmp_path / f"dispatch_{machine}.lock"))
+    monkeypatch.setattr(runner.resources, "machine_busy", lambda *a, **k: False)
+    runner.run_loop(cfg, once=True)  # no pending jobs: idle tick, must not hang
+
+    # Lock must be free again: acquiring it fresh must not block.
+    fd = runner._acquire_dispatch_lock(cfgmod.machine_name(cfg))
+    os.close(fd)
+
+
 # ------------------------------------------------------- template rendering
 
 JOB = {"id": "abl_ctrl", "type": "replay", "scene": "/data/fr3",

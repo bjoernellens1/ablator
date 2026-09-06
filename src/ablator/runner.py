@@ -15,6 +15,7 @@ queue bookkeeping and process launch.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -2845,6 +2846,63 @@ class _K8sInflight:
         self._threads.clear()
 
 
+def _dispatch_lock_path(machine: str) -> str:
+    """Local (never networked-filesystem) path for this machine's exclusive
+    dispatch lock. Deliberately under ~/.cache/ablator/ (same convention as
+    source_checkout.py's worktree cache) rather than the shared queue dir:
+    the two processes that must be serialized against each other always run
+    on the SAME host (only that host's own `ablator run` ever claims its
+    `machine` identity), and flock() over a networked mount (the queue dir
+    lives on /mnt/cps_persistent1_shared, an NFS-style share) is not
+    reliably an exclusive lock -- many NFS configurations silently no-op
+    advisory locks, which would make the guard below a placebo.
+    """
+    d = os.path.expanduser("~/.cache/ablator/run_locks")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"dispatch_{machine}.lock")
+
+
+def _acquire_dispatch_lock(machine: str):
+    """Block until this process holds the sole right to dispatch bare-metal
+    GPU jobs for `machine`, and return the open fd (caller must keep a
+    reference for the life of the process -- closing/GC'ing it releases the
+    flock).
+
+    Found live 2026-09-06 on r9700: psnr26tum9_fr3_b16_alphagate and
+    psnr26oracle_fr3_offline_hold8 launched within the same minute and ran
+    concurrently (two `docker run --name splat_train_*` processes, two
+    `python train.py` trees) even though every job's container already
+    carries a `splat_train_*` name and every machine's busy_guard already
+    keys off that name (see _ensure_container_name). Nothing had ever
+    stopped a SECOND `ablator run` process for the same machine identity
+    from starting -- start_runners()'s `pgrep -f "[a]blator run"` check is
+    a best-effort probe made once, at launch time, by whichever process
+    happens to be starting a runner; it does not prevent a second process
+    (a manually-invoked daemon, an `--once` dispatcher, a stray restart)
+    from beginning its own claim_next()/launch cycle while a first one is
+    already live. Once two such processes exist, each independently reads
+    `resources.machine_busy()` (a `docker ps`/`podman ps` probe) and can
+    both see "idle" in the same instant -- particularly during the sliver
+    between one process's `subprocess.Popen(["docker", "run", ...])`
+    returning and that container actually being visible in `docker ps`
+    (already a documented race elsewhere in this file, see the
+    reconcile_stale_running() grace-window comment) -- and both then claim
+    and launch a GPU job onto the same GPU.
+
+    This lock closes that gap structurally rather than narrowing the
+    timing window further: only one process may ever be inside the
+    busy-check -> claim -> launch -> supervise sequence for a given
+    machine at a time, for as long as it holds the lock (see run_loop(),
+    which holds it for exactly that span each tick). A second process
+    (including a `--once` one-shot dispatcher) simply blocks here until
+    the first relinquishes it, rather than racing it.
+    """
+    path = _dispatch_lock_path(machine)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
 def run_loop(cfg: dict, once: bool = False) -> None:
     machine = cfgmod.machine_name(cfg)
     q = Queue(cfgmod.queue_path(cfg))
@@ -2934,185 +2992,189 @@ def run_loop(cfg: dict, once: bool = False) -> None:
             last_self_check = now
         try:
             inflight.reap()
-            baremetal_busy = resources.machine_busy(cfg, machine)
-            if baremetal_busy:
-                # Local GPU busy with this machine's own bare-metal job only
-                # blocks steps 1/3 (bare-metal claim/run) below -- it must
-                # NOT block step 2 (k8s-fill). This runner is the sole
-                # dispatcher for every k8s-backend machine (e.g.
-                # a100cluster); k8s dispatch never touches this machine's
-                # own GPU, so gating it behind local GPU busy starved the
-                # cluster of new work for the entire duration of every
-                # bare-metal job this process ran. Found live 2026-07-25:
-                # an a100cluster-pinned job sat "pending" for 10+ minutes
-                # while main ran back-to-back bare-metal jobs, with zero
-                # k8s dispatch log lines the entire time.
-                write_heartbeat(cfg, machine,
-                                f"busy-wait k8s_inflight={inflight.total()}")
-            else:
-                write_heartbeat(cfg, machine, f"idle k8s_inflight={inflight.total()}")
-
-            # Steps 0/1 (bare-metal self-heal, urgent-fix gate, bare-metal
-            # claim) only make sense/are only safe while this machine's own
-            # GPU is idle -- in particular, enforce_urgent_fixes can do a
-            # local git pull, which must never yank code out from under a
-            # running bind-mounted bare-metal job. None of this touches k8s
-            # dispatch (step 2 below), which always runs regardless of
-            # baremetal_busy.
-            job = None
-            currency_ok = True
-            if not baremetal_busy:
-                # Re-run bare-metal self-heal on every idle tick, not just at
-                # startup. The startup-only call can legitimately skip a job
-                # that predates this process (busy=True because that prior
-                # process's own job was still genuinely training) and then
-                # never get a second chance -- confirmed live 2026-07-07:
-                # frdeskw01main_fr1desk_w01_plus_admission_fix stayed stuck at
-                # status="running" for 2h45m because the runner restarted
-                # 2.5 minutes before that in-flight job actually finished, the
-                # startup call correctly deferred (busy=True at that instant),
-                # and nothing ever retried once the machine went idle seconds
-                # later. reconcile_stale_running() is a no-op once an entry has
-                # already been reconciled (it only touches status=="running"
-                # entries), so calling it every idle tick is cheap in steady
-                # state -- one extra q.read() scan, not a busy-poll.
-                reconcile_stale_running(cfg, machine, q, busy=False)
-
-                # -1. Pause re-validation: if this machine is currently
-                # paused, re-run the SPECIFIC check that caused it (never a
-                # blind timer/TTL -- see pause_revalidation.py and
-                # splatograph issue #629) and clear the flag only if that
-                # check now passes. Human-set pauses (`ablator pause`) and
-                # any category without a registered re-checker are left
-                # untouched. Only reached once machine_busy() above already
-                # confirmed this machine's own GPU is idle -- the same
-                # scoping the urgent-fix gate below relies on -- so
-                # auto-clearing here can never race a foreign or
-                # bind-mounted job for the GPU; it only makes claim_next()
-                # eligible again on a subsequent, still fully-guarded tick.
-                revalidate_pause(cfg, machine, q)
-
-                # 0. Urgent-fix currency gate: verify this dispatcher's own
-                # checkout has every registered urgent fix before dispatching
-                # ANYTHING this tick -- both the k8s path (git-sync pins to
-                # this host's HEAD SHA) and the bare-metal path (live bind
-                # mount) run whatever is on disk here right now. Only reached
-                # once machine_busy() above already confirmed idle, so an
-                # auto-pull here can never yank code out from under a running
-                # bind-mounted job. See urgent_fixes.py for the full incident
-                # writeup and design rationale.
-                currency_ok = enforce_urgent_fixes(cfg, machine, q)
-
-                # 1. Claim (non-blocking) this runner's own bare-metal job
-                # FIRST, before k8s claiming — this is what actually gives an
-                # idle bare-metal machine first shot at machine="any" jobs
-                # instead of losing every race to whichever process's
-                # k8s-fill loop happens to run first. Running it is deferred
-                # to step 3 (it's blocking) so it doesn't starve k8s
-                # concurrency in the meantime — see the design comment above
-                # for why that split matters.
-                job = q.claim_next(
-                    machine, can_run=make_can_run(cfg, machine, requires_gpu=True),
-                    allow_pinned_git_while_paused=not currency_ok,
-                )
-
-            # Preserve bare-metal priority through the new runner-provenance
-            # write as well as through queue claiming.  If a k8s thread wins
-            # the queue lock first, its provenance/finalization can otherwise
-            # delay this already-claimed local job until the k8s work ends.
-            baremetal_provenance_recorded = False
-            if job is not None:
-                _record_runner_provenance(cfg, job, machine, q)
-                baremetal_provenance_recorded = True
-
-            # 1b. Claim and run (non-blocking) CPU-only jobs -- types with
-            # `requires_gpu = false` -- regardless of baremetal_busy. These
-            # never touch the GPU, so gating them behind the GPU-idle check
-            # starved them for hours behind a deep GPU queue (found live
-            # 2026-09-04: splatograph-lab's 10-second CPU test suite could not
-            # get a slot on main for a whole afternoon; a second runner racing
-            # for the ~2 s gap between back-to-back GPU jobs never won it).
-            # Each is handed to a background thread exactly like a k8s
-            # dispatch, bounded by [resources] cpu_max_concurrent, and goes
-            # through the same _dispatch_and_finalize bookkeeping.
-            cpu_slot = f"cpu:{machine}"
-            cpu_cap = cpu_max_concurrent(cfg)
-            while inflight.count(cpu_slot) < cpu_cap:
-                cjob = q.claim_next(
-                    machine, can_run=make_can_run(cfg, machine, requires_gpu=False),
-                    allow_pinned_git_while_paused=not currency_ok,
-                )
-                if cjob is None:
-                    break
-                print(f"[ablator] dispatching CPU-only {cjob['id']} on {machine} "
-                      f"({inflight.count(cpu_slot) + 1}/{cpu_cap} in flight, "
-                      f"gpu_busy={baremetal_busy})", flush=True)
-                t = threading.Thread(
-                    target=_dispatch_and_finalize,
-                    args=(cfg, machine, cjob, machine, q),
-                    daemon=True,
-                    name=f"cpu-{cjob['id']}",
-                )
-                t.start()
-                inflight.add(cpu_slot, t, cjob["id"])
-
-            # 2. Fill k8s concurrency slots — non-blocking: each claimed job
-            # is handed to a background thread and this loop moves straight
-            # on to running the bare-metal job (if any) below without
-            # waiting for it. When another bare-metal machine looks
-            # idle-with-capacity right now (fresh heartbeat), defer
-            # claiming machine="any" jobs for k8s this tick so that machine
-            # gets first shot on its own next poll instead of losing every
-            # "any" job to this process's k8s dispatch purely because it
-            # gets to call claim_next() more often. Jobs explicitly pinned
-            # to a k8s machine are never affected by this.
-            defer_any = _other_idle_baremetal(cfg, machine)
-            for k8s_name in k8s_machines:
-                cap = _k8s_max_concurrent(cfg, k8s_name)
-                base_can_run = make_can_run(cfg, k8s_name)
-                if currency_ok:
-                    can_run = base_can_run
+            dispatch_lock_fd = _acquire_dispatch_lock(machine)
+            try:
+                baremetal_busy = resources.machine_busy(cfg, machine)
+                if baremetal_busy:
+                    # Local GPU busy with this machine's own bare-metal job only
+                    # blocks steps 1/3 (bare-metal claim/run) below -- it must
+                    # NOT block step 2 (k8s-fill). This runner is the sole
+                    # dispatcher for every k8s-backend machine (e.g.
+                    # a100cluster); k8s dispatch never touches this machine's
+                    # own GPU, so gating it behind local GPU busy starved the
+                    # cluster of new work for the entire duration of every
+                    # bare-metal job this process ran. Found live 2026-07-25:
+                    # an a100cluster-pinned job sat "pending" for 10+ minutes
+                    # while main ran back-to-back bare-metal jobs, with zero
+                    # k8s dispatch log lines the entire time.
+                    write_heartbeat(cfg, machine,
+                                    f"busy-wait k8s_inflight={inflight.total()}")
                 else:
-                    can_run = lambda candidate, inner=base_can_run: (
-                        can_bypass_urgent_fix_pause(candidate) and inner(candidate)
+                    write_heartbeat(cfg, machine, f"idle k8s_inflight={inflight.total()}")
+
+                # Steps 0/1 (bare-metal self-heal, urgent-fix gate, bare-metal
+                # claim) only make sense/are only safe while this machine's own
+                # GPU is idle -- in particular, enforce_urgent_fixes can do a
+                # local git pull, which must never yank code out from under a
+                # running bind-mounted bare-metal job. None of this touches k8s
+                # dispatch (step 2 below), which always runs regardless of
+                # baremetal_busy.
+                job = None
+                currency_ok = True
+                if not baremetal_busy:
+                    # Re-run bare-metal self-heal on every idle tick, not just at
+                    # startup. The startup-only call can legitimately skip a job
+                    # that predates this process (busy=True because that prior
+                    # process's own job was still genuinely training) and then
+                    # never get a second chance -- confirmed live 2026-07-07:
+                    # frdeskw01main_fr1desk_w01_plus_admission_fix stayed stuck at
+                    # status="running" for 2h45m because the runner restarted
+                    # 2.5 minutes before that in-flight job actually finished, the
+                    # startup call correctly deferred (busy=True at that instant),
+                    # and nothing ever retried once the machine went idle seconds
+                    # later. reconcile_stale_running() is a no-op once an entry has
+                    # already been reconciled (it only touches status=="running"
+                    # entries), so calling it every idle tick is cheap in steady
+                    # state -- one extra q.read() scan, not a busy-poll.
+                    reconcile_stale_running(cfg, machine, q, busy=False)
+
+                    # -1. Pause re-validation: if this machine is currently
+                    # paused, re-run the SPECIFIC check that caused it (never a
+                    # blind timer/TTL -- see pause_revalidation.py and
+                    # splatograph issue #629) and clear the flag only if that
+                    # check now passes. Human-set pauses (`ablator pause`) and
+                    # any category without a registered re-checker are left
+                    # untouched. Only reached once machine_busy() above already
+                    # confirmed this machine's own GPU is idle -- the same
+                    # scoping the urgent-fix gate below relies on -- so
+                    # auto-clearing here can never race a foreign or
+                    # bind-mounted job for the GPU; it only makes claim_next()
+                    # eligible again on a subsequent, still fully-guarded tick.
+                    revalidate_pause(cfg, machine, q)
+
+                    # 0. Urgent-fix currency gate: verify this dispatcher's own
+                    # checkout has every registered urgent fix before dispatching
+                    # ANYTHING this tick -- both the k8s path (git-sync pins to
+                    # this host's HEAD SHA) and the bare-metal path (live bind
+                    # mount) run whatever is on disk here right now. Only reached
+                    # once machine_busy() above already confirmed idle, so an
+                    # auto-pull here can never yank code out from under a running
+                    # bind-mounted job. See urgent_fixes.py for the full incident
+                    # writeup and design rationale.
+                    currency_ok = enforce_urgent_fixes(cfg, machine, q)
+
+                    # 1. Claim (non-blocking) this runner's own bare-metal job
+                    # FIRST, before k8s claiming — this is what actually gives an
+                    # idle bare-metal machine first shot at machine="any" jobs
+                    # instead of losing every race to whichever process's
+                    # k8s-fill loop happens to run first. Running it is deferred
+                    # to step 3 (it's blocking) so it doesn't starve k8s
+                    # concurrency in the meantime — see the design comment above
+                    # for why that split matters.
+                    job = q.claim_next(
+                        machine, can_run=make_can_run(cfg, machine, requires_gpu=True),
+                        allow_pinned_git_while_paused=not currency_ok,
                     )
-                while inflight.count(k8s_name) < cap:
-                    kjob = q.claim_next(k8s_name, can_run=can_run,
-                                        only_pinned=defer_any)
-                    if kjob is None:
+
+                # Preserve bare-metal priority through the new runner-provenance
+                # write as well as through queue claiming.  If a k8s thread wins
+                # the queue lock first, its provenance/finalization can otherwise
+                # delay this already-claimed local job until the k8s work ends.
+                baremetal_provenance_recorded = False
+                if job is not None:
+                    _record_runner_provenance(cfg, job, machine, q)
+                    baremetal_provenance_recorded = True
+
+                # 1b. Claim and run (non-blocking) CPU-only jobs -- types with
+                # `requires_gpu = false` -- regardless of baremetal_busy. These
+                # never touch the GPU, so gating them behind the GPU-idle check
+                # starved them for hours behind a deep GPU queue (found live
+                # 2026-09-04: splatograph-lab's 10-second CPU test suite could not
+                # get a slot on main for a whole afternoon; a second runner racing
+                # for the ~2 s gap between back-to-back GPU jobs never won it).
+                # Each is handed to a background thread exactly like a k8s
+                # dispatch, bounded by [resources] cpu_max_concurrent, and goes
+                # through the same _dispatch_and_finalize bookkeeping.
+                cpu_slot = f"cpu:{machine}"
+                cpu_cap = cpu_max_concurrent(cfg)
+                while inflight.count(cpu_slot) < cpu_cap:
+                    cjob = q.claim_next(
+                        machine, can_run=make_can_run(cfg, machine, requires_gpu=False),
+                        allow_pinned_git_while_paused=not currency_ok,
+                    )
+                    if cjob is None:
                         break
-                    print(f"[ablator] dispatching {kjob['id']} to {k8s_name} "
-                          f"({inflight.count(k8s_name) + 1}/{cap} in flight)",
-                          flush=True)
+                    print(f"[ablator] dispatching CPU-only {cjob['id']} on {machine} "
+                          f"({inflight.count(cpu_slot) + 1}/{cpu_cap} in flight, "
+                          f"gpu_busy={baremetal_busy})", flush=True)
                     t = threading.Thread(
                         target=_dispatch_and_finalize,
-                        args=(cfg, machine, kjob, k8s_name, q),
+                        args=(cfg, machine, cjob, machine, q),
                         daemon=True,
-                        name=f"k8s-{kjob['id']}",
+                        name=f"cpu-{cjob['id']}",
                     )
                     t.start()
-                    inflight.add(k8s_name, t, kjob["id"])
+                    inflight.add(cpu_slot, t, cjob["id"])
 
-            # 3. Run (serially, blocking) the bare-metal job claimed in step
-            # 1, if any.
-            if job is None:
+                # 2. Fill k8s concurrency slots — non-blocking: each claimed job
+                # is handed to a background thread and this loop moves straight
+                # on to running the bare-metal job (if any) below without
+                # waiting for it. When another bare-metal machine looks
+                # idle-with-capacity right now (fresh heartbeat), defer
+                # claiming machine="any" jobs for k8s this tick so that machine
+                # gets first shot on its own next poll instead of losing every
+                # "any" job to this process's k8s dispatch purely because it
+                # gets to call claim_next() more often. Jobs explicitly pinned
+                # to a k8s machine are never affected by this.
+                defer_any = _other_idle_baremetal(cfg, machine)
+                for k8s_name in k8s_machines:
+                    cap = _k8s_max_concurrent(cfg, k8s_name)
+                    base_can_run = make_can_run(cfg, k8s_name)
+                    if currency_ok:
+                        can_run = base_can_run
+                    else:
+                        can_run = lambda candidate, inner=base_can_run: (
+                            can_bypass_urgent_fix_pause(candidate) and inner(candidate)
+                        )
+                    while inflight.count(k8s_name) < cap:
+                        kjob = q.claim_next(k8s_name, can_run=can_run,
+                                            only_pinned=defer_any)
+                        if kjob is None:
+                            break
+                        print(f"[ablator] dispatching {kjob['id']} to {k8s_name} "
+                              f"({inflight.count(k8s_name) + 1}/{cap} in flight)",
+                              flush=True)
+                        t = threading.Thread(
+                            target=_dispatch_and_finalize,
+                            args=(cfg, machine, kjob, k8s_name, q),
+                            daemon=True,
+                            name=f"k8s-{kjob['id']}",
+                        )
+                        t.start()
+                        inflight.add(k8s_name, t, kjob["id"])
+
+                # 3. Run (serially, blocking) the bare-metal job claimed in step
+                # 1, if any.
+                if job is None:
+                    if once:
+                        inflight.join_all()
+                        return
+                    time.sleep(IDLE_POLL_S)
+                    continue
+                write_heartbeat(cfg, machine, f"running:{job['id']}")
+                status = _dispatch_and_finalize(
+                    cfg, machine, job, machine, q,
+                    runner_provenance_recorded=baremetal_provenance_recorded,
+                )
+                write_heartbeat(cfg, machine,
+                                f"finished:{job['id']}:{status} "
+                                f"k8s_inflight={inflight.total()}")
+                last_tick = time.monotonic()  # job runs are legitimately long
                 if once:
                     inflight.join_all()
                     return
-                time.sleep(IDLE_POLL_S)
-                continue
-            write_heartbeat(cfg, machine, f"running:{job['id']}")
-            status = _dispatch_and_finalize(
-                cfg, machine, job, machine, q,
-                runner_provenance_recorded=baremetal_provenance_recorded,
-            )
-            write_heartbeat(cfg, machine,
-                            f"finished:{job['id']}:{status} "
-                            f"k8s_inflight={inflight.total()}")
-            last_tick = time.monotonic()  # job runs are legitimately long
-            if once:
-                inflight.join_all()
-                return
+            finally:
+                os.close(dispatch_lock_fd)
         except Exception as e:
             import traceback
             print(f"[ablator] loop iteration crashed: {e!r}\n"
