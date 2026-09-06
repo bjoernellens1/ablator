@@ -2862,11 +2862,12 @@ def _dispatch_lock_path(machine: str) -> str:
     return os.path.join(d, f"dispatch_{machine}.lock")
 
 
-def _acquire_dispatch_lock(machine: str):
-    """Block until this process holds the sole right to dispatch bare-metal
-    GPU jobs for `machine`, and return the open fd (caller must keep a
-    reference for the life of the process -- closing/GC'ing it releases the
-    flock).
+def _acquire_dispatch_lock(machine: str) -> int | None:
+    """Try to become the sole process allowed to dispatch bare-metal GPU
+    jobs for `machine` right now. Returns the open fd on success (caller
+    must keep a reference for as long as it holds dispatch rights --
+    closing/GC'ing it releases the flock), or None if another process
+    already holds it.
 
     Found live 2026-09-06 on r9700: psnr26tum9_fr3_b16_alphagate and
     psnr26oracle_fr3_offline_hold8 launched within the same minute and ran
@@ -2892,14 +2893,23 @@ def _acquire_dispatch_lock(machine: str):
     This lock closes that gap structurally rather than narrowing the
     timing window further: only one process may ever be inside the
     busy-check -> claim -> launch -> supervise sequence for a given
-    machine at a time, for as long as it holds the lock (see run_loop(),
-    which holds it for exactly that span each tick). A second process
-    (including a `--once` one-shot dispatcher) simply blocks here until
-    the first relinquishes it, rather than racing it.
+    machine at a time (see run_loop(), which holds it for exactly that
+    span each tick, including the full blocking job run). Non-blocking by
+    design, not LOCK_EX: run_loop()'s bare-metal dispatch already holds
+    this lock for the entire duration of a running job (potentially hours),
+    and a `--once` one-shot dispatcher (see the idle-triggered launcher in
+    ablator_gpu_sampler-style scripts) must return promptly -- "no slot
+    available this cycle" -- exactly like the existing `baremetal_busy`
+    idiom, never block indefinitely waiting for someone else's job to
+    finish.
     """
     path = _dispatch_lock_path(machine)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
     return fd
 
 
@@ -2993,6 +3003,24 @@ def run_loop(cfg: dict, once: bool = False) -> None:
         try:
             inflight.reap()
             dispatch_lock_fd = _acquire_dispatch_lock(machine)
+            if dispatch_lock_fd is None:
+                # Another `ablator run` process already holds this
+                # machine's dispatch lock -- it is either mid busy-check/
+                # claim/launch itself, or already running a job it
+                # dispatched. Treat this tick exactly like
+                # baremetal_busy=True: never claim/launch a second
+                # bare-metal job here. This should only ever happen
+                # transiently (an operator-started duplicate daemon, a
+                # `--once` dispatcher racing the persistent one) -- it
+                # self-resolves as soon as the lock holder's own tick ends.
+                write_heartbeat(cfg, machine,
+                                f"busy-wait(dispatch_lock held elsewhere) "
+                                f"k8s_inflight={inflight.total()}")
+                if once:
+                    inflight.join_all()
+                    return
+                time.sleep(IDLE_POLL_S)
+                continue
             try:
                 baremetal_busy = resources.machine_busy(cfg, machine)
                 if baremetal_busy:
