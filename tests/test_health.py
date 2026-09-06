@@ -137,6 +137,67 @@ def test_complete_marker_accepts_list_any_match(tmp_path):
     assert health.job_health(job, str(tmp_path), qcfg)["state"] == "done"
 
 
+def _researchflow_job(tmp_path, state_dir_name="9a58e4c6b084", job_id="run-job"):
+    """A `type: "researchflow"` external job as submitted by external.py --
+    no model_path, everything keyed off external_metadata (see
+    docs/external-scheduler.md and ResearchFlow's execute_job)."""
+    state_dir = tmp_path / state_dir_name
+    (state_dir / "jobs").mkdir(parents=True, exist_ok=True)
+    return {
+        "id": "rf-abc123-job",
+        "type": "researchflow",
+        "model_path": "",
+        "external_metadata": {
+            "researchflow_origin_path": str(state_dir / "experiment_origin.json"),
+            "researchflow_job_id": job_id,
+        },
+    }, state_dir
+
+
+def test_researchflow_done_marker_path_from_metadata(tmp_path):
+    job, state_dir = _researchflow_job(tmp_path)
+    assert health.researchflow_done_marker(job) == str(
+        state_dir / "jobs" / "run-job.done"
+    )
+    # Non-researchflow types and jobs missing either metadata field resolve
+    # to nothing rather than guessing.
+    assert health.researchflow_done_marker({"type": "bag"}) is None
+    assert health.researchflow_done_marker({"type": "researchflow"}) is None
+    assert health.researchflow_done_marker(
+        {"type": "researchflow", "external_metadata": {"researchflow_job_id": "x"}}
+    ) is None
+
+
+def test_researchflow_external_job_done_via_own_marker(tmp_path):
+    """A `type: "researchflow"` external job (see docs/external-scheduler.md)
+    has no model_path and never produces a result_glob/.COMPLETE artifact --
+    ResearchFlow's own `execute_job` writes `<state-dir>/jobs/<job_id>.done`
+    instead once its subprocess exits 0 and its evidence contract validates.
+    Before this, job_health() had no way to see that file, so an already-
+    finished external job stayed permanently unable to reach state="done"
+    here (confirmed live: varsplat x office0 stuck at status="running")."""
+    job, state_dir = _researchflow_job(tmp_path)
+    h = health.job_health(job, str(tmp_path))
+    assert h["state"] != "done"
+    (state_dir / "jobs" / "run-job.done").write_text("planshahere\n")
+    h = health.job_health(job, str(tmp_path))
+    assert h["state"] == "done"
+    # Also settles the process_alive=False path used by reconcile/
+    # require_result_artifact post-exit checks -- a real completion marker
+    # must never be downgraded to "crashed" just because there is no
+    # in-process handle to consult and no train.log at model_path.
+    h = health.job_health(job, str(tmp_path), process_alive=False)
+    assert h["state"] == "done"
+
+
+def test_researchflow_marker_absent_stays_not_done(tmp_path):
+    job, _state_dir = _researchflow_job(tmp_path)
+    h = health.job_health(job, str(tmp_path), process_alive=False)
+    # No live process, no log, no .done -- looks exactly like a job that
+    # died before writing anything, same as any other job type.
+    assert h["state"] == "crashed"
+
+
 def test_clear_stale_complete_marker_clears_all_configured_markers(tmp_path):
     job = make_run(tmp_path, "Training: 5/30000")
     for name in (".COMPLETE", "causal_replay_summary.json"):

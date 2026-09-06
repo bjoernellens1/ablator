@@ -14,6 +14,10 @@ Configurable under [queue]:
   result_glob        success marker glob relative to model_path resolution
   hung_after_min     minutes without log writes before "hung" (default 20)
   crash_markers      list of substrings meaning "crashed"
+
+`type: "researchflow"` external jobs (see docs/external-scheduler.md) have no
+model_path and are never covered by the config keys above; see
+researchflow_done_marker() for their own, independent completion evidence.
 """
 from __future__ import annotations
 
@@ -94,6 +98,47 @@ DEFAULT_CRASH_MARKERS = [
 ]
 
 
+def researchflow_done_marker(job: dict) -> str | None:
+    """Path to a ``type: "researchflow"`` external job's own completion marker.
+
+    External jobs submitted via `external.py` (see docs/external-scheduler.md)
+    carry no `model_path` at all -- everything above this point in the module
+    (result_glob, complete_marker) resolves relative to `model_path` and is
+    permanently unable to see them, so every such job was stuck reporting
+    "no completion artifact" forever, however long it had actually already
+    finished (confirmed live: varsplat x office0 stuck at status="running"
+    well after ResearchFlow's own execute-job had already written its
+    completion evidence).
+
+    ResearchFlow's `execute_job` (src/researchflow/execution.py) writes
+    `<state-dir>/jobs/<job_id>.done` -- containing the plan sha256, never
+    zero-byte -- only once its own subprocess exits 0 AND its evidence
+    contract (`<state-dir>/jobs/<job_id>.evidence.json`) validates; a
+    process that fails, or one whose output fails evidence validation,
+    never gets a `.done` file at all. So `.done` alone is authoritative:
+    there is no case where checking it can produce a false "done" that
+    checking both files together would have avoided.
+
+    `<state-dir>` is not itself submitted as a job field, but the fixed
+    relative layout is recoverable from two `external_metadata` fields
+    ResearchFlow already stamps onto every job it submits: the sibling
+    `experiment_origin.json` it writes at `<state-dir>/experiment_origin.json`
+    (given here as `researchflow_origin_path`) and the job's own
+    `researchflow_job_id`. Absent either field (e.g. a non-ResearchFlow
+    caller reusing the `researchflow` type name directly), there is nothing
+    to resolve and this returns None -- same as no marker configured.
+    """
+    if job.get("type") != "researchflow":
+        return None
+    metadata = job.get("external_metadata") or {}
+    origin_path = metadata.get("researchflow_origin_path")
+    job_id = metadata.get("researchflow_job_id")
+    if not origin_path or not job_id:
+        return None
+    state_dir = os.path.dirname(str(origin_path))
+    return os.path.join(state_dir, "jobs", f"{job_id}.done")
+
+
 def parse_iter(tail: str, extra_args: str = "",
                counter_regex: str = progmod.DEFAULT_REGEX,
                cap_regex: str = progmod.DEFAULT_CAP_REGEX,
@@ -172,6 +217,15 @@ def job_health(job: dict, base_dir: str, qcfg: dict | None = None,
         # gradeability tooling reads), this is only a second, independent
         # way to reach "done" for run types whose completion contract never
         # produces that artifact.
+        h["state"] = "done"
+
+    researchflow_marker = researchflow_done_marker(job)
+    if researchflow_marker and os.path.exists(researchflow_marker):
+        # Independent OR, same rationale as complete_markers() above: a
+        # `type: "researchflow"` external job's own `.done` file is the only
+        # completion evidence it will ever produce at this layer (it has no
+        # model_path), so this is not a fallback for the checks above -- for
+        # this job type, it is the ONLY signal that can ever fire.
         h["state"] = "done"
 
     try:
