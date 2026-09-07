@@ -2890,6 +2890,79 @@ def _claimed_age_s(job: dict, now: float | None = None) -> float | None:
     return (time.time() if now is None else now) - claimed_epoch
 
 
+# How long after a reconcile-driven `done` verdict self-heal still considers
+# reverting it, if fresh contrary evidence shows up. Bounded deliberately --
+# an OLD reconciled-done entry has had plenty of chances to be genuinely
+# correct (or superseded by dependents already dispatched off of it); this
+# is only meant to catch the narrow, recent window where a fleet-wide
+# rollout is still in progress and a stale peer's daemon (running code from
+# before container_alive / recently_active existed) raced a fresher one.
+SELF_HEAL_WINDOW_S = 1800.0
+
+
+def heal_falsely_reconciled_done(cfg: dict, machine: str, q: Queue) -> None:
+    """Revert a `status="done", reconciled=True` job BACK to "running" if
+    this machine's own claimed_by=`machine` job still has a genuinely live
+    container or a freshly-written log.
+
+    Exists because reconcile_stale_running()'s cross-machine branch has no
+    way to stop a DIFFERENT host's stale daemon (one whose ablator install
+    predates container_alive/recently_active, see self_check.py) from
+    writing a false "done" for a job THIS host claimed and is still
+    actively training -- that write lands in the same shared queue file
+    regardless of which host's code is current. Found live 2026-09:
+    psnr26orb12_r9700_...'s `done` was written by "rtx4070" (a genuinely
+    separate, unrelated-to-"rtx4070b" host that had never been updated
+    past d43078c, 11 commits behind -- confirmed via its own
+    ablator_version_rtx4070.txt) while r9700 (already on the current,
+    protected code) was actively training it the whole time.
+
+    Deliberately scoped to `claimed_by == machine` only -- this machine has
+    full local authority (a real docker/podman ps, no cross-host
+    reachability problem) over its own claimed jobs, so this never has to
+    guess about a foreign host's container the way the cross-machine
+    reconcile branch does. Bounded to jobs finished within
+    SELF_HEAL_WINDOW_S so this can never resurrect an old, long-settled
+    entry (e.g. one a dependent job has since been legitimately dispatched
+    on top of and is itself well underway) -- only the narrow window where
+    a mixed-currency fleet is still converging. `reconciled=True` (never
+    set by a job's own genuine exit_code-driven completion, only by
+    reconcile_stale_running) further scopes this to auto-inferred verdicts,
+    never a trainer's own reported result.
+    """
+    now = time.time()
+    for job in q.read():
+        if job.get("status") != "done" or not job.get("reconciled"):
+            continue
+        if job.get("claimed_by") != machine:
+            continue
+        finished_at = job.get("finished_at")
+        if not finished_at:
+            continue
+        try:
+            finished_epoch = time.mktime(
+                time.strptime(finished_at, "%Y-%m-%dT%H:%M:%S"))
+        except (TypeError, ValueError):
+            continue
+        if now - finished_epoch > SELF_HEAL_WINDOW_S:
+            continue
+        base_dir = _job_base_dir(cfg, job, machine)
+        container_alive = _job_container_alive(cfg, job, machine)
+        h = healthmod.job_health(job, base_dir,
+                                 _health_qcfg(cfg, _type_cfg_or_empty(cfg, job, machine)),
+                                 process_alive=False,
+                                 container_alive=container_alive)
+        if container_alive or _log_recently_active(h):
+            reason = (f"its container ({expected_container_name(job)}) is "
+                      "still running" if container_alive else
+                      f"its log was written to {h.get('log_age_s'):.0f}s ago")
+            print(f"[ablator] self-heal: {job['id']} was marked done+reconciled "
+                  f"but {reason} -- a peer's stale daemon likely raced this "
+                  "one; reverting to 'running'", flush=True)
+            q.update(job["id"], status="running", health=h,
+                    self_healed=True, self_healed_at=time.strftime("%Y-%m-%dT%H:%M:%S"))
+
+
 DEFAULT_K8S_MAX_CONCURRENT = 4
 
 # How fresh a heartbeat must be to trust its "idle" state as "about to try
@@ -3194,6 +3267,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
           f"(dispatching for: {', '.join(dispatch_machines)})", flush=True)
     inflight = _K8sInflight()
     reconcile_stale_running(cfg, machine, q)
+    heal_falsely_reconciled_done(cfg, machine, q)
     for k8s_name in k8s_machines:
         reconcile_stale_running(cfg, k8s_name, q, busy=False, inflight=inflight)
 
@@ -3298,6 +3372,7 @@ def run_loop(cfg: dict, once: bool = False) -> None:
                     # entries), so calling it every idle tick is cheap in steady
                     # state -- one extra q.read() scan, not a busy-poll.
                     reconcile_stale_running(cfg, machine, q, busy=False)
+                    heal_falsely_reconciled_done(cfg, machine, q)
 
                     # -1. Pause re-validation: if this machine is currently
                     # paused, re-run the SPECIFIC check that caused it (never a
