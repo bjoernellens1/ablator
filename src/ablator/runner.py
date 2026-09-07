@@ -16,12 +16,14 @@ queue bookkeeping and process launch.
 from __future__ import annotations
 
 import fcntl
+import fnmatch
 import json
 import os
 import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -2410,6 +2412,29 @@ def _type_cfg_or_empty(cfg: dict, job: dict, machine: str) -> dict:
         return {}
 
 
+def _machine_is_definitely_remote(cfg: dict, machine: str) -> bool:
+    """True only if `machine`'s own `[machines.<machine>] hostname_patterns`
+    positively rule out this process's actual hostname -- i.e. `machine` is
+    a real, specifically-identified host and it is not this one.
+
+    A machine with no hostname_patterns (or the catch-all `["*"]`
+    fallback pattern many configs give a default/pinned identity like
+    "main") is INDETERMINATE, not remote: that identity could equally be
+    this same physical box under a different logical name (see
+    test_reconcile_cross_machine_leaves_running_when_container_alive_locally,
+    where claimed_by="main" and the reconciling `machine` is
+    "a100cluster_x" on the very same host) -- for those, the caller must
+    still do the real local check, exactly as before this function
+    existed. Only a machine with a SPECIFIC, non-matching pattern list is
+    safe to call "remote" and skip the (meaningless, or worse,
+    misleading-False) local probe for."""
+    pats = cfgmod.machine_cfg(cfg, machine).get("hostname_patterns", [])
+    if not pats or pats == ["*"]:
+        return False
+    host = socket.gethostname().lower()
+    return not any(fnmatch.fnmatch(host, p.lower()) for p in pats)
+
+
 def _job_container_alive(cfg: dict, job: dict, machine: str) -> bool | None:
     """container_running() for `job`'s own container, using the SAME
     runtime and name the job was actually launched with -- rendered from
@@ -2435,6 +2460,14 @@ def _job_container_alive(cfg: dict, job: dict, machine: str) -> bool | None:
     that fails to render -- a bash-wrapper type has no
     `splat_train_<job_id>` container to find, and False in that case would
     be wrong, not just uninformative.
+
+    `machine` is trusted here to be a host this local `ps` can meaningfully
+    query (true for every caller: dispatch/own-machine reconcile always
+    pass the actual local machine identity, and the cross-host reconcile
+    caller pre-filters with _machine_is_definitely_remote() before ever
+    reaching here) -- this function itself does not re-derive host
+    identity, so tests exercising it directly with an arbitrary `machine`
+    name still see a real container_running() call.
     """
     tcfg = _type_cfg_or_empty(cfg, job, machine)
     if not tcfg:
@@ -2635,7 +2668,20 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
             # from before this check existed -- this can only ever add
             # protection, never remove it.
             claimed_by_tcfg = _type_cfg_or_empty(cfg, job, claimed_by or machine)
-            container_alive = _job_container_alive(cfg, job, claimed_by or machine)
+            # Skip the local ps entirely when claimed_by is a machine we can
+            # positively identify as a different physical host (see
+            # _machine_is_definitely_remote()): a same-named runtime binary
+            # present on THIS host (e.g. both hosts run podman) would
+            # otherwise happily run and return a confident, wrong False for
+            # a container it can never actually see, defeating the whole
+            # point of the container_alive check below. This is narrower
+            # than container_running()'s own None-on-FileNotFoundError --
+            # that only catches the binary-missing case, not the
+            # same-binary-wrong-daemon one.
+            if _machine_is_definitely_remote(cfg, claimed_by or machine):
+                container_alive = None
+            else:
+                container_alive = _job_container_alive(cfg, job, claimed_by or machine)
             h = healthmod.job_health(job, base_dir,
                                      _health_qcfg(cfg, claimed_by_tcfg),
                                      process_alive=False,
@@ -2800,8 +2846,13 @@ DEFAULT_RECONCILE_GRACE_S = 180.0
 # container_alive. container_alive can only ever see a container on THIS
 # physical host (local docker/podman ps, even when resolved against
 # claimed_by's config/runtime -- see _job_container_alive): for a job
-# claimed by a genuinely different host, it always comes back None, and the
-# artifact-only "done" check has no way to tell "the run is over" apart
+# claimed by a machine _job_container_alive/_machine_is_definitely_remote
+# can positively identify as a different host, it comes back None outright
+# (no local ps is even attempted); for a job claimed by an
+# ambiguously-identified machine (no/wildcard hostname_patterns) that
+# happens to be a different physical host anyway, a local ps can still
+# come back a plain, wrong False. Either way the artifact-only "done"
+# check has no way to tell "the run is over" apart
 # from "the run is mid-refinement and just hasn't finished the FINAL
 # artifact yet". The job's own progress log lives on the same
 # NFS-shared storage as everything else here (model_path), so ANY host's
