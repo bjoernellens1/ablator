@@ -1328,6 +1328,99 @@ def test_reconcile_cross_host_marks_done_when_log_stale(tmp_path, monkeypatch):
     assert job["reconciled"] is True
 
 
+# ------------------------------------------------------- self-heal
+
+def test_heal_reverts_falsely_reconciled_done_when_container_alive(
+        tmp_path, monkeypatch):
+    """Regression, found live 2026-09: a completely separate, stale-code
+    host ("rtx4070", 11 commits behind, predating container_alive /
+    recently_active) reconciled r9700's job done via the cross-machine
+    branch while r9700 itself -- already on current code -- was still
+    actively training it. r9700 has full local authority over its own
+    claimed job (a real docker/podman ps, no cross-host guessing needed)
+    and must self-heal the damage on its own next idle tick."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_falsely_done"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    recent_finish = time.strftime("%Y-%m-%dT%H:%M:%S")
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "done", "claimed_by": "r9700",
+                          "reconciled": True, "finished_at": recent_finish}])
+    monkeypatch.setattr(runner, "container_running",
+                        lambda runtime, name, **k: name == "splat_train_j1")
+    runner.heal_falsely_reconciled_done(cfg, "r9700", q)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
+    assert job.get("self_healed") is True
+
+
+def test_heal_ignores_own_genuine_completion(tmp_path, monkeypatch):
+    """A job that finished for real via run_job()'s own exit_code path
+    never sets reconciled=True -- self-heal must never touch it, container
+    liveness notwithstanding (e.g. a leftover viewer container reusing a
+    similar name should never resurrect a genuinely-done job)."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_genuinely_done"
+    (mp / "comparison" / "iter_1000").mkdir(parents=True)
+    (mp / "comparison" / "iter_1000" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "done", "claimed_by": "r9700",
+                          "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S")}])
+    monkeypatch.setattr(runner, "container_running",
+                        lambda runtime, name, **k: name == "splat_train_j1")
+    runner.heal_falsely_reconciled_done(cfg, "r9700", q)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert "self_healed" not in job
+
+
+def test_heal_ignores_jobs_outside_the_window(tmp_path, monkeypatch):
+    """A reconciled-done entry from well outside SELF_HEAL_WINDOW_S is left
+    alone -- self-heal is only meant to catch a mixed-currency fleet still
+    converging, never to resurrect an old, long-settled entry a dependent
+    may have already been legitimately dispatched on top of."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_old_reconciled"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    old_finish = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 7200))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "done", "claimed_by": "r9700",
+                          "reconciled": True, "finished_at": old_finish}])
+    monkeypatch.setattr(runner, "container_running",
+                        lambda runtime, name, **k: name == "splat_train_j1")
+    runner.heal_falsely_reconciled_done(cfg, "r9700", q)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert "self_healed" not in job
+
+
+def test_heal_ignores_other_machines_reconciled_jobs(tmp_path, monkeypatch):
+    """Self-heal only ever acts on claimed_by == machine -- never a foreign
+    host's job, for the same reachability reason reconcile's cross-machine
+    branch can't check a foreign container directly."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_foreign_reconciled"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "done", "claimed_by": "main",
+                          "reconciled": True,
+                          "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S")}])
+    monkeypatch.setattr(runner, "container_running",
+                        lambda runtime, name, **k: True)
+    runner.heal_falsely_reconciled_done(cfg, "r9700", q)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert "self_healed" not in job
+
+
 def test_reconcile_leaves_other_machines_job_running_when_no_artifact(tmp_path):
     """The cross-machine dead-man's-switch only ever marks a foreign job
     DONE from a real completion artifact -- it must never requeue a
