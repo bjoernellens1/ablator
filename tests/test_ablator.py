@@ -1178,6 +1178,72 @@ def test_reconcile_cross_machine_leaves_running_when_container_alive_locally(
     assert job.get("claimed_by") == "main"
 
 
+def test_reconcile_cross_host_leaves_running_when_log_recently_active(
+        tmp_path, monkeypatch):
+    """Regression, found live 2026-09: rtx4090d's idle-tick reconcile marked
+    a `main`-claimed psnr26 causal_mapping job done from its interim
+    mapping_endpoint artifact while main's own container was genuinely
+    still training -- rtx4090d has no way to check main's container
+    directly (a local docker/podman ps on rtx4090d can never see a
+    container running on main, and main has no configured `ssh` address
+    for other hosts to reach it, so container_alive alone can never close
+    this gap for a TRULY cross-host reconcile, unlike the same-host,
+    different-machine-identity case above).
+
+    The job's own progress log lives on the same NFS-shared model_path
+    storage every host already reads for the completion-artifact check --
+    a log written to within the last couple of minutes is strong,
+    already-computed (job_health always fills in log_age_s), host-agnostic
+    evidence the run is not actually over. container_running() here
+    simulates "genuinely not found on this host" (False, not None) --
+    exactly what a real remote job looks like to a local ps -- and the
+    fresh log must still be enough to withhold the done verdict."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_cross_host_active"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    (mp / "train.log").write_text("Training: 12000/30000 [20:00<10:00]")
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    monkeypatch.setattr(runner, "container_running", lambda runtime, name, **k: False)
+    # rtx4090d is a genuinely different host reconciling main's job.
+    runner.reconcile_stale_running(cfg, "rtx4090d", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
+    assert job.get("claimed_by") == "main"
+
+
+def test_reconcile_cross_host_marks_done_when_log_stale(tmp_path, monkeypatch):
+    """Contrast case: same genuinely-cross-host setup, but the log is stale
+    (no recent writes) -- the recently_active safety net must not become a
+    blanket "never mark done cross-host"; a truly finished/orphaned job
+    still gets marked done from its completion artifact, exactly as
+    before RECENT_LOG_ACTIVITY_S existed."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_cross_host_stale"
+    (mp / "comparison" / "iter_5000").mkdir(parents=True)
+    (mp / "comparison" / "iter_5000" / "report.json").write_text("{}")
+    log = mp / "train.log"
+    log.write_text("Training: 30000/30000")
+    stale = time.time() - 600  # 10 min ago, past RECENT_LOG_ACTIVITY_S
+    os.utime(log, (stale, stale))
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    monkeypatch.setattr(runner, "container_running", lambda runtime, name, **k: False)
+    runner.reconcile_stale_running(cfg, "rtx4090d", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert job["reconciled"] is True
+
+
 def test_reconcile_leaves_other_machines_job_running_when_no_artifact(tmp_path):
     """The cross-machine dead-man's-switch only ever marks a foreign job
     DONE from a real completion artifact -- it must never requeue a
