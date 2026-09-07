@@ -2640,11 +2640,16 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
                                      _health_qcfg(cfg, claimed_by_tcfg),
                                      process_alive=False,
                                      container_alive=container_alive)
-            if container_alive:
+            recently_active = _log_recently_active(h)
+            if container_alive or recently_active:
+                reason = (f"its container ({expected_container_name(job)}) "
+                          "is still running on this host" if container_alive else
+                          f"its log was written to {h.get('log_age_s'):.0f}s ago "
+                          "(cross-host: no container check possible, but a "
+                          f"fresh log is not consistent with 'done')")
                 print(f"[ablator] reconcile: {job['id']} (claimed by "
-                      f"{claimed_by!r})'s container "
-                      f"({expected_container_name(job)}) is still running "
-                      f"on this host (state={h['state']!r}) -- leaving at "
+                      f"{claimed_by!r}) has a completion artifact but "
+                      f"{reason} (state={h['state']!r}) -- leaving at "
                       "'running', not marking done", flush=True)
                 q.update(job["id"], health=h)
             elif h["state"] == "done":
@@ -2749,23 +2754,29 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
                                  _health_qcfg(cfg, _type_cfg_or_empty(cfg, job, machine)),
                                  process_alive=False,
                                  container_alive=container_alive)
-        if container_alive:
+        recently_active = _log_recently_active(h)
+        if container_alive or recently_active:
             # Authoritative "not actually orphaned" evidence, independent
             # of (and a tighter, per-job version of) the machine-wide
             # busy-guard `busy` check above -- checked unconditionally
             # here, regardless of what h["state"] came back as (which may
             # be "training"/"reporting"/"hung", not just "finishing": a
             # live container with a progressing log reads as "training",
-            # for instance). Leave it at 'running', untouched: neither
-            # marking done NOR requeuing is safe while a real container is
-            # still writing this job's output -- requeuing in particular
-            # would dispatch a second container against the same
-            # model_path while the first is still running.
-            print(f"[ablator] reconcile: {job['id']}'s container "
-                  f"({expected_container_name(job)}) is still running "
+            # for instance). recently_active is a second, independent
+            # signal (see RECENT_LOG_ACTIVITY_S) for the rare case
+            # container_alive itself can't confirm (e.g. no container
+            # runtime binary on this host for the job's type). Leave it
+            # at 'running', untouched: neither marking done NOR requeuing
+            # is safe here -- requeuing in particular would dispatch a
+            # second container against the same model_path while the
+            # first is still running.
+            reason = (f"its container ({expected_container_name(job)}) is "
+                      "still running" if container_alive else
+                      f"its log was written to {h.get('log_age_s'):.0f}s ago")
+            print(f"[ablator] reconcile: {job['id']}: {reason} "
                   f"(state={h['state']!r}) -- leaving at 'running', not "
-                  "requeuing (next idle tick re-checks once it exits)",
-                  flush=True)
+                  "requeuing (next idle tick re-checks once it's actually "
+                  "gone)", flush=True)
             q.update(job["id"], health=h)
         elif h["state"] == "done":
             print(f"[ablator] reconcile: {job['id']} has a completion artifact "
@@ -2783,6 +2794,34 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
 
 
 DEFAULT_RECONCILE_GRACE_S = 180.0
+
+# How fresh a job's own progress log has to be for reconcile to treat it as
+# unambiguous "still genuinely running" evidence, independent of
+# container_alive. container_alive can only ever see a container on THIS
+# physical host (local docker/podman ps, even when resolved against
+# claimed_by's config/runtime -- see _job_container_alive): for a job
+# claimed by a genuinely different host, it always comes back None, and the
+# artifact-only "done" check has no way to tell "the run is over" apart
+# from "the run is mid-refinement and just hasn't finished the FINAL
+# artifact yet". The job's own progress log lives on the same
+# NFS-shared storage as everything else here (model_path), so ANY host's
+# reconcile can read its mtime regardless of which host actually launched
+# it -- a log written to in the last couple of minutes is strong, cheap,
+# already-computed (health.job_health() always fills in log_age_s)
+# evidence of a live run, cross-host or not. Found live 2026-09:
+# rtx4090d's idle-tick reconcile marked a `main`-claimed job done from its
+# interim mapping_endpoint artifact while `main`'s own container was still
+# training -- rtx4090d has no way to check main's container directly (main
+# has no configured ssh address for other hosts to reach it), so
+# container_alive alone can never close this gap; this can.
+RECENT_LOG_ACTIVITY_S = 120.0
+
+
+def _log_recently_active(h: dict) -> bool:
+    """True if job_health()'s log_age_s says the run's own log was written
+    to within RECENT_LOG_ACTIVITY_S -- see that constant's docstring."""
+    age = h.get("log_age_s")
+    return age is not None and age < RECENT_LOG_ACTIVITY_S
 
 
 def _claimed_age_s(job: dict, now: float | None = None) -> float | None:
