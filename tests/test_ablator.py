@@ -2,6 +2,7 @@
 import json
 import os
 import shutil
+import socket
 import subprocess
 import threading
 import time
@@ -1022,6 +1023,89 @@ def test_job_container_alive_none_for_non_container_command(tmp_path):
     job = {"id": "j1", "type": "shellwrap", "model_path": str(tmp_path / "mp"),
           "status": "running"}
     assert runner._job_container_alive(cfg, job, "main") is None
+
+
+def test_machine_is_definitely_remote(tmp_path):
+    """The host-identity helper the cross-host reconcile branch uses to
+    decide whether a local `ps` is even meaningful: False for a machine
+    with no/wildcard hostname_patterns (indeterminate -- could be this
+    same host under another identity, see
+    test_reconcile_cross_machine_leaves_running_when_container_alive_locally),
+    True only for a machine with SPECIFIC patterns that don't match this
+    process's real hostname, False again for one whose patterns do."""
+    cfg = make_cfg(tmp_path)
+    assert runner._machine_is_definitely_remote(cfg, "main") is False
+    assert runner._machine_is_definitely_remote(cfg, "r9700") is True
+    cfg["machines"]["here"] = {"hostname_patterns": [socket.gethostname()]}
+    assert runner._machine_is_definitely_remote(cfg, "here") is False
+    assert runner._machine_is_definitely_remote(cfg, "does-not-exist") is False
+
+
+def test_reconcile_cross_host_docker_job_probed_from_remote_host_returns_unknown(
+        tmp_path, monkeypatch):
+    """Regression for the peer-reported bug: rtx4090d's cross-host reconcile
+    called container_running('podman'/'docker', ...) against a job claimed
+    by a genuinely different host (r9700, whose `[types.replay.machines.
+    r9700]` override launches under docker) and either raised
+    FileNotFoundError (no docker binary on the probing host) or, worse,
+    silently returned a wrong False (a same-named runtime IS present
+    locally but can never see the other host's daemon). Once r9700 is
+    identified as definitely remote (its hostname_patterns don't match
+    this process's real hostname), the reconcile must not attempt the
+    local ps at all -- proven here by making container_running raise if
+    it's ever called."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_remote_docker"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    (mp / "train.log").write_text("Training: 1/10")
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "r9700",
+                          "claimed_at": old_claimed_at}])
+
+    def boom(runtime, name, **k):
+        raise AssertionError(
+            f"container_running({runtime!r}, ...) must not be called for "
+            "a machine positively identified as a different physical host")
+    monkeypatch.setattr(runner, "container_running", boom)
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
+    assert job.get("claimed_by") == "r9700"
+
+
+def test_reconcile_cross_host_real_check_when_claimed_by_matches_local_host(
+        tmp_path, monkeypatch):
+    """Counterpart to the above: a machine whose hostname_patterns DO match
+    this process's actual hostname is genuinely local, so the cross-host
+    reconcile branch must still perform a real container_running() probe
+    for it rather than skipping straight to None -- same-host, container
+    genuinely alive, must be treated as authoritative 'still running'
+    evidence."""
+    cfg = make_cfg(tmp_path)
+    cfg["machines"]["here"] = {"hostname_patterns": [socket.gethostname()]}
+    mp = tmp_path / "run_local_alive"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "here",
+                          "claimed_at": old_claimed_at}])
+    seen = []
+
+    def fake_container_running(runtime, name, **k):
+        seen.append((runtime, name))
+        return True
+    monkeypatch.setattr(runner, "container_running", fake_container_running)
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    assert seen == [("podman", "splat_train_j1")]  # [types.replay].command[0]
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
 
 
 def test_reconcile_requeues_when_no_artifact_and_no_process(tmp_path):
