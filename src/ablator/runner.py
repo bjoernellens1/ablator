@@ -2284,8 +2284,19 @@ def run_job(cfg: dict, job: dict, machine: str,
             # consulted here, so a manual kill can never read as "done".
             status = override
         elif exit_code == 0 and _require_result_artifact(cfg, tcfg):
+            # container_alive belt-and-suspenders: exit_code==0 already
+            # means proc.poll() saw the local client exit, which normally
+            # implies the container is gone too -- but see kill_job()'s own
+            # docstring for why a client process exiting and its container
+            # actually being gone are NOT the same guarantee in every
+            # podman/docker version/config (a SIGKILL to the client is
+            # uncatchable and can't be proxied, orphaning the container).
+            # Checking here costs one `ps` call only on the already-rare
+            # "job finished" path, and can only ever downgrade an
+            # otherwise-"done" verdict, never upgrade one.
             h = healthmod.job_health(job, cwd or os.getcwd(), _health_qcfg(cfg, tcfg),
-                                     process_alive=False)
+                                     process_alive=False,
+                                     container_alive=_job_container_alive(cfg, job, machine))
             if h["state"] != "done":
                 print(f"[ablator] {job['id']} exited 0 but no completion "
                       f"artifact found (result_glob unmatched, state="
@@ -2605,10 +2616,38 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
             if age_s is not None and age_s < grace_s:
                 continue
             base_dir = _job_base_dir(cfg, job, claimed_by or machine)
+            # container_alive: a local docker/podman ps IS meaningful here
+            # even though claimed_by != machine, when this reconcile call
+            # is itself running on the SAME physical host under a
+            # different machine identity -- e.g. a bare-metal runner also
+            # acting as the k8s dispatcher for several `[machines.a100...]`
+            # pseudo-names (see run_loop's startup reconcile loop over
+            # k8s_machines): claimed_by="main" and machine="a100cluster_x"
+            # can both be true of a process physically running on "main",
+            # where `docker/podman ps` for main's own splat_train_<id>
+            # absolutely does find it. Resolving the type config against
+            # claimed_by (not machine) also fixes a latent bug: the type's
+            # per-machine command override (podman vs docker, etc.) must
+            # match the machine that actually launched the job, not the
+            # identity currently doing the reconciling. When claimed_by
+            # really is a different host, container_running()'s local ps
+            # simply finds nothing (False/None) and behavior is unchanged
+            # from before this check existed -- this can only ever add
+            # protection, never remove it.
+            claimed_by_tcfg = _type_cfg_or_empty(cfg, job, claimed_by or machine)
+            container_alive = _job_container_alive(cfg, job, claimed_by or machine)
             h = healthmod.job_health(job, base_dir,
-                                     _health_qcfg(cfg, _type_cfg_or_empty(cfg, job, machine)),
-                                     process_alive=False)
-            if h["state"] == "done":
+                                     _health_qcfg(cfg, claimed_by_tcfg),
+                                     process_alive=False,
+                                     container_alive=container_alive)
+            if container_alive:
+                print(f"[ablator] reconcile: {job['id']} (claimed by "
+                      f"{claimed_by!r})'s container "
+                      f"({expected_container_name(job)}) is still running "
+                      f"on this host (state={h['state']!r}) -- leaving at "
+                      "'running', not marking done", flush=True)
+                q.update(job["id"], health=h)
+            elif h["state"] == "done":
                 print(f"[ablator] reconcile: {job['id']} (claimed by "
                       f"{claimed_by!r}) has a completion artifact but is "
                       "stuck at 'running' -- that machine's own runner may "

@@ -1146,6 +1146,38 @@ def test_reconcile_marks_other_machines_job_done_when_artifact_present(tmp_path)
     assert job.get("claimed_by") == "main"  # untouched -- provenance preserved
 
 
+def test_reconcile_cross_machine_leaves_running_when_container_alive_locally(
+        tmp_path, monkeypatch):
+    """Regression: `reconcile_stale_running(cfg, "a100cluster", q, ...)` runs
+    on the SAME physical host as `claimed_by="main"` when that host is also
+    acting as the k8s dispatcher for a `[machines.a100cluster]` pseudo-name
+    (see run_loop's startup loop over k8s_machines) -- claimed_by != the
+    reconcile call's own `machine` parameter does NOT mean a different
+    physical host in that case, so a local docker/podman ps genuinely can
+    (and must) see the job's real container. Found live 2026-09: a psnr26
+    causal_mapping job's interim mapping_endpoint artifact was read as done
+    by exactly this cross-machine path -- with its container still up --
+    because that branch never checked container liveness at all."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_still_finishing_foreign"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    monkeypatch.setattr(runner, "container_running",
+                        lambda runtime, name, **k: name == "splat_train_j1")
+    # reconcile called under a DIFFERENT machine identity than claimed_by,
+    # simulating "main" also acting as the a100cluster k8s dispatcher.
+    runner.reconcile_stale_running(cfg, "a100cluster", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
+    assert job.get("claimed_by") == "main"
+
+
 def test_reconcile_leaves_other_machines_job_running_when_no_artifact(tmp_path):
     """The cross-machine dead-man's-switch only ever marks a foreign job
     DONE from a real completion artifact -- it must never requeue a
@@ -1276,6 +1308,37 @@ def test_exit_zero_with_artifact_is_done_when_required(tmp_path, monkeypatch):
     monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
     runner.run_loop(cfg, once=True)
     assert read_queue(q.path)[0]["status"] == "done"
+
+
+def test_exit_zero_but_container_still_alive_is_not_done(tmp_path, monkeypatch):
+    """Belt-and-suspenders: exit_code==0 (the launching client process
+    exited) is normally sufficient evidence the container is gone too, but
+    see kill_job()'s own docstring for why that's not an absolute guarantee
+    in every podman/docker version/config (a SIGKILL to the client is
+    uncatchable and can't be proxied to the container, orphaning it). If a
+    container matching this job's name is somehow still reported alive
+    despite the client exiting 0, it must not be marked done."""
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    mp = tmp_path / "run_client_exited_container_alive"
+    (mp / "comparison" / "iter_1000").mkdir(parents=True)
+    (mp / "comparison" / "iter_1000" / "report.json").write_text("{}")
+    cfg["types"]["replay"] = {"cwd": str(tmp_path),
+                              "command": ["podman", "run", "img", "true"],
+                              "require_result_artifact": True}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "machine": "any", "type": "replay",
+                          "scene": "/s", "model_path": str(mp),
+                          "status": "pending"}])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    monkeypatch.setattr(runner, "container_running",
+                        lambda runtime, name, **k: name == "splat_train_j1")
+    runner.run_loop(cfg, once=True)
+    # not "done": container_alive=True downgraded the verdict to
+    # "finishing", which the exit_code==0 completion check treats as
+    # "not done yet" -> failed -> retry -> quarantine (never a silent done).
+    assert read_queue(q.path)[0]["status"] != "done"
 
 
 def test_require_result_artifact_off_by_default(tmp_path, monkeypatch):
