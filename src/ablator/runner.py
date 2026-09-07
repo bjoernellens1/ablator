@@ -351,6 +351,13 @@ def _sanitize_container_name(raw: str) -> str:
     return out if out and (out[0].isalnum()) else f"j_{out}"
 
 
+def expected_container_name(job: dict) -> str:
+    """The `--name` _ensure_container_name() injects for `job`, i.e. the
+    name to look for with `docker/podman ps` when checking whether this
+    job's own container is still up (see container_running())."""
+    return f"splat_train_{_sanitize_container_name(str(job.get('id', 'job')))}"
+
+
 def _ensure_container_name(argv: list[str], job: dict) -> list[str]:
     """Inject `--name splat_train_<job_id>` into a rendered docker/podman
     `run` command if the template didn't already set one.
@@ -377,7 +384,7 @@ def _ensure_container_name(argv: list[str], job: dict) -> list[str]:
         return argv
     if container_name_from_argv(argv) is not None:
         return argv  # template already set an explicit name -- respect it
-    name = f"splat_train_{_sanitize_container_name(str(job.get('id', 'job')))}"
+    name = expected_container_name(job)
     run_idx = argv.index("run")
     return argv[: run_idx + 1] + ["--name", name] + argv[run_idx + 1 :]
 
@@ -541,6 +548,32 @@ _CONTAINER_RUNTIMES = ("podman", "docker")
 
 def _is_container_runtime(value: object) -> bool:
     return os.path.basename(str(value)) in _CONTAINER_RUNTIMES
+
+
+def container_running(runtime: str, name: str,
+                      run=subprocess.run) -> bool | None:
+    """Is a container named `name` currently up under `runtime`
+    ("docker"/"podman")?
+
+    One `ps` call, server-side filtered to an exact name match, so this
+    stays cheap enough to call once per job per health-check tick (see
+    _job_container_alive(), the only caller). Returns None -- not False --
+    if the runtime binary itself can't be invoked or errors out; callers
+    (health.job_health's container_alive param) must treat None as
+    "unknown", never as "not running", exactly like process_alive=None.
+    """
+    try:
+        proc = run([runtime, "ps", "--filter", f"name=^{name}$",
+                   "--format", "{{.Names}}"],
+                  capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"[ablator] container_running({runtime!r}, {name!r}): {e!r} "
+              "-- treating as unknown", flush=True)
+        return None
+    if proc.returncode != 0:
+        return None
+    names = {n for n in proc.stdout.splitlines() if n.strip()}
+    return name in names
 
 
 def container_name_from_argv(argv: list[str]) -> str | None:
@@ -2366,6 +2399,45 @@ def _type_cfg_or_empty(cfg: dict, job: dict, machine: str) -> dict:
         return {}
 
 
+def _job_container_alive(cfg: dict, job: dict, machine: str) -> bool | None:
+    """container_running() for `job`'s own container, using the SAME
+    runtime and name the job was actually launched with -- rendered from
+    the job's own command template (render_command()), not a separate
+    config field.
+
+    `[types.<t>] image_probe_runtime` (type_capable()'s field) is NOT a
+    reliable stand-in for this: it is only set on some machines/types in
+    practice (e.g. splatograph.toml sets it just under
+    `[types.bag.machines.r9700]`) while a type's actual `command` may run
+    podman on one machine and docker on another (see `[types.replay]` /
+    `[types.replay.machines.r9700]` in that same example config) --
+    defaulting to "docker" for a type whose command runs podman would
+    silently query the wrong daemon, see nothing, and report the
+    container as exited when it is not. render_command() already resolves
+    the correct runtime (argv[0], via the type's per-machine `command`
+    override) and the correct container name (`_ensure_container_name`'s
+    `--name`, or an explicit one the template set) in one place -- reuse
+    both here instead of re-deriving them.
+
+    Returns None (unknown) for any type whose command isn't a
+    docker/podman `run` invocation at all (e.g. a bash-wrapper type) or
+    that fails to render -- a bash-wrapper type has no
+    `splat_train_<job_id>` container to find, and False in that case would
+    be wrong, not just uninformative.
+    """
+    tcfg = _type_cfg_or_empty(cfg, job, machine)
+    if not tcfg:
+        return None
+    try:
+        argv, _env, _cwd = render_command(tcfg, job, machine)
+    except TemplateError:
+        return None
+    if not argv or not _is_container_runtime(argv[0]):
+        return None
+    name = container_name_from_argv(argv) or expected_container_name(job)
+    return container_running(os.path.basename(argv[0]), name)
+
+
 def _require_result_artifact(cfg: dict, tcfg: dict) -> bool:
     """Per-type (falls back to [queue]) toggle: an exit code of 0 is not
     sufficient for 'done' — a result_glob artifact must also exist.
@@ -2621,10 +2693,42 @@ def reconcile_stale_running(cfg: dict, machine: str, q: Queue,
                       "cluster — treating as crashed", flush=True)
 
         base_dir = _job_base_dir(cfg, job, machine)
+        # Own-machine reconcile: `machine` is the host this daemon process
+        # is actually running on, so a local docker/podman ps genuinely can
+        # see this job's container if one is up -- unlike the cross-machine
+        # dead-man's-switch branch above, where claimed_by may be a
+        # different host entirely and a local ps would be meaningless (and
+        # a False there would be actively wrong, not just uninformative).
+        # See health.job_health()'s container_alive docstring for why this
+        # matters: a multi-phase trainer's interim result_glob match must
+        # not read as "done" while its container is still writing the final
+        # one (this exact scenario: psnr26 causal_mapping jobs marked done
+        # -- and duplicate-dispatched -- minutes before their container
+        # actually exited, found live 2026-09).
+        container_alive = _job_container_alive(cfg, job, machine)
         h = healthmod.job_health(job, base_dir,
                                  _health_qcfg(cfg, _type_cfg_or_empty(cfg, job, machine)),
-                                 process_alive=False)
-        if h["state"] == "done":
+                                 process_alive=False,
+                                 container_alive=container_alive)
+        if container_alive:
+            # Authoritative "not actually orphaned" evidence, independent
+            # of (and a tighter, per-job version of) the machine-wide
+            # busy-guard `busy` check above -- checked unconditionally
+            # here, regardless of what h["state"] came back as (which may
+            # be "training"/"reporting"/"hung", not just "finishing": a
+            # live container with a progressing log reads as "training",
+            # for instance). Leave it at 'running', untouched: neither
+            # marking done NOR requeuing is safe while a real container is
+            # still writing this job's output -- requeuing in particular
+            # would dispatch a second container against the same
+            # model_path while the first is still running.
+            print(f"[ablator] reconcile: {job['id']}'s container "
+                  f"({expected_container_name(job)}) is still running "
+                  f"(state={h['state']!r}) -- leaving at 'running', not "
+                  "requeuing (next idle tick re-checks once it exits)",
+                  flush=True)
+            q.update(job["id"], health=h)
+        elif h["state"] == "done":
             print(f"[ablator] reconcile: {job['id']} has a completion artifact "
                   f"but was stuck at 'running' (orphaned by a runner "
                   f"restart/crash) — marking done", flush=True)

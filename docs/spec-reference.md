@@ -33,11 +33,13 @@ the resulting jobs to the shared queue (refusing duplicate job ids).
 | `arms` | array of objects | required | The variants to expand. |
 | `parallel` | bool | `true` | `false` chains arms sequentially via `depends_on` (see below). |
 | `lane` | int (1, 2 or 3) | `2` | Spec-level default lane, overridable per arm. |
+| `result_glob` | string | unset | Spec-wide default completion-artifact glob, overridable per `base`/arm (arm > base > spec precedence). See the arm-field table below. |
 
 ## `base` fields
 
 `base` may set any of: `type`, `scene`, `iterations`, `machine`,
-`base_args`, `lane`. Every one of these is overridable per arm.
+`base_args`, `lane`, `result_glob`. Every one of these is overridable per
+arm.
 
 ## Arm fields
 
@@ -51,6 +53,7 @@ the resulting jobs to the shared queue (refusing duplicate job ids).
 | `extra_args` | string | `""` | Appended after `base_args`+arm's own `base_args` (see below). |
 | `base_args` | string | `base.base_args` or `""` | Arm-level override of the base args string. |
 | `lane` | int (1, 2 or 3) | spec/base `lane` or `2` | Queue lane (see [queue semantics](queue-semantics.md)). `plan` raises `SystemExit` if not 1/2/3. |
+| `result_glob` | string | arm > `base.result_glob` > spec-level `result_glob` (all optional) | Per-job override of the completion-artifact glob, stamped onto the expanded job as `job["result_glob"]`. Nearest declaration wins, same precedence as the Git target (see below). Not set on the job at all if none of arm/base/spec declare it, so `health.job_health()` falls through to the type's own `result_glob` and then `[queue] result_glob` (see [health.md](health.md)). Needed for multi-phase trainers whose FINAL artifact differs from a type's usual one — e.g. splatograph's `causal_mapping` trainer with `--streaming_post_mapping_refinement_steps N > 0` writes an interim `comparison/mapping_endpoint/report.json` minutes before its final `comparison/iter_<N>/report.json`; pin such arms to `"result_glob": "comparison/iter_*/report.json"` so they aren't read as done at the interim artifact. |
 
 `extra_args` fed to the command template is
 `" ".join([effective base_args, arm's own extra_args])`, both

@@ -6,14 +6,32 @@ and never injects anything into a run. The runner reads health and acts;
 a job started by hand behaves identically and needs no runner at all.
 
 Health dict:
-  {"state": "starting"|"training"|"reporting"|"done"|"hung"|"crashed",
+  {"state": "starting"|"training"|"reporting"|"finishing"|"done"|"hung"|"crashed",
    "iter": int|None, "total": int|None, "log_age_s": float|None}
 
-Configurable under [queue]:
+"finishing" means a result_glob/complete_marker/researchflow completion
+artifact matched, but the caller-supplied `container_alive` says the job's
+own container is still running -- see job_health()'s container_alive
+param docstring. It is never "done" until the container has exited (or no
+container runtime is available to check).
+
+Configurable under [queue] (or per-type, or per-job -- see below):
   progress_log, progress_regex, progress_cap_regex   (as in progress.py)
   result_glob        success marker glob relative to model_path resolution
   hung_after_min     minutes without log writes before "hung" (default 20)
   crash_markers      list of substrings meaning "crashed"
+
+`result_glob` resolution order is per-job `job["result_glob"]` (settable
+directly on a queue job, or via a spec's `result_glob` at the base/arm/spec
+level -- see ablator.spec.expand_spec) > the type's own `result_glob`
+(layered into qcfg by runner._health_qcfg) > `[queue] result_glob` >
+DEFAULT_RESULT_GLOB. This matters for multi-phase trainers whose final
+artifact differs from their queue-wide default (e.g. splatograph's
+causal_mapping trainer with `--streaming_post_mapping_refinement_steps N
+> 0` writes an interim `comparison/mapping_endpoint/report.json` long
+before its final `comparison/iter_<N>/report.json`; a job pinned to the
+latter via `"result_glob": "comparison/iter_*/report.json"` is not
+misread as done at the interim artifact).
 
 `type: "researchflow"` external jobs (see docs/external-scheduler.md) have no
 model_path and are never covered by the config keys above; see
@@ -171,19 +189,52 @@ def hung_after_s(qcfg: dict, job: dict | None = None) -> float:
 
 def job_health(job: dict, base_dir: str, qcfg: dict | None = None,
                process_alive: bool | None = None,
-               now: float | None = None) -> dict:
+               now: float | None = None,
+               container_alive: bool | None = None) -> dict:
     """Derive run health purely from the run's own artifacts.
 
     process_alive: caller-supplied liveness of the launching subprocess /
     container (None = unknown). A dead process without a success marker
     means the run died before finishing.
+
+    container_alive: caller-supplied liveness of the job's own container
+    (e.g. `docker/podman ps` for `splat_train_<job_id>`), independent of
+    `process_alive` -- needed for callers (the daemon's stale-running
+    reconciler in particular) that have no live subprocess handle at all
+    because they are re-observing a job after a runner restart, yet a
+    real container may still be executing it. None = unknown/unchecked
+    (e.g. no container runtime available), in which case this behaves
+    exactly as if it had never been passed.
+
+    True is authoritative evidence the run has NOT finished yet, no
+    matter what result_glob/complete_marker/researchflow marker say: a
+    multi-phase trainer (e.g. splatograph's causal_mapping with
+    `--streaming_post_mapping_refinement_steps N > 0`) writes its first
+    `comparison/mapping_endpoint/report.json` minutes before its final
+    `comparison/iter_<N>/report.json`, so a result_glob/complete_marker
+    match alone is not sufficient evidence of completion while the
+    container that would go on to write the final artifact is still
+    up -- confirmed live 2026-09 on psnr26 causal_mapping jobs marked
+    "done" (and re-dispatched by a second host) minutes before their
+    container actually exited. When container_alive is True, it also
+    supersedes `process_alive is False` in the crash heuristics below --
+    the caller passing process_alive=False here only ever means "I have
+    no live subprocess handle", not "the run is dead", and a live
+    container is strictly better evidence than the absence of one.
     """
     qcfg = qcfg or {}
     now = time.time() if now is None else now
+    # Effective process liveness for the crash heuristics below: a live
+    # container is authoritative "not dead" evidence and overrides a
+    # caller-supplied process_alive=False that only reflects "no local
+    # subprocess handle" (see container_alive docstring above).
+    effective_alive = True if container_alive else process_alive
     mp = resolve_model_path(job.get("model_path", ""), base_dir)
     log = os.path.join(mp, qcfg.get("progress_log", progmod.DEFAULT_LOG))
     markers = qcfg.get("crash_markers", DEFAULT_CRASH_MARKERS)
-    result_glob = qcfg.get("result_glob", DEFAULT_RESULT_GLOB)
+    # Per-job override > [queue]/type-merged qcfg (see runner._health_qcfg
+    # for the type-level layering) > default.
+    result_glob = job.get("result_glob", qcfg.get("result_glob", DEFAULT_RESULT_GLOB))
     # cli.py's `collect` documents (and configs in the wild use)
     # "{model_path}/comparison/*/report.json" — a template resolved via
     # str.format() against job vars, relative to the type's cwd. This
@@ -228,11 +279,20 @@ def job_health(job: dict, base_dir: str, qcfg: dict | None = None,
         # this job type, it is the ONLY signal that can ever fire.
         h["state"] = "done"
 
+    if h["state"] == "done" and container_alive:
+        # Artifact-based completion evidence exists, but the job's own
+        # container is still running -- see the container_alive param
+        # docstring above. Downgrade off "done" here (before the early
+        # returns below can lock it in) so the log tail is still
+        # consulted for a more specific state (training/reporting/hung);
+        # "finishing" is the fallback when the log gives no better signal.
+        h["state"] = "finishing"
+
     try:
         h["log_age_s"] = round(now - os.path.getmtime(log), 1)
     except OSError:
         # No log yet: either just starting, or died before writing it.
-        if h["state"] != "done" and process_alive is False:
+        if h["state"] not in ("done", "finishing") and effective_alive is False:
             h["state"] = "crashed"
         return h
 
@@ -244,7 +304,7 @@ def job_health(job: dict, base_dir: str, qcfg: dict | None = None,
     if h["state"] == "done":
         return h
 
-    if any(m in tail for m in markers) or process_alive is False:
+    if any(m in tail for m in markers) or effective_alive is False:
         h["state"] = "crashed"
     elif h["log_age_s"] > hung_after_s(qcfg, job):
         h["state"] = "hung"

@@ -100,7 +100,8 @@ cwd = "/path/to/repo"
 command = ["podman", "run", "...", "{scene}", "-m", "{model_path}",
            "--iterations", "{iterations}", "{extra_args}"]
 env = { SCENE_SOURCE = "{scene}" }
-result_glob = "..."               # per-type override for `collect`
+result_glob = "..."               # per-type override for `collect` AND health
+                                   # verdicts (see below)
 
 [types.<type>.machines.<name>]    # shallow per-machine override
 command = ["docker", "run", "..."]        # replaces base command
