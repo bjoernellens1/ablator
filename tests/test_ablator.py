@@ -127,6 +127,38 @@ def test_arm_scene_and_base_args_override():
     assert jobs[1]["scene"] == spec["base"]["scene"]
 
 
+def test_result_glob_precedence_arm_beats_base_beats_spec():
+    """Per-arm/base/spec result_glob (nearest wins) is stamped onto the
+    expanded job as job["result_glob"] -- needed for multi-phase trainers
+    whose final artifact differs from the type's usual one (e.g.
+    causal_mapping with post-mapping refinement, see docs/health.md)."""
+    spec = make_spec(arms=[
+        {"id": "x", "result_glob": "comparison/iter_*/report.json"},
+        {"id": "y"},  # falls back to base
+    ])
+    spec["base"]["result_glob"] = "comparison/mapping_endpoint/report.json"
+    spec["result_glob"] = "comparison/*/report.json"  # spec-wide fallback
+    jobs = specmod.expand_spec(spec)
+    assert jobs[0]["result_glob"] == "comparison/iter_*/report.json"  # arm wins
+    assert jobs[1]["result_glob"] == "comparison/mapping_endpoint/report.json"  # base
+
+
+def test_result_glob_falls_back_to_spec_level_when_unset_elsewhere():
+    spec = make_spec(arms=[{"id": "z"}])
+    spec["result_glob"] = "comparison/*/report.json"
+    jobs = specmod.expand_spec(spec)
+    assert jobs[0]["result_glob"] == "comparison/*/report.json"
+
+
+def test_result_glob_absent_when_never_declared():
+    """No scope declares result_glob -- must not be set on the job at all,
+    so health.job_health() falls through to the type's own result_glob and
+    then [queue] result_glob rather than being locked to some forced
+    per-job default."""
+    jobs = specmod.expand_spec(make_spec())
+    assert "result_glob" not in jobs[0]
+
+
 def test_expand_refuses_duplicate_arm_ids():
     spec = make_spec(arms=[{"id": "x"}, {"id": "x"}])
     with pytest.raises(SystemExit, match="duplicate arm id"):
@@ -839,6 +871,157 @@ def test_reconcile_marks_done_when_completion_artifact_present(tmp_path):
     job = read_queue(q.path)[0]
     assert job["status"] == "done"
     assert job["reconciled"] is True
+
+
+def test_reconcile_leaves_running_when_container_still_alive(tmp_path, monkeypatch):
+    """Regression: a multi-phase trainer (splatograph's causal_mapping with
+    `--streaming_post_mapping_refinement_steps N > 0`) writes an interim
+    comparison/mapping_endpoint/report.json minutes before its final
+    comparison/iter_<N>/report.json. Before this fix, reconcile_stale_running
+    marked such a job done -- and it was then re-dispatched by a second
+    idle poll/host -- the instant the interim artifact appeared, even
+    though the job's own container (checked here via a faked
+    docker/podman ps) was still up. It must instead leave the job at
+    'running', untouched -- not done, and not requeued to pending either."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_still_finishing"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    monkeypatch.setattr(runner, "container_running",
+                        lambda runtime, name, **k: name == "splat_train_j1")
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
+    assert job.get("claimed_by") == "main"
+    assert job["health"]["state"] == "finishing"
+
+
+def test_reconcile_leaves_running_when_container_alive_and_log_progressing(
+        tmp_path, monkeypatch):
+    """Same scenario as test_reconcile_leaves_running_when_container_still_alive,
+    but with a real, actively-progressing train.log present (the normal
+    case for a genuinely still-running job -- job_health() then reports
+    "training", not "finishing", since the log gives a more specific
+    signal). The reconciler must key off container liveness directly, not
+    off health state string equality to "finishing": branching on the
+    string alone would send a "training"-state live job to the requeue
+    branch below and re-dispatch a duplicate against the same
+    model_path -- the exact failure this fix targets."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_progressing"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    (mp / "train.log").write_text("Training: 45000/98000 [30:00<40:00]")
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    monkeypatch.setattr(runner, "container_running",
+                        lambda runtime, name, **k: name == "splat_train_j1")
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "running"
+    assert job.get("claimed_by") == "main"
+    assert job["health"]["state"] == "training"
+
+
+def test_reconcile_marks_done_when_container_has_exited(tmp_path, monkeypatch):
+    """Same interim-artifact scenario as
+    test_reconcile_leaves_running_when_container_still_alive, but the
+    container has genuinely exited (faked docker/podman ps reports it
+    gone) -- must still mark done, exactly like the no-container-check
+    path did before this fix."""
+    cfg = make_cfg(tmp_path)
+    mp = tmp_path / "run_container_exited"
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    q = Queue(cfg["queue"]["path"])
+    old_claimed_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 3600))
+    write_queue(q.path, [{"id": "j1", "type": "replay", "model_path": str(mp),
+                          "status": "running", "claimed_by": "main",
+                          "claimed_at": old_claimed_at}])
+    monkeypatch.setattr(runner, "container_running", lambda runtime, name, **k: False)
+    runner.reconcile_stale_running(cfg, "main", q, busy=False)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert job["reconciled"] is True
+
+
+def test_container_running_parses_ps_output(monkeypatch):
+    """Unit-level: container_running() greps a faked `ps` subprocess result
+    for an exact name match, and treats a failed/erroring invocation as
+    unknown (None), never as a false 'not running'."""
+    calls = []
+
+    class FakeResult:
+        def __init__(self, out, rc=0):
+            self.stdout = out
+            self.returncode = rc
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        assert argv[:2] == ["docker", "ps"]
+        return FakeResult("splat_train_other\nsplat_train_j1\n")
+
+    assert runner.container_running("docker", "splat_train_j1", run=fake_run) is True
+    assert runner.container_running("docker", "splat_train_missing",
+                                    run=fake_run) is False
+    assert calls  # the filter/format flags were passed through, not hand-parsed
+
+    def fake_run_missing_binary(argv, **kwargs):
+        raise FileNotFoundError("no such file: docker")
+
+    assert runner.container_running("docker", "splat_train_j1",
+                                    run=fake_run_missing_binary) is None
+
+
+def test_job_container_alive_uses_the_jobs_own_rendered_runtime(tmp_path, monkeypatch):
+    """_job_container_alive() must probe the SAME runtime the job actually
+    launched under (podman on 'main' per make_cfg's [types.replay]
+    command, docker on 'r9700' per its per-machine override) -- not a
+    separate, often-unset `image_probe_runtime` field defaulting to
+    "docker". Defaulting to docker for a podman job would silently query
+    the wrong daemon, see no container, and report it as exited when the
+    real podman container is still up -- exactly the false-done failure
+    mode this whole feature exists to close."""
+    cfg = make_cfg(tmp_path)
+    q = Queue(cfg["queue"]["path"])
+    job = {"id": "j1", "type": "replay", "model_path": str(tmp_path / "mp"),
+          "status": "running"}
+
+    seen = []
+
+    def fake_container_running(runtime, name, **k):
+        seen.append((runtime, name))
+        return True
+
+    monkeypatch.setattr(runner, "container_running", fake_container_running)
+    assert runner._job_container_alive(cfg, job, "main") is True
+    assert seen == [("podman", "splat_train_j1")]  # [types.replay].command[0]
+
+    seen.clear()
+    assert runner._job_container_alive(cfg, job, "r9700") is True
+    assert seen == [("docker", "splat_train_j1")]  # r9700's command override
+
+
+def test_job_container_alive_none_for_non_container_command(tmp_path):
+    """A type whose command isn't docker/podman `run` (e.g. a bash-wrapper
+    type) has no `splat_train_<id>` container to find -- must return None
+    (unknown), never False (which the reconciler would read as "exited")."""
+    cfg = make_cfg(tmp_path)
+    cfg["types"]["shellwrap"] = {"cwd": "/repo", "command": ["bash", "run.sh"]}
+    job = {"id": "j1", "type": "shellwrap", "model_path": str(tmp_path / "mp"),
+          "status": "running"}
+    assert runner._job_container_alive(cfg, job, "main") is None
 
 
 def test_reconcile_requeues_when_no_artifact_and_no_process(tmp_path):

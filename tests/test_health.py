@@ -92,6 +92,63 @@ def test_done_with_model_path_prefixed_result_glob(tmp_path):
     assert health.job_health(job, str(tmp_path), qcfg)["state"] == "done"
 
 
+def test_job_level_result_glob_overrides_qcfg_result_glob(tmp_path):
+    """Per-job `result_glob` (settable directly, or via a spec's
+    base/arm/spec-level result_glob -- see spec.expand_spec) takes
+    precedence over qcfg's (queue- or type-merged) result_glob. Needed for
+    multi-phase trainers whose final artifact differs from the queue-wide
+    default (e.g. splatograph's causal_mapping trainer with
+    `--streaming_post_mapping_refinement_steps N > 0`, which writes an
+    interim comparison/mapping_endpoint/report.json long before its final
+    comparison/iter_<N>/report.json)."""
+    mp = tmp_path / "run"
+    mp.mkdir()
+    (mp / "comparison" / "mapping_endpoint").mkdir(parents=True)
+    (mp / "comparison" / "mapping_endpoint" / "report.json").write_text("{}")
+    job = {"id": "j1", "model_path": str(mp), "extra_args": "",
+          "result_glob": "comparison/iter_*/report.json"}
+    qcfg = {"result_glob": "comparison/*/report.json"}
+    # qcfg's glob alone would match the interim artifact -- but the job's
+    # own override only matches the final one, which doesn't exist yet.
+    assert health.job_health(job, str(tmp_path), qcfg)["state"] != "done"
+    # once the final artifact lands, the job-level glob is satisfied
+    (mp / "comparison" / "iter_5000").mkdir(parents=True)
+    (mp / "comparison" / "iter_5000" / "report.json").write_text("{}")
+    assert health.job_health(job, str(tmp_path), qcfg)["state"] == "done"
+
+
+def test_container_alive_prevents_false_done(tmp_path):
+    """Regression: a multi-phase trainer's interim result_glob match must
+    not read as 'done' while the caller reports the job's own container as
+    still running -- found live 2026-09 on psnr26 causal_mapping jobs
+    marked done (and duplicate-dispatched by a second host) minutes before
+    their container actually exited. `container_alive=True` downgrades an
+    otherwise-'done' verdict; `container_alive=False`/None (unknown, e.g.
+    no container runtime) leaves 'done' as the final word."""
+    job = make_run(tmp_path, "Training: 5000/30000", report=True)
+    # container genuinely still running -> not done, regardless of the glob
+    h = health.job_health(job, str(tmp_path), container_alive=True)
+    assert h["state"] != "done"
+    assert h["state"] == "training"  # log still has live progress to report
+    # container has exited -> done, as before
+    h = health.job_health(job, str(tmp_path), container_alive=False)
+    assert h["state"] == "done"
+    # unknown (no container runtime available) -> behaves as if unset, done
+    h = health.job_health(job, str(tmp_path), container_alive=None)
+    assert h["state"] == "done"
+
+
+def test_container_alive_true_does_not_get_masked_as_crashed(tmp_path):
+    """A caller with no live subprocess handle (process_alive=False, e.g.
+    the daemon's reconcile path after a restart) but genuine
+    container_alive=True evidence must not have that container evidence
+    overridden back to 'crashed' by the process_alive=False heuristic."""
+    job = make_run(tmp_path, "Training: 5000/30000", report=True)
+    h = health.job_health(job, str(tmp_path), process_alive=False,
+                          container_alive=True)
+    assert h["state"] not in ("done", "crashed")
+
+
 def test_done_via_complete_marker_without_report_glob(tmp_path):
     """A trainer/run type that completes cleanly without ever producing a
     `comparison/*/report.json` (e.g. the causal_mapping trainer with no

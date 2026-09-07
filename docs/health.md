@@ -13,7 +13,7 @@ Derived purely from a running job's own artifacts (progress log,
 result-file glob, and caller-supplied process liveness):
 
 ```json
-{"state": "starting"|"training"|"reporting"|"done"|"hung"|"crashed",
+{"state": "starting"|"training"|"reporting"|"finishing"|"done"|"hung"|"crashed",
  "iter": 1234, "total": 30000, "log_age_s": 12.4}
 ```
 
@@ -22,13 +22,59 @@ result-file glob, and caller-supplied process liveness):
 | `starting` | No log written yet (or nothing parseable). |
 | `training` | Log is progressing; an iteration counter was parsed. |
 | `reporting` | Iteration counter reached its total — post-training report phase. |
-| `done` | The configured `result_glob` matched a file under the job's `model_path`, OR the `complete_marker` file (default `.COMPLETE`) exists there. |
+| `finishing` | A `result_glob`/`complete_marker`/researchflow completion artifact matched, but the caller reported (via `container_alive=True`) that the job's own container is still running — see below. Never `done` while this holds. |
+| `done` | The configured `result_glob` matched a file under the job's `model_path`, OR the `complete_marker` file (default `.COMPLETE`) exists there — AND the job's container, if checked, is no longer running. |
 | `hung` | Log hasn't been written to in longer than `hung_after_min` (default 20, per-job or `[queue]`-level override). |
 | `crashed` | A crash marker (`Traceback...`, `CUDA error`, `HIP error`, `std::exception`, `Segmentation fault`, `core dumped`, or config-overridden via `[queue] crash_markers`) appeared in the log tail, or the caller reported the process/container as no longer alive with no success marker present. |
 
 Relevant `[queue]` config knobs: `progress_log`, `progress_regex`,
 `progress_cap_regex` (see `ablator.progress`), `result_glob`,
 `complete_marker`, `hung_after_min`, `crash_markers`.
+
+### `result_glob` resolution order
+
+Per-job `job["result_glob"]` (settable directly on a queue job, or via a
+spec's `result_glob` at the arm/base/spec level — see
+[spec-reference.md](spec-reference.md), arm > base > spec precedence) >
+the job type's own `result_glob` (`[types.<type>] result_glob`, layered
+into the merged qcfg by `runner._health_qcfg`) > `[queue] result_glob` >
+the module default (`comparison/*/report.json`).
+
+This matters for multi-phase trainers whose FINAL artifact differs from
+what the rest of that job type normally produces. Splatograph's
+`causal_mapping` trainer run with `--streaming_post_mapping_refinement_steps
+N > 0` writes an interim `comparison/mapping_endpoint/report.json` minutes
+before its final `comparison/iter_<N>/report.json` — a job (or spec arm)
+that needs to be graded on the final refined result, not the interim
+mapping-only one, sets `"result_glob": "comparison/iter_*/report.json"`
+on itself without having to change the type's or queue's default for
+every other job of that type.
+
+### `container_alive` and the `finishing` state
+
+`job_health(..., container_alive=...)` accepts a third, independent
+liveness signal alongside `process_alive`: whether the job's own
+container (`splat_train_<job_id>`, see `runner.expected_container_name`)
+is currently up, typically from a `docker/podman ps --filter name=...`
+call the caller makes (`runner.container_running`).
+
+This exists because a `result_glob`/`complete_marker` match is not
+sufficient completion evidence on its own for a multi-phase trainer: the
+interim artifact above is real and matches `result_glob` the instant it's
+written, well before the container that will go on to write the FINAL
+artifact has exited. Before this existed, the daemon's stale-running
+reconciler (`runner.reconcile_stale_running`, which has no live
+subprocess handle to consult after a runner restart) read that interim
+match as `done` and requeued/re-dispatched the job while its container
+was still training — confirmed live 2026-09 on psnr26 `causal_mapping`
+jobs. `container_alive=True` downgrades an otherwise-`done` verdict to
+`finishing` (or a more specific state parsed from the still-live log,
+e.g. `training`/`reporting`/`hung`) and is never overridden back to
+`crashed` by a caller-supplied `process_alive=False` (which, from a
+restarted daemon with no subprocess handle, means "unknown", not "dead").
+`container_alive=False` (the container has genuinely exited) or `None`
+(unknown — e.g. no container runtime available to check) behave exactly
+as before: `done` stands once the artifact/marker evidence says so.
 
 `result_glob` accepts either a bare pattern relative to the resolved
 `model_path` (e.g. `comparison/*/report.json`) or the

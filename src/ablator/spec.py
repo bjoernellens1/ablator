@@ -178,6 +178,19 @@ def expand_spec(spec: dict,
             "lane": lane,
             "status": "pending",
         }
+        # result_glob: arm > base > spec (nearest declaration wins, same
+        # precedence as the Git target below). Only set on the job when at
+        # least one scope declares it -- absent, health.job_health() falls
+        # back to the type's own result_glob (runner._health_qcfg) and then
+        # [queue] result_glob, so omitting this never forces the default.
+        # Needed for multi-phase trainers (e.g. splatograph's causal_mapping
+        # with `--streaming_post_mapping_refinement_steps N > 0`) whose
+        # final artifact differs from the queue-wide default -- see
+        # ablator.health's module docstring.
+        for scope in (arm, base, spec):
+            if "result_glob" in scope:
+                job["result_glob"] = scope["result_glob"]
+                break
         git_target = _resolve_git_target(spec, base, arm, name=name, arm_id=arm_id)
         if git_target is not None:
             git_sha, git_repo = git_target
