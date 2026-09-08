@@ -72,6 +72,39 @@ _DISK_FULL_MARKER = DEFAULT_PATTERNS["disk_full"][0]
 _TRACEBACK_RE = re.compile(r"Traceback \(most recent call last\)")
 
 
+def last_traceback_block(text: str) -> str:
+    """Extract the LAST complete traceback block from text.
+
+    Returns the substring from the last "Traceback (most recent call last)"
+    marker to the end of text, or empty string if no traceback found.
+    This preserves the innermost frames and exception line which
+    _snippet's fixed 160-char window would otherwise lose.
+    """
+    if not text:
+        return ""
+    matches = list(_TRACEBACK_RE.finditer(text))
+    if not matches:
+        return ""
+    last_match = matches[-1]
+    return text[last_match.start():].strip()
+
+
+def _evidence_with_traceback(marker: str, log_tail: str) -> str:
+    """Build evidence snippet: marker-centered snippet + last traceback block if present.
+
+    Returns combined evidence capped at 4KB for the ledger. Full stderr is
+    persisted separately in ablator_stderr.log.
+    """
+    snippet = _snippet(log_tail, marker)
+    traceback_block = last_traceback_block(log_tail)
+    # If we have a traceback and it's not already in the snippet, append it capped at 4KB total
+    if traceback_block and traceback_block not in snippet:
+        combined = snippet + "\n" + traceback_block
+        # Bound total evidence to ~4KB for the ledger
+        return combined[:4096] if len(combined) > 4096 else combined
+    return snippet
+
+
 def patterns_from_config(cfg: dict | None) -> dict[str, tuple[str, ...]]:
     """Merge [error_patterns] overrides from a loaded TOML/JSON config on
     top of DEFAULT_PATTERNS. A category present in cfg replaces its default
@@ -184,7 +217,7 @@ def classify_failure(job: dict, log_tail: str, exit_code: int | None,
     gpu_oom_hit = any(marker in low for marker in gpu_oom_markers)
     if gpu_oom_hit and (job.get("gpu_busy_at_claim") or machine_context.get("gpu_busy_at_claim")):
         marker = next(m for m in gpu_oom_markers if m in low)
-        return _result("gpu_busy_conflict", _snippet(log_tail, marker), 0.9)
+        return _result("gpu_busy_conflict", _evidence_with_traceback(marker, log_tail), 0.9)
 
     # --- oom_killed ------------------------------------------------------
     if exit_code == 137 and not gpu_oom_hit:
@@ -211,10 +244,10 @@ def classify_failure(job: dict, log_tail: str, exit_code: int | None,
     # --- gpu_busy_conflict without prior claim-time flag but still OOM/busy --
     if gpu_oom_hit:
         marker = next(m for m in gpu_oom_markers if m in low)
-        return _result("gpu_busy_conflict", _snippet(log_tail, marker), 0.5)
+        return _result("gpu_busy_conflict", _evidence_with_traceback(marker, log_tail), 0.5)
 
     # --- code_error ------------------------------------------------------
     if _TRACEBACK_RE.search(log_tail):
-        return _result("code_error", _snippet(log_tail, "Traceback (most recent call last)"), 0.85)
+        return _result("code_error", _evidence_with_traceback("Traceback (most recent call last)", log_tail), 0.85)
 
     return _result("unknown", _snippet(log_tail, "") if log_tail else "no matching signature", 0.3)
