@@ -47,11 +47,46 @@ def test_image_missing():
     assert r["suggested_action"] == "skip_permanently_this_machine"
 
 
-def test_gpu_busy_conflict():
+def test_gpu_busy_conflict_with_claim_flag():
+    """OOM with gpu_busy_at_claim=True: genuine co-residency, requeue."""
     r = errormod.classify_failure(_job(gpu_busy_at_claim=True),
                                   "RuntimeError: HIP out of memory", 1, {})
     assert r["category"] == "gpu_busy_conflict"
     assert r["suggested_action"] == "requeue_backoff_5min"
+
+
+def test_cuda_oom_high_memory_usage():
+    """OOM where job's process owns 87% of 11.59 GiB: terminal cuda_oom, no retry."""
+    log = (
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.19 GiB. "
+        "GPU 0 has a total capacity of 11.59 GiB of which 1.03 GiB is free. "
+        "Including non-PyTorch memory, this process has 10.08 GiB memory in use. "
+        "Of the allocated memory 7.17 GiB is allocated by PyTorch, and 2.56 GiB is reserved."
+    )
+    r = errormod.classify_failure(_job(), log, 1, {})
+    assert r["category"] == "cuda_oom"
+    assert r["suggested_action"] == "quarantine_no_retry"
+    assert r["confidence"] == 0.9
+
+
+def test_cuda_oom_very_high_memory_usage():
+    """OOM where job's process owns 98% of 23.56 GiB: terminal cuda_oom, no retry."""
+    log = (
+        "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 530.00 MiB. "
+        "GPU 0 has a total capacity of 23.56 GiB of which 0.40 GiB is free. "
+        "Including non-PyTorch memory, this process has 23.16 GiB memory in use."
+    )
+    r = errormod.classify_failure(_job(), log, 1, {})
+    assert r["category"] == "cuda_oom"
+    assert r["suggested_action"] == "quarantine_no_retry"
+
+
+def test_gpu_busy_conflict_no_memory_info():
+    """OOM with no memory info and no gpu_busy_at_claim: fallback to gpu_busy_conflict."""
+    r = errormod.classify_failure(_job(), "RuntimeError: CUDA out of memory", 1, {})
+    assert r["category"] == "gpu_busy_conflict"
+    assert r["suggested_action"] == "requeue_backoff_5min"
+    assert r["confidence"] == 0.5  # Lower confidence for fallback
 
 
 def test_oom_killed():
