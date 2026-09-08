@@ -962,9 +962,40 @@ def machine_context_snapshot(job: dict, base_dir: str) -> dict:
 
 
 def _job_log_tail(cfg: dict, job: dict) -> str:
+    """Read the tail of a job's log for error classification.
+
+    Size is controlled by [errors].evidence_tail_bytes (default 16 KB).
+    This is separate from CRASH_TAIL_BYTES used for health monitoring.
+    """
     from . import progress as progmod
     log = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
-    return progmod.read_tail(log, healthmod.CRASH_TAIL_BYTES)
+    try:
+        tail_bytes = max(1024, int(cfg.get("errors", {}).get("evidence_tail_bytes", 16384)))
+    except (TypeError, ValueError):
+        tail_bytes = 16384
+    return progmod.read_tail(log, tail_bytes)
+
+
+def _persist_stderr_for_failed_job(cfg: dict, job: dict) -> None:
+    """Persist full log/stderr of a failed job to ablator_stderr.log in its output dir.
+
+    Best-effort, never raises. Allows inspecting the full stderr even when
+    evidence_snippet is bounded for ledger size.
+    """
+    try:
+        mp = healthmod.resolve_model_path(job.get("model_path", ""), ".")
+        if not mp or not os.path.isdir(mp):
+            return
+        log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
+        stderr_dest = os.path.join(mp, "ablator_stderr.log")
+        if not os.path.exists(log_path):
+            return
+        with open(log_path, "rb") as src:
+            content = src.read()
+        with open(stderr_dest, "wb") as dst:
+            dst.write(content)
+    except OSError:
+        pass
 
 
 def classify_and_record(cfg: dict, job: dict, exit_code: int | None,
@@ -977,6 +1008,9 @@ def classify_and_record(cfg: dict, job: dict, exit_code: int | None,
     directly, still through this same function so the ledger bookkeeping
     (q.update of error_category/evidence/confidence/suggested_action) is
     identical to every other failure path.
+
+    Also persists the full log to ablator_stderr.log in the job's output
+    directory when it exists.
     """
     if job.get("_gpu_memory_exhausted"):
         result = errormod.gpu_memory_exhaustion_result(job.get("_gpu_memory_pct"))
@@ -995,6 +1029,9 @@ def classify_and_record(cfg: dict, job: dict, exit_code: int | None,
     job["error_evidence"] = result["evidence_snippet"]
     job["error_confidence"] = result["confidence"]
     job["suggested_action"] = result["suggested_action"]
+
+    # Persist full log for failed jobs
+    _persist_stderr_for_failed_job(cfg, job)
     return result
 
 
