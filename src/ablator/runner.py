@@ -1074,9 +1074,28 @@ def handle_failure(cfg: dict, job: dict, exit_code: int | None, machine: str,
         return "quarantined"
 
     if action == "requeue_backoff_5min":
-        q.update(job["id"], status="pending", health=None,
-                claimed_by=None, claimed_at=None,
-                not_before=time.time() + 5 * 60)
+        # Safety net for gpu_busy_conflict: cap requeue attempts at 3 total.
+        # After 3 failed requeue attempts, quarantine to prevent infinite loops.
+        if category == "gpu_busy_conflict":
+            attempts = job.get("gpu_busy_conflict_attempts", 0)
+            if attempts >= 3:
+                print(f"[ablator] {job['id']}: gpu_busy_conflict requeue cap exceeded "
+                      f"({attempts} attempts) — quarantining instead of requeue", flush=True)
+                q.update(job["id"], status="quarantined",
+                        gpu_busy_conflict_attempts=attempts + 1,
+                        quarantine_reason="gpu_busy_conflict_requeue_cap_exceeded")
+                return "quarantined"
+            # Not yet at cap, requeue with incremented counter
+            attempts = attempts + 1
+            q.update(job["id"], status="pending", health=None,
+                    claimed_by=None, claimed_at=None,
+                    not_before=time.time() + 5 * 60,
+                    gpu_busy_conflict_attempts=attempts)
+        else:
+            # Non-gpu_busy_conflict case: regular requeue without attempt tracking
+            q.update(job["id"], status="pending", health=None,
+                    claimed_by=None, claimed_at=None,
+                    not_before=time.time() + 5 * 60)
         return "pending"
 
     if action == "requeue_backoff_2min":

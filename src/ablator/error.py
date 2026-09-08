@@ -6,8 +6,8 @@ category + evidence + confidence + suggested_action. Callers (runner)
 decide what to actually do about it (requeue/quarantine/pause).
 
 Categories, roughly in priority order when multiple could match:
-  disk_full, image_missing, gpu_busy_conflict, oom_killed, scene_missing,
-  network_transient, code_error, unknown
+  disk_full, image_missing, cuda_oom, gpu_busy_conflict, oom_killed,
+  scene_missing, network_transient, code_error, unknown
 
 Marker lists are config-driven: built-in defaults below, overridable per
 category via the host TOML config's [error_patterns] table, e.g.
@@ -34,6 +34,7 @@ SUGGESTED_ACTION = {
     "code_error": "quarantine_code_fix_needed",
     "unknown": "retry_once_then_quarantine",
     "gpu_memory_exhaustion": "quarantine_no_retry",
+    "cuda_oom": "quarantine_no_retry",
 }
 
 DEFAULT_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -70,6 +71,34 @@ _GPU_OOM_MARKERS = DEFAULT_PATTERNS["gpu_oom"]
 _DISK_FULL_MARKER = DEFAULT_PATTERNS["disk_full"][0]
 
 _TRACEBACK_RE = re.compile(r"Traceback \(most recent call last\)")
+
+# CUDA OOM memory parsing: extract "this process has X GiB" and "total capacity of Y GiB"
+# Handles both orderings (total capacity may appear before or after process memory mention)
+_CUDA_OOM_MEMORY_RE = re.compile(
+    r"total capacity of\s+([\d.]+)\s*GiB.*?"
+    r"this process has\s+([\d.]+)\s*GiB",
+    re.IGNORECASE | re.DOTALL
+)
+
+
+def _process_owns_most_gpu_memory(log_tail: str, threshold_pct: float = 0.85) -> bool:
+    """Check if CUDA OOM message indicates the job's own process owns >= threshold_pct
+    of GPU memory. Returns True if process owns >= 85% (default), False otherwise.
+
+    Parses: "GPU 0 has a total capacity of Y GiB" (comes first in the message)
+    and "Including non-PyTorch memory, this process has X GiB memory in use" (comes later).
+    """
+    match = _CUDA_OOM_MEMORY_RE.search(log_tail)
+    if not match:
+        return False
+    try:
+        total_gib = float(match.group(1))  # group 1: total capacity
+        process_gib = float(match.group(2))  # group 2: this process has
+        if total_gib <= 0:
+            return False
+        return process_gib / total_gib >= threshold_pct
+    except (ValueError, ZeroDivisionError):
+        return False
 
 
 def patterns_from_config(cfg: dict | None) -> dict[str, tuple[str, ...]]:
@@ -180,11 +209,26 @@ def classify_failure(job: dict, log_tail: str, exit_code: int | None,
         if marker in low:
             return _result("image_missing", _snippet(log_tail, marker), 0.95)
 
-    # --- gpu_busy_conflict ---------------------------------------------------
+    # --- cuda_oom (takes precedence over gpu_busy_conflict) -----------------
     gpu_oom_hit = any(marker in low for marker in gpu_oom_markers)
-    if gpu_oom_hit and (job.get("gpu_busy_at_claim") or machine_context.get("gpu_busy_at_claim")):
+    if gpu_oom_hit:
+        # Check if process owns >= 85% of GPU memory: deterministic OOM at job's peak,
+        # not a transient co-residency conflict. Takes precedence even if gpu_busy_at_claim.
+        if _process_owns_most_gpu_memory(log_tail, threshold_pct=0.85):
+            marker = next(m for m in gpu_oom_markers if m in low)
+            return _result("cuda_oom", _snippet(log_tail, marker), 0.9)
+
+        # Genuine co-residency: GPU was busy at claim time (pre-dispatch guard flagged it)
+        # or this is a known busy-signal case (e.g. another process held memory).
+        # Requeue with backoff.
+        if job.get("gpu_busy_at_claim") or machine_context.get("gpu_busy_at_claim"):
+            marker = next(m for m in gpu_oom_markers if m in low)
+            return _result("gpu_busy_conflict", _snippet(log_tail, marker), 0.9)
+
+        # Fallback: OOM without clear evidence of co-residency or high memory usage.
+        # Classify as gpu_busy_conflict with lower confidence (may still be transient).
         marker = next(m for m in gpu_oom_markers if m in low)
-        return _result("gpu_busy_conflict", _snippet(log_tail, marker), 0.9)
+        return _result("gpu_busy_conflict", _snippet(log_tail, marker), 0.5)
 
     # --- oom_killed ------------------------------------------------------
     if exit_code == 137 and not gpu_oom_hit:
@@ -207,11 +251,6 @@ def classify_failure(job: dict, log_tail: str, exit_code: int | None,
     for marker in network_markers:
         if marker in low:
             return _result("network_transient", _snippet(log_tail, marker), 0.8)
-
-    # --- gpu_busy_conflict without prior claim-time flag but still OOM/busy --
-    if gpu_oom_hit:
-        marker = next(m for m in gpu_oom_markers if m in low)
-        return _result("gpu_busy_conflict", _snippet(log_tail, marker), 0.5)
 
     # --- code_error ------------------------------------------------------
     if _TRACEBACK_RE.search(log_tail):
