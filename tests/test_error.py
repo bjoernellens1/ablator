@@ -54,10 +54,43 @@ def test_gpu_busy_conflict():
     assert r["suggested_action"] == "requeue_backoff_5min"
 
 
-def test_oom_killed():
-    r = errormod.classify_failure(_job(), "process killed", 137, {})
+def test_oom_killed_confirmed_by_dmesg():
+    """Exit 137 IS classified oom_killed when dmesg actually confirms the
+    kernel OOM-killer fired."""
+    r = errormod.classify_failure(
+        _job(), "process killed", 137,
+        {"dmesg_tail": "Out of memory: Killed process 12345 (train.py)"})
     assert r["category"] == "oom_killed"
     assert r["suggested_action"] == "requeue_once_needs_review"
+
+
+def test_oom_killed_confirmed_by_container_inspect():
+    """Exit 137 IS classified oom_killed when the container's own
+    `docker/podman inspect --format='{{.State.OOMKilled}}'` says true --
+    the authoritative signal (see runner._container_oom_killed)."""
+    r = errormod.classify_failure(
+        _job(), "process killed", 137, {"container_oom_killed": True})
+    assert r["category"] == "oom_killed"
+
+
+def test_killed_externally_when_no_oom_evidence():
+    """Bug fix (incident 2026-09-12): exit code 137 ALONE (no dmesg
+    OOM-killer signature, no container inspect confirmation -- e.g. the
+    container was already removed by the time this ran) is genuinely
+    ambiguous -- a SIGKILL covers both the OOM-killer and a plain operator
+    `docker kill`/`kill -9`. Must NOT be guessed as oom_killed."""
+    r = errormod.classify_failure(_job(), "process killed", 137, {})
+    assert r["category"] == "killed_externally"
+    assert r["category"] != "oom_killed"
+
+
+def test_killed_externally_when_container_inspect_says_not_oom():
+    """An operator's `docker kill` on a container is exactly this case:
+    docker/podman inspect's State.OOMKilled positively reports false, so
+    exit 137 must be classified killed_externally, not oom_killed."""
+    r = errormod.classify_failure(
+        _job(), "process killed", 137, {"container_oom_killed": False})
+    assert r["category"] == "killed_externally"
 
 
 def test_scene_missing():

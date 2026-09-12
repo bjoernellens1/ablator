@@ -11,7 +11,6 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
-import os
 import socket
 import subprocess
 import time
@@ -263,11 +262,26 @@ def cancel_jobs(cfg: dict[str, Any], job_ids: list[str]) -> list[dict[str, Any]]
                 results.append({"job_id": job_id, "status": status, "action": "no_op"})
         queue._save(handle, jobs)
 
-    # Running jobs are supervised by another process.  Use the same control
-    # file protocol as ``ablator skip`` so cancellation stays backend-agnostic.
-    queue_dir = os.path.dirname(cfgmod.queue_path(cfg))
+    # Running jobs are supervised by another process. Use the literal SAME
+    # control-file mechanism (and path) as `ablator skip`/`ablator stop`/
+    # `ablator requeue` (runner.control_path()/runner.read_control(),
+    # polled every ~HEALTH_POLL_S by supervise()) rather than re-deriving
+    # the path inline here: this used to hand-build
+    # f"control_{job_id}" against `os.path.dirname(cfgmod.queue_path(cfg))`
+    # directly -- a second, independent copy of runner.control_path()'s own
+    # logic that happened to compute the identical path today, but any
+    # future change to that logic (e.g. keying control files by machine, or
+    # moving them under [queue] log_dir instead of the queue file's own
+    # directory) would silently desync the two, leaving `cancel-jobs`
+    # writing a control file the runner's read_control() never looks at
+    # while `ablator skip` kept working -- exactly the asymmetry reported
+    # in the 2026-09-12 incident (cancel-jobs reported "cancel_requested"
+    # but the job kept running). Importing runner here (not at module load)
+    # avoids adding a hard import-time dependency from this module onto the
+    # much larger runner module for callers that never cancel a running job.
+    from . import runner as runnermod
     for job_id in running:
-        path = os.path.join(queue_dir, f"control_{job_id}")
+        path = runnermod.control_path(cfg, job_id)
         with open(path, "w") as handle:
             handle.write("skip\n")
     return results

@@ -352,6 +352,65 @@ def test_running_cancel_uses_existing_control_protocol(tmp_path: Path) -> None:
     assert (tmp_path / "control_job-running").read_text() == "skip\n"
 
 
+def test_running_cancel_uses_the_shared_control_path_helper(tmp_path: Path, monkeypatch) -> None:
+    """Bug fix (incident 2026-09-12): cancel_jobs() must derive the control
+    file path via runner.control_path() -- the exact same helper
+    ablator skip/stop/requeue use -- rather than an independently
+    hand-built f"control_{job_id}" string. Proven here by monkeypatching
+    control_path() to a distinctive value and asserting cancel_jobs()
+    actually followed it: if cancel_jobs ever regresses to a duplicated,
+    independent path construction, this fails even though the two happen
+    to compute the same string today."""
+    cfg = _cfg(tmp_path)
+    job = build_job(cfg, job_id="job-running2", job_type="researchflow", params={"jobscript": "a.sh"})
+    submit_job(cfg, job)
+    Queue(cfg["queue"]["path"]).update("job-running2", status="running", claimed_by="main")
+
+    calls = []
+
+    def fake_control_path(cfg_arg, job_id):
+        calls.append(job_id)
+        return str(tmp_path / f"CUSTOM_control_{job_id}")
+
+    monkeypatch.setattr(runner, "control_path", fake_control_path)
+    result = cancel_jobs(cfg, ["job-running2"])
+    assert result[0]["action"] == "cancel_requested"
+    assert calls == ["job-running2"]
+    assert (tmp_path / "CUSTOM_control_job-running2").read_text() == "skip\n"
+
+
+def test_cancel_jobs_control_file_honored_by_supervise_within_poll_cadence(
+    tmp_path: Path,
+) -> None:
+    """End-to-end: a control file written by cancel_jobs() must be picked
+    up by a real supervise() loop at its normal poll cadence, exactly like
+    `ablator skip` -- same mechanism, same promptness, no separate/slower
+    path. Uses a real subprocess (a plain `sleep`) and a real, short
+    poll_s rather than mocking supervise() itself."""
+    import subprocess as sp
+    cfg = _cfg(tmp_path)
+    job_record = build_job(cfg, job_id="job-cancel-e2e", job_type="researchflow",
+                          params={"jobscript": "a.sh"})
+    submit_job(cfg, job_record)
+    Queue(cfg["queue"]["path"]).update("job-cancel-e2e", status="running", claimed_by="main")
+
+    result = cancel_jobs(cfg, ["job-cancel-e2e"])
+    assert result[0]["action"] == "cancel_requested"
+
+    job = {"id": "job-cancel-e2e", "type": "researchflow", "model_path": "m",
+          "status": "running"}
+    proc = sp.Popen(["sleep", "5"], start_new_session=True)
+    try:
+        outcome = runner.supervise(cfg, job, proc, str(tmp_path), q=None,
+                                   poll_s=0.05, argv=["sleep", "5"])
+        assert outcome == "cancelled"
+        assert proc.poll() is not None  # actually killed, not just flagged
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
 def test_external_params_become_generic_template_variables(tmp_path: Path) -> None:
     cfg = _cfg(tmp_path)
     job = build_job(

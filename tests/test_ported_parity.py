@@ -104,7 +104,19 @@ def test_classify_gpu_busy_conflict_requires_claim_flag():
 
 
 def test_classify_oom_killed_exit_code_137():
+    """Bug fix (incident 2026-09-12): exit code 137 ALONE, with no positive
+    OOM evidence (no dmesg OOM-killer signature, no container inspect
+    State.OOMKilled confirmation), must not be guessed as oom_killed -- a
+    SIGKILL covers both the kernel OOM-killer and a plain operator
+    `docker kill`/`kill -9`. See tests/test_error.py for the full set of
+    oom_killed vs killed_externally cases."""
     r = errormod.classify_failure({}, "", 137)
+    assert r["category"] == "killed_externally"
+    assert r["suggested_action"] == "requeue_once_needs_review"
+
+
+def test_classify_oom_killed_exit_code_137_confirmed_by_container_inspect():
+    r = errormod.classify_failure({}, "", 137, {"container_oom_killed": True})
     assert r["category"] == "oom_killed"
     assert r["suggested_action"] == "requeue_once_needs_review"
 

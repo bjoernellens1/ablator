@@ -29,6 +29,12 @@ SUGGESTED_ACTION = {
     "image_missing": "skip_permanently_this_machine",
     "gpu_busy_conflict": "requeue_backoff_5min",
     "oom_killed": "requeue_once_needs_review",
+    # exit code 137 (SIGKILL) with no positive OOM evidence -- see
+    # classify_failure()'s docstring. Same "one retry, flagged for a human"
+    # action as oom_killed: this is deliberately NOT an automatic silent
+    # retrain-from-scratch loop for what may well have been an operator's
+    # intentional `docker kill`/`kill -9`.
+    "killed_externally": "requeue_once_needs_review",
     "scene_missing": "quarantine_no_retry",
     "network_transient": "requeue_backoff_2min",
     "code_error": "quarantine_code_fix_needed",
@@ -219,14 +225,47 @@ def classify_failure(job: dict, log_tail: str, exit_code: int | None,
         marker = next(m for m in gpu_oom_markers if m in low)
         return _result("gpu_busy_conflict", _evidence_with_traceback(marker, log_tail), 0.9)
 
-    # --- oom_killed ------------------------------------------------------
+    # --- oom_killed vs killed_externally -----------------------------------
+    # Exit code 137 alone means "reaped by an uncatchable SIGKILL" -- that
+    # covers BOTH the kernel OOM-killer and a plain operator `docker kill`/
+    # `kill -9` (or e.g. a daemon restart), so it is not, on its own,
+    # evidence of OOM. Incident (2026-09-12): an operator's own
+    # `docker kill splat_train_<id>` (to release a GPU a stale "done"
+    # verdict had wrongly reported free -- see runner._wait_for_container_exit's
+    # docstring for that half of the incident) was classified oom_killed from
+    # exit code 137 alone and flipped a job from "done" back to "pending",
+    # which then got re-claimed and retrained from scratch within a minute.
+    # Only classify oom_killed given POSITIVE OOM evidence:
+    #   - machine_context["container_oom_killed"] is True (authoritative:
+    #     `docker/podman inspect --format='{{.State.OOMKilled}}'`, populated
+    #     by runner._container_oom_killed() from launch-time-captured
+    #     container identity -- see that function's docstring), or
+    #   - a kernel OOM-killer signature in dmesg.
+    # Anything else -- container_oom_killed is False (inspect POSITIVELY
+    # says it was NOT an OOM kill) or None (unknown/unavailable, e.g. the
+    # container was already removed by the time this ran) with no dmesg
+    # confirmation -- is genuinely ambiguous and must not be guessed as OOM.
     if exit_code == 137 and not gpu_oom_hit:
+        container_oom = machine_context.get("container_oom_killed")
         dmesg = machine_context.get("dmesg_tail", "")
-        evidence = "exit code 137, no CUDA/HIP OOM signature in log"
-        if dmesg and ("out of memory" in dmesg.lower() or "oom-killer" in dmesg.lower()):
-            evidence += f"; dmesg: {_snippet(dmesg, 'oom')}"
+        dmesg_confirms = bool(dmesg) and (
+            "out of memory" in dmesg.lower() or "oom-killer" in dmesg.lower())
+        if container_oom is True or dmesg_confirms:
+            evidence = "exit code 137"
+            if container_oom is True:
+                evidence += "; container inspect State.OOMKilled=true"
+            if dmesg_confirms:
+                evidence += f"; dmesg: {_snippet(dmesg, 'oom')}"
             return _result("oom_killed", evidence, 0.9)
-        return _result("oom_killed", evidence, 0.6)
+        if container_oom is False:
+            evidence = ("exit code 137, but container inspect State.OOMKilled=false "
+                       "-- not an OOM kill (likely an operator `docker kill`/"
+                       "`kill -9` or other external signal)")
+            return _result("killed_externally", evidence, 0.75)
+        evidence = ("exit code 137, no OOM evidence (no container inspect data "
+                   "available, no dmesg OOM-killer signature) -- SIGKILL alone "
+                   "does not distinguish the OOM-killer from an operator kill")
+        return _result("killed_externally", evidence, 0.4)
 
     # --- scene_missing -------------------------------------------------------
     scene = job.get("scene", "")

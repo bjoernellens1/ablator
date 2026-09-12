@@ -1600,6 +1600,175 @@ def test_require_result_artifact_off_by_default(tmp_path, monkeypatch):
     assert read_queue(q.path)[0]["status"] == "done"
 
 
+def test_wait_for_container_exit_polls_until_gone(monkeypatch):
+    """Unit-level: _wait_for_container_exit() must keep polling (sleeping
+    poll_s between checks) as long as `running` reports True, and return
+    as soon as it reports anything else (False = confirmed exited)."""
+    calls = {"n": 0}
+
+    def fake_running(runtime, name):
+        calls["n"] += 1
+        assert (runtime, name) == ("docker", "splat_train_j1")
+        return calls["n"] < 3  # alive for 2 checks, gone on the 3rd
+
+    slept = []
+    runner._wait_for_container_exit(
+        "docker", "splat_train_j1", poll_s=5,
+        sleep=lambda s: slept.append(s), running=fake_running,
+    )
+    assert calls["n"] == 3
+    assert slept == [5, 5]  # one sleep between each "still alive" check
+
+
+def test_wait_for_container_exit_stops_on_unknown():
+    """A running() result of None (can't check, e.g. no runtime binary) must
+    stop the wait immediately, same as False -- never hang forever on an
+    unsupported host or a transient probe failure."""
+    runner._wait_for_container_exit(
+        "docker", "splat_train_j1", sleep=lambda s: (_ for _ in ()).throw(
+            AssertionError("must not sleep/re-poll after an unknown result")),
+        running=lambda runtime, name: None,
+    )  # returns without raising
+
+
+def test_default_completion_waits_for_container_exit_then_done(tmp_path, monkeypatch):
+    """Bug fix (incident 2026-09-12, psnr26spp31c_..._sampleall on
+    rtx3090): with require_result_artifact left at its default (False,
+    the common case -- see test_require_result_artifact_off_by_default),
+    exit_code==0 must NOT be reported as "done" while the job's own
+    container is still alive; completion genuinely waits for the
+    container to actually exit first, instead of reporting the job (and,
+    transitively, the GPU) done the instant the wrapping client process
+    exits."""
+    cfg = make_cfg(tmp_path)
+    cfg["queue"]["log_dir"] = str(tmp_path)
+    mp = tmp_path / "run_container_still_alive_then_exits"
+    # A fake `podman` binary (named exactly that -- _is_container_runtime()
+    # matches on basename) that just exits 0, standing in for a real
+    # `podman run` so this stays a real-subprocess test without needing an
+    # actual container runtime/image.
+    # A fake `podman` binary answers every `inspect`/`image inspect` call
+    # (pre-launch image digest resolution, post-launch container identity
+    # capture) with the same canned Id/Image JSON, and exits 0 for `run`/
+    # `stop`/`rm` -- enough for run_job()'s provenance plumbing without a
+    # real container runtime/image.
+    fake_podman = tmp_path / "podman"
+    fake_podman.write_text(
+        "#!/bin/sh\n"
+        'echo \'[{"Id": "deadbeef", '
+        '"Image": "sha256:' + ("0" * 64) + '"}]\'\n'
+        "exit 0\n"
+    )
+    fake_podman.chmod(0o755)
+    cfg["types"]["replay"] = {"cwd": str(tmp_path),
+                              "command": [str(fake_podman), "run", "img", "true"]}
+    q = Queue(cfg["queue"]["path"])
+    write_queue(q.path, [{"id": "j1", "machine": "any", "type": "replay",
+                          "scene": "/s", "model_path": str(mp),
+                          "status": "pending"}])
+    monkeypatch.setattr(resources, "machine_busy", lambda *a, **k: False)
+    monkeypatch.setattr(cfgmod, "machine_name", lambda c: "main")
+    calls = {"n": 0}
+
+    def fake_container_running(runtime, name, **k):
+        calls["n"] += 1
+        return calls["n"] <= 2  # alive for the first 2 checks, then gone
+
+    monkeypatch.setattr(runner, "container_running", fake_container_running)
+    sleeps = []
+    monkeypatch.setattr(runner.time, "sleep", lambda s: sleeps.append(s))
+    # Bypass the real machine-wide dispatch lock (~/.cache/ablator/run_locks/
+    # dispatch_main.lock) -- it is a genuine, host-global flock keyed only
+    # by machine name (see runner._acquire_dispatch_lock's docstring), so a
+    # real `ablator run` daemon actually active on the machine running this
+    # test suite would otherwise make this test (and others claiming for
+    # "main") spuriously fail with the job stuck at "pending".
+    monkeypatch.setattr(runner, "_acquire_dispatch_lock", lambda machine: 1)
+    runner.run_loop(cfg, once=True)
+    assert read_queue(q.path)[0]["status"] == "done"
+    # Not a silent immediate "done": the container-alive check ran, and the
+    # wait loop actually polled again (and slept between polls) before
+    # settling on "gone".
+    assert calls["n"] >= 3
+    assert sleeps  # actually waited, did not just check once and move on
+
+
+def test_finish_never_reopens_a_terminal_done_job(tmp_path):
+    """Bug fix (incident 2026-09-12): a job already 'done' must never be
+    flipped to a different status by a late/stray event (e.g. a container
+    exit event, misclassified or not, reaching finish() well after the job
+    already completed) -- once terminal, terminal."""
+    cfg_path = tmp_path / "queue.jsonl"
+    q = Queue(str(cfg_path))
+    write_queue(q.path, [{"id": "j1", "status": "done", "finished_at": "T0"}])
+    q.finish("j1", "pending", claimed_by=None, claimed_at=None)
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert job["finished_at"] == "T0"
+
+
+def test_update_never_reopens_a_terminal_done_job_status(tmp_path):
+    """Same guard as finish(), for the update() path handle_failure() uses
+    for backoff/resume dispositions -- but only the status field is
+    dropped; other, harmless bookkeeping fields in the same call still
+    land."""
+    q = Queue(str(tmp_path / "queue.jsonl"))
+    write_queue(q.path, [{"id": "j1", "status": "done"}])
+    q.update("j1", status="pending", claimed_by=None, note="stray exit event")
+    job = read_queue(q.path)[0]
+    assert job["status"] == "done"
+    assert job["note"] == "stray exit event"  # non-status fields still apply
+
+
+def test_finish_still_applies_from_a_non_terminal_status(tmp_path):
+    """The guard must not block ordinary, legitimate transitions -- only
+    ones that would move a job AWAY FROM an already-terminal status."""
+    q = Queue(str(tmp_path / "queue.jsonl"))
+    write_queue(q.path, [{"id": "j1", "status": "running"}])
+    q.finish("j1", "done")
+    assert read_queue(q.path)[0]["status"] == "done"
+
+
+def test_container_oom_killed_reads_docker_inspect(monkeypatch):
+    """runner._container_oom_killed() reuses the container identity already
+    captured at launch time (job['actual_launch']) to run one targeted
+    `inspect --format='{{.State.OOMKilled}}'` call."""
+    job = {"actual_launch": {"runtime": "docker", "container_id": "abc123"}}
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        return type("R", (), {"returncode": 0, "stdout": "true\n"})()
+
+    assert runner._container_oom_killed(job, run=fake_run) is True
+    assert seen["argv"] == ["docker", "inspect", "--format",
+                            "{{.State.OOMKilled}}", "abc123"]
+
+    def fake_run_false(argv, **kw):
+        return type("R", (), {"returncode": 0, "stdout": "false\n"})()
+
+    assert runner._container_oom_killed(job, run=fake_run_false) is False
+
+
+def test_container_oom_killed_none_without_launch_identity():
+    """No actual_launch/container_id captured (e.g. a non-container job
+    type, or the job never got that far) -> unknown, no subprocess call."""
+    def boom(*a, **k):
+        raise AssertionError("must not shell out with no container identity")
+    assert runner._container_oom_killed({}, run=boom) is None
+    assert runner._container_oom_killed(
+        {"actual_launch": {"runtime": "process", "container_id": None}},
+        run=boom) is None
+
+
+def test_container_oom_killed_none_when_inspect_fails(monkeypatch):
+    """Container already removed (--rm, or a prior force_remove_container())
+    by the time this runs -> inspect fails -> unknown, not a guessed False."""
+    job = {"actual_launch": {"runtime": "docker", "container_id": "abc123"}}
+    fake_run = lambda argv, **kw: type("R", (), {"returncode": 1, "stdout": ""})()
+    assert runner._container_oom_killed(job, run=fake_run) is None
+
+
 def test_control_requeue_never_yields_done_regardless_of_exit_code(tmp_path):
     """A manual control action (stop/skip/requeue), even against a process
     that goes on to exit 0, must never be reported as 'done' — supervise()
