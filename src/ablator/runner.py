@@ -578,6 +578,49 @@ def container_running(runtime: str, name: str,
     return name in names
 
 
+def _wait_for_container_exit(runtime: str, name: str, poll_s: float = HEALTH_POLL_S,
+                             sleep=None, running=None) -> None:
+    """Block until `docker/podman ps` no longer reports `name` as running.
+
+    Bug fix (incident 2026-09-12, psnr26spp31c_..._sampleall on rtx3090):
+    the queue marked that job "done" at elapsed 0h14m -- the instant its
+    wrapping `podman/docker run` CLIENT process exited -- while the
+    container itself kept running a post-mapping pose-align tail for 35+
+    more minutes, so ablator believed the GPU was free
+    (`[gpu_busy_conflict!]` on every other job's claim attempt in the
+    meantime) while the container still held it. The client process
+    exiting is not the same guarantee as the container being gone (see
+    kill_job()'s docstring for the general split, and
+    health.job_health()'s container_alive docstring for the multi-phase-
+    trainer variant of the same gap).
+
+    docs/health.md documents "done" as requiring the artifact/marker match
+    AND "the job's container, if checked, is no longer running" -- i.e.
+    completion is defined to genuinely wait for the container, not to
+    collect results the instant they appear and reap the container
+    separately. This function is the wait: called from run_job() only for
+    the common (require_result_artifact unset/False) path once the client
+    process has exited 0 but this job's own container is still reported
+    alive, so the "done" verdict -- and the GPU-idle signal derived from
+    it -- is delayed until the container has genuinely exited, instead of
+    downgrading straight to a failed/retried verdict (which would launch a
+    duplicate attempt against the same model_path while the first
+    container is still finishing on its own).
+
+    `running` defaults to `container_running`; returns as soon as it
+    reports anything other than True -- False (confirmed exited) or None
+    (unknown/can't check, e.g. no container runtime binary) are both
+    treated as "stop waiting", so a transient `ps` failure or an
+    unsupported host can never hang a job here forever.
+    """
+    running = running or container_running
+    if sleep is None:
+        def sleep(s):
+            time.sleep(s)
+    while running(runtime, name) is True:
+        sleep(poll_s)
+
+
 def container_name_from_argv(argv: list[str]) -> str | None:
     """Extract the `--name X` / `--name=X` value from a rendered command,
     if the command is a podman/docker `run` invocation. Returns None for
@@ -944,12 +987,52 @@ def output_folder_preflight(model_path: str, cwd: str | None) -> str:
     return f"[ablator] output folder preflight: path={resolved} free={free_str} write_speed={speed_str}"
 
 
+def _container_oom_killed(job: dict, run=subprocess.run) -> bool | None:
+    """`docker/podman inspect --format='{{.State.OOMKilled}}'` for this job's
+    own container, if we still can -- authoritative evidence for
+    error.classify_failure()'s oom_killed vs killed_externally split (see
+    that function's docstring for the incident this fixes).
+
+    Reuses `job["actual_launch"]` (runtime + container_id), already
+    captured at launch time by _capture_container_identity() before this
+    job's container is torn down -- no new launch-time infrastructure
+    needed, just one more read-only inspect call at classification time.
+    Returns None (unknown, never a guessed False) whenever that data is
+    missing, the runtime binary can't be invoked, the container has
+    already been removed (`--rm`, or a prior force_remove_container()),
+    or its output doesn't parse as a clean true/false -- exactly like
+    container_running()'s own None-on-uncertainty contract, so a caller
+    never mistakes "couldn't check" for "confirmed not OOM".
+    """
+    launch = job.get("actual_launch") or {}
+    runtime = launch.get("runtime")
+    container_id = launch.get("container_id")
+    if not runtime or runtime == "process" or not container_id:
+        return None
+    try:
+        proc = run([runtime, "inspect", "--format", "{{.State.OOMKilled}}",
+                   container_id], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"[ablator] _container_oom_killed({runtime!r}, {container_id!r}): "
+              f"{e!r} -- treating as unknown", flush=True)
+        return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout.strip().lower()
+    if out == "true":
+        return True
+    if out == "false":
+        return False
+    return None
+
+
 def machine_context_snapshot(job: dict, base_dir: str) -> dict:
     """Best-effort, read-only machine signals for error.classify_failure()."""
     mp = healthmod.resolve_model_path(job.get("model_path", ""), base_dir)
     ctx: dict = {
         "disk_free_bytes": _disk_free_bytes(mp),
         "docker_storage_free_bytes": _docker_storage_free_bytes(),
+        "container_oom_killed": _container_oom_killed(job),
     }
     for dmesg_path in ("/var/log/messages",):
         try:
@@ -962,9 +1045,40 @@ def machine_context_snapshot(job: dict, base_dir: str) -> dict:
 
 
 def _job_log_tail(cfg: dict, job: dict) -> str:
+    """Read the tail of a job's log for error classification.
+
+    Size is controlled by [errors].evidence_tail_bytes (default 16 KB).
+    This is separate from CRASH_TAIL_BYTES used for health monitoring.
+    """
     from . import progress as progmod
     log = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
-    return progmod.read_tail(log, healthmod.CRASH_TAIL_BYTES)
+    try:
+        tail_bytes = max(1024, int(cfg.get("errors", {}).get("evidence_tail_bytes", 16384)))
+    except (TypeError, ValueError):
+        tail_bytes = 16384
+    return progmod.read_tail(log, tail_bytes)
+
+
+def _persist_stderr_for_failed_job(cfg: dict, job: dict) -> None:
+    """Persist full log/stderr of a failed job to ablator_stderr.log in its output dir.
+
+    Best-effort, never raises. Allows inspecting the full stderr even when
+    evidence_snippet is bounded for ledger size.
+    """
+    try:
+        mp = healthmod.resolve_model_path(job.get("model_path", ""), ".")
+        if not mp or not os.path.isdir(mp):
+            return
+        log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
+        stderr_dest = os.path.join(mp, "ablator_stderr.log")
+        if not os.path.exists(log_path):
+            return
+        with open(log_path, "rb") as src:
+            content = src.read()
+        with open(stderr_dest, "wb") as dst:
+            dst.write(content)
+    except OSError:
+        pass
 
 
 def classify_and_record(cfg: dict, job: dict, exit_code: int | None,
@@ -977,6 +1091,9 @@ def classify_and_record(cfg: dict, job: dict, exit_code: int | None,
     directly, still through this same function so the ledger bookkeeping
     (q.update of error_category/evidence/confidence/suggested_action) is
     identical to every other failure path.
+
+    Also persists the full log to ablator_stderr.log in the job's output
+    directory when it exists.
     """
     if job.get("_gpu_memory_exhausted"):
         result = errormod.gpu_memory_exhaustion_result(job.get("_gpu_memory_pct"))
@@ -995,6 +1112,9 @@ def classify_and_record(cfg: dict, job: dict, exit_code: int | None,
     job["error_evidence"] = result["evidence_snippet"]
     job["error_confidence"] = result["confidence"]
     job["suggested_action"] = result["suggested_action"]
+
+    # Persist full log for failed jobs
+    _persist_stderr_for_failed_job(cfg, job)
     return result
 
 
@@ -2307,6 +2427,26 @@ def run_job(cfg: dict, job: dict, machine: str,
                 status = "failed"
             else:
                 status = "done"
+        elif exit_code == 0 and container_name:
+            # Bug fix (incident 2026-09-12, see _wait_for_container_exit()'s
+            # docstring for the full incident): this is the COMMON path
+            # (require_result_artifact unset/False for most job types,
+            # including the causal_mapping type involved in that incident),
+            # so unlike the require_result_artifact branch above -- which
+            # downgrades a still-alive container straight to a failed/
+            # retried verdict -- completion here genuinely WAITS for the
+            # container to actually exit before reporting "done" at all,
+            # matching docs/health.md's documented "done" contract ("the
+            # job's container, if checked, is no longer running") instead
+            # of reporting done (and, transitively, GPU-idle) the instant
+            # the wrapping client process exits.
+            if _job_container_alive(cfg, job, machine):
+                print(f"[ablator] {job['id']} client process exited 0 but "
+                      f"its container ({container_name}) is still running "
+                      "-- waiting for it to actually exit before marking "
+                      "done", flush=True)
+                _wait_for_container_exit(argv[0], container_name)
+            status = "done"
         else:
             status = "done" if exit_code == 0 else "failed"
     except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:

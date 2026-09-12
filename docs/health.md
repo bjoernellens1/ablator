@@ -118,6 +118,32 @@ completion tail (`splatograph.runtime.finalize`) the other two trainers use;
 until then, only add `causal_replay_summary.json` to `complete_marker` for
 job types/specs known not to configure real post-mapping refinement.
 
+### Completion waits for the container, it does not collect-then-kill (decision, incident 2026-09-12)
+
+A job's own launching client process exiting 0 is not, by itself,
+sufficient evidence the job's container has actually exited (a detached
+launch, or a wrapper script that returns once an interim phase completes
+while a backgrounded tail keeps the named container running — exactly
+`splat_train_<job_id>` in the incident below). `runner.run_job()`'s
+normal (i.e. `require_result_artifact` unset/False, the common case)
+completion path now checks `_job_container_alive()` after the client
+process exits 0, and — if the container is still up — genuinely WAITS
+(`runner._wait_for_container_exit()`, polling `docker/podman ps`) for it
+to exit before reporting the job "done" at all, rather than reporting
+completion (and, transitively, that the GPU is free) the instant the
+client exits and separately killing the container at collection time.
+This was a deliberate choice between the two designs: `ablator`'s queue
+semantics already define "done" as requiring the container gone (see the
+`done`/`finishing` states above), so waiting is the fix that matches the
+documented contract, and it avoids ever needing to kill a container that
+may still be doing legitimate, real work.
+
+Incident: `psnr26spp31c_..._sampleall` on `rtx3090` was marked `done` at
+elapsed 0h14m while its container ran a post-mapping pose-align tail for
+35+ more minutes; every other job's claim attempt against that GPU saw
+`gpu_busy_conflict` in the meantime because the queue believed the GPU
+was already free.
+
 ## `ablator errors [name]`
 
 Classifies **terminal** (failed/quarantined) jobs and machine-level
@@ -132,6 +158,7 @@ do (requeue with backoff / quarantine / pause the machine).
 | `gpu_busy_conflict` | `requeue_backoff_5min` |
 | `gpu_memory_exhaustion` | `quarantine_no_retry` (runner's own in-flight GPU-memory guard killed it — bypasses log-tail heuristics entirely, since the guard already knows why) |
 | `oom_killed` | `requeue_once_needs_review` |
+| `killed_externally` | `requeue_once_needs_review` |
 | `scene_missing` | `quarantine_no_retry` |
 | `network_transient` | `requeue_backoff_2min` |
 | `code_error` | `quarantine_code_fix_needed` |
@@ -139,10 +166,29 @@ do (requeue with backoff / quarantine / pause the machine).
 
 Classification checks categories roughly in this priority order (first
 match wins): `disk_full` → `image_missing` → `gpu_busy_conflict` (only
-if the job was flagged busy-at-claim-time) → `oom_killed` (exit 137
-without a GPU-OOM log signature) → `scene_missing` → `network_transient`
+if the job was flagged busy-at-claim-time) → `oom_killed`/`killed_externally`
+(exit 137 without a GPU-OOM log signature) → `scene_missing` → `network_transient`
 → `gpu_busy_conflict` (fallback, lower confidence) → `code_error`
 (Python traceback) → `unknown`.
+
+**`oom_killed` vs `killed_externally`** (decision, incident 2026-09-12):
+exit code 137 means "reaped by an uncatchable SIGKILL" — that alone
+never distinguishes the kernel OOM-killer from an operator's own
+`docker kill`/`kill -9` (or a daemon restart). Guessing `oom_killed` from
+the exit code alone let a deliberate operator kill get misclassified as a
+system crash. `classify_failure()` now requires POSITIVE OOM evidence
+before using `oom_killed`: either `docker/podman inspect
+--format='{{.State.OOMKilled}}'` (via `machine_context["container_oom_killed"]`,
+populated by `runner._container_oom_killed()` from the container identity
+already captured at launch time) reporting `true`, or a kernel OOM-killer
+signature in dmesg. Absent both — including when the container was
+already removed by the time classification ran, so the inspect can't be
+performed at all — exit 137 is classified `killed_externally` instead:
+same `requeue_once_needs_review` suggested action (still needs a human
+look), but honest that the cause is not established as OOM. Separately,
+a job already in a terminal `done` state is never reopened by ANY late
+exit/classification event — see `queue.Queue`'s `TERMINAL_STATUSES` /
+"once terminal, terminal" guard in `finish()`/`update()`.
 
 Marker lists are config-driven — override any category (wholesale, not
 merged) via `[error_patterns]` in the host config:

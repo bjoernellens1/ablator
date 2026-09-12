@@ -23,6 +23,39 @@ from . import source_checkout as sourcecheckout
 
 DEFAULT_FLOCK_TIMEOUT_S = 60.0
 
+# Once a job reaches one of these, it is done being touched by automatic
+# machinery -- see finish()/update()'s "once terminal, terminal" guard.
+# Deliberately excludes "failed" (an intermediate state: one automatic
+# retry, or handle_failure()'s own backoff-to-pending, is expected and
+# legitimate) and "pending" (not terminal at all). A human can still reset
+# a terminal job on purpose via `ablator rerun`, which bypasses these two
+# methods entirely (it mutates the loaded jobs list directly under its own
+# lock -- see cli.cmd_rerun) precisely so it is not caught by this guard.
+#
+# One further, narrow exception, checked inline in both methods below: a
+# job at status="done" with reconciled=True is not a genuine, trainer-
+# reported completion -- it is runner.reconcile_stale_running()'s own
+# INFERRED verdict (an artifact match with no live process to confirm it),
+# which runner.heal_falsely_reconciled_done() deliberately reverts back to
+# "running" (still `status="running"`, never straight to "pending") when a
+# live container/log later proves that inference wrong (see that
+# function's own docstring -- a mixed-currency multi-host fleet racing a
+# stale peer's daemon). That correction is exactly the kind of terminal-job
+# mutation this guard exists to stop for a genuinely-finished job, so it
+# must stay exempt; a real exit_code-driven "done" (reconciled unset) is
+# not.
+TERMINAL_STATUSES = frozenset({"done", "cancelled", "quarantined"})
+
+
+def _terminal_reopen_blocked(current_job: dict, new_status: str | None) -> bool:
+    current = current_job.get("status")
+    if current not in TERMINAL_STATUSES or new_status is None or new_status == current:
+        return False
+    if (current == "done" and current_job.get("reconciled")
+            and new_status == "running"):
+        return False  # heal_falsely_reconciled_done()'s sanctioned correction
+    return True
+
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -466,6 +499,28 @@ class Queue:
                     jobs = self._load(f)
                     for j in jobs:
                         if j.get("id") == job_id:
+                            if _terminal_reopen_blocked(j, status):
+                                current = j.get("status")
+                                # Bug fix (incident 2026-09-12): a job
+                                # already terminal must never be reopened
+                                # (or overwritten to a DIFFERENT terminal
+                                # status) by a late/stray event -- e.g. an
+                                # operator's `docker kill` on a container
+                                # whose job was already correctly marked
+                                # "done" reaching this call well after the
+                                # fact (misclassified as oom_killed,
+                                # flipping the job back to "pending" and
+                                # getting it re-claimed/retrained from
+                                # scratch within a minute). Once terminal,
+                                # terminal -- see TERMINAL_STATUSES' own
+                                # docstring for the one sanctioned bypass
+                                # (`ablator rerun`, which never calls
+                                # finish()/update() at all).
+                                print(f"[ablator] finish({job_id!r}, {status!r}) "
+                                      f"ignored: job is already terminal "
+                                      f"({current!r}) -- not reopening it",
+                                      flush=True)
+                                continue
                             try:
                                 declarations.validate_immutable_update(j, extra)
                             except declarations.ExperimentDeclarationError as exc:
@@ -501,6 +556,22 @@ class Queue:
                 jobs = self._load(f)
                 for j in jobs:
                     if j.get("id") == job_id:
+                        new_status = fields.get("status")
+                        if _terminal_reopen_blocked(j, new_status):
+                            current = j.get("status")
+                            # Same "once terminal, terminal" guard as
+                            # finish() -- see TERMINAL_STATUSES' docstring
+                            # and finish()'s comment for the incident this
+                            # fixes. Drop only the status field itself (a
+                            # late reopen attempt), not the whole update,
+                            # so any other, harmless bookkeeping fields in
+                            # the same call (health snapshots etc.) still
+                            # land.
+                            print(f"[ablator] update({job_id!r}) status change "
+                                  f"to {new_status!r} ignored: job is already "
+                                  f"terminal ({current!r}) -- not reopening it",
+                                  flush=True)
+                            fields = {k: v for k, v in fields.items() if k != "status"}
                         try:
                             declarations.validate_immutable_update(j, fields)
                         except declarations.ExperimentDeclarationError as exc:

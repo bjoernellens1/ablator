@@ -54,10 +54,43 @@ def test_gpu_busy_conflict():
     assert r["suggested_action"] == "requeue_backoff_5min"
 
 
-def test_oom_killed():
-    r = errormod.classify_failure(_job(), "process killed", 137, {})
+def test_oom_killed_confirmed_by_dmesg():
+    """Exit 137 IS classified oom_killed when dmesg actually confirms the
+    kernel OOM-killer fired."""
+    r = errormod.classify_failure(
+        _job(), "process killed", 137,
+        {"dmesg_tail": "Out of memory: Killed process 12345 (train.py)"})
     assert r["category"] == "oom_killed"
     assert r["suggested_action"] == "requeue_once_needs_review"
+
+
+def test_oom_killed_confirmed_by_container_inspect():
+    """Exit 137 IS classified oom_killed when the container's own
+    `docker/podman inspect --format='{{.State.OOMKilled}}'` says true --
+    the authoritative signal (see runner._container_oom_killed)."""
+    r = errormod.classify_failure(
+        _job(), "process killed", 137, {"container_oom_killed": True})
+    assert r["category"] == "oom_killed"
+
+
+def test_killed_externally_when_no_oom_evidence():
+    """Bug fix (incident 2026-09-12): exit code 137 ALONE (no dmesg
+    OOM-killer signature, no container inspect confirmation -- e.g. the
+    container was already removed by the time this ran) is genuinely
+    ambiguous -- a SIGKILL covers both the OOM-killer and a plain operator
+    `docker kill`/`kill -9`. Must NOT be guessed as oom_killed."""
+    r = errormod.classify_failure(_job(), "process killed", 137, {})
+    assert r["category"] == "killed_externally"
+    assert r["category"] != "oom_killed"
+
+
+def test_killed_externally_when_container_inspect_says_not_oom():
+    """An operator's `docker kill` on a container is exactly this case:
+    docker/podman inspect's State.OOMKilled positively reports false, so
+    exit 137 must be classified killed_externally, not oom_killed."""
+    r = errormod.classify_failure(
+        _job(), "process killed", 137, {"container_oom_killed": False})
+    assert r["category"] == "killed_externally"
 
 
 def test_scene_missing():
@@ -234,3 +267,83 @@ def test_cmd_unpause_missing_flag_errors(tmp_path):
     cfg = make_cfg(tmp_path)
     with pytest.raises(SystemExit):
         cli.cmd_unpause(cfg, "nonexistent-machine")
+
+
+def test_last_traceback_block_extraction():
+    """Test that last_traceback_block extracts traceback to end of text."""
+    log = "some output\nTraceback (most recent call last):\n  File \"train.py\", line 100\n    foo()\nValueError: bad value"
+    tb = errormod.last_traceback_block(log)
+    assert "Traceback (most recent call last)" in tb
+    assert "ValueError: bad value" in tb
+    assert "some output" not in tb  # Should not include text before traceback
+
+
+def test_last_traceback_block_multiple():
+    """Test that last_traceback_block returns the LAST traceback, not the first."""
+    log = (
+        "Traceback (most recent call last):\n  File \"a.py\"\nError: first\n\n"
+        "... cleanup ...\n\n"
+        "Traceback (most recent call last):\n  File \"b.py\"\nError: second"
+    )
+    tb = errormod.last_traceback_block(log)
+    assert "File \"b.py\"" in tb
+    assert "Error: second" in tb
+    # First traceback should not be in the result (it's before the last one)
+    assert tb.count("Traceback") == 1
+
+
+def test_synthetic_large_stderr_with_traceback():
+    """Test ~35 KB synthetic stderr with traceback near the end.
+
+    Simulates a job with a large preamble (like ABLATOR_JOB_JSON) followed by
+    the actual error. Evidence should contain the exception line and innermost
+    frames, not get cut off at the marker's fixed 160-char window.
+    """
+    # Build a ~35 KB log: preamble + some noise + traceback at the end
+    preamble = "x" * 20000  # 20 KB of noise
+    middle = "y" * 15000   # 15 KB more noise
+    traceback_text = (
+        "\nTraceback (most recent call last):\n"
+        "  File \"/splatograph/train.py\", line 2818, in <module>\n"
+        "    training(config)\n"
+        "  File \"/splatograph/train.py\", line 2500, in training\n"
+        "    result = model.train_step(batch)\n"
+        "  File \"/splatograph/model.py\", line 1200, in train_step\n"
+        "    loss = compute_loss(output)\n"
+        "  File \"/splatograph/loss.py\", line 450, in compute_loss\n"
+        "    raise RuntimeError(\"tensor shape mismatch\")\n"
+        "RuntimeError: tensor shape mismatch\n"
+    )
+    full_log = preamble + middle + traceback_text
+    assert len(full_log) > 30000  # Verify size exceeds evidence tail size
+
+    # Classify as code_error (has traceback)
+    r = errormod.classify_failure(_job(), full_log, 1, {})
+    assert r["category"] == "code_error"
+
+    # Evidence must contain the exception line and inner frames, not just marker
+    evidence = r["evidence_snippet"]
+    assert "RuntimeError: tensor shape mismatch" in evidence
+    assert "compute_loss" in evidence  # Inner frame
+    assert len(evidence) > 160  # Must be more than just the 160-char snippet window
+
+
+def test_gpu_oom_with_traceback_in_evidence():
+    """Test that gpu_busy_conflict classifies OOM with traceback in evidence."""
+    log = (
+        "RuntimeError: HIP out of memory: tried to allocate 16.00 GiB\n"
+        "... device full ...\n\n"
+        "Traceback (most recent call last):\n"
+        "  File \"/train.py\", line 100\n"
+        "    result = model(batch)\n"
+        "  File \"/model.py\", line 50\n"
+        "    raise RuntimeError('OOM')\n"
+        "RuntimeError: Out of memory\n"
+    )
+    r = errormod.classify_failure(_job(gpu_busy_at_claim=True), log, 1, {})
+    assert r["category"] == "gpu_busy_conflict"
+
+    # Evidence should include both the OOM marker and the traceback
+    evidence = r["evidence_snippet"]
+    assert "HIP out of memory" in evidence
+    assert "RuntimeError: Out of memory" in evidence

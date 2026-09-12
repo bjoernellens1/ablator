@@ -75,6 +75,24 @@ conflict backs off 5 minutes via `not_before`, a transient network
 error backs off 2 minutes) comes from
 [failure classification](health.md) — see `SUGGESTED_ACTION` there.
 
+**Once terminal, terminal** (decision, incident 2026-09-12): `done`,
+`cancelled` and `quarantined` are true terminal states for automatic
+machinery — `Queue.finish()`/`Queue.update()` refuse to move a job away
+from one of these (a late/stray event, e.g. a container-exit
+classification arriving well after the job already completed, is
+dropped with a log line rather than applied), with one sanctioned
+exception: `runner.heal_falsely_reconciled_done()` reverting a
+`status="done", reconciled=True` (i.e. auto-inferred, not a genuine
+trainer-reported completion) job back to `running` when it turns out the
+container/log is still live. A human can still reset a genuinely terminal
+job on purpose via `ablator rerun`, which bypasses `finish()`/`update()`
+entirely. (Incident: an operator's `docker kill` on a container whose job
+had already been marked `done` was classified `oom_killed` from exit code
+137 alone and flipped the job back to `pending`, which got re-claimed and
+retrained from scratch within a minute — see
+[health.md](health.md#oom_killed-vs-killed_externally-decision-incident-2026-09-12)
+for the companion classification fix.)
+
 ## Logs
 
 Per-job stdout/stderr lands at `<log_dir>/<job id>.log`
