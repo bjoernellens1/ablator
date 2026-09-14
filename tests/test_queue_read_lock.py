@@ -63,6 +63,25 @@ def test_read_waits_for_a_locked_partial_rewrite(tmp_path):
     assert parent.recv() == ("ok", expected)
 
 
+def test_read_reopens_after_lock_to_avoid_a_stale_prelock_handle(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "queue.jsonl"
+    expected = [{"id": "complete", "status": "pending"}]
+    path.write_text(json.dumps(expected[0]) + "\n")
+    stale_path = tmp_path / "stale-prelock-view.jsonl"
+    stale_path.write_text('{"id": "partial"')
+    queue = Queue(str(path))
+
+    monkeypatch.setattr(
+        queue,
+        "_open_locked",
+        lambda **_kwargs: stale_path.open(),
+    )
+
+    assert queue.read() == expected
+
+
 def test_read_shares_the_queue_lock_with_another_reader(tmp_path):
     path = tmp_path / "queue.jsonl"
     expected = [{"id": "complete", "status": "pending"}]

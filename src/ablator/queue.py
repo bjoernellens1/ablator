@@ -284,8 +284,11 @@ class Queue:
         if not os.path.exists(self.path):
             return []
         try:
-            with self._open_locked(shared=True, create=False) as f:
-                return self._load(f)
+            with self._open_locked(shared=True, create=False):
+                # A pre-flock NFS handle can retain an in-progress rewrite.
+                # Reopen after locking while the guard remains held.
+                with open(self.path) as snapshot:
+                    return self._load(snapshot)
         except FileNotFoundError:
             return []
 
