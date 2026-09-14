@@ -82,6 +82,27 @@ def test_read_reopens_after_lock_to_avoid_a_stale_prelock_handle(
     assert queue.read() == expected
 
 
+def test_read_retries_a_torn_snapshot_from_a_lock_free_writer(tmp_path, monkeypatch):
+    path = tmp_path / "queue.jsonl"
+    expected = [{"id": "complete", "status": "pending"}]
+    path.write_text(json.dumps(expected[0]) + "\n")
+    queue = Queue(str(path))
+    original_load = queue._load
+    calls = 0
+
+    def load(snapshot):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise json.JSONDecodeError("torn lock-free rewrite", "{", 1)
+        return original_load(snapshot)
+
+    monkeypatch.setattr(queue, "_load", load)
+
+    assert queue.read() == expected
+    assert calls == 2
+
+
 def test_read_shares_the_queue_lock_with_another_reader(tmp_path):
     path = tmp_path / "queue.jsonl"
     expected = [{"id": "complete", "status": "pending"}]

@@ -22,6 +22,7 @@ from . import experiment_declaration as declarations
 from . import source_checkout as sourcecheckout
 
 DEFAULT_FLOCK_TIMEOUT_S = 60.0
+READ_SNAPSHOT_RETRY_S = 5.0
 
 # Once a job reaches one of these, it is done being touched by automatic
 # machinery -- see finish()/update()'s "once terminal, terminal" guard.
@@ -280,17 +281,24 @@ class Queue:
 
     # -- public API ------------------------------------------------------
     def read(self) -> list[dict]:
-        """Return a shared-lock snapshot for status displays."""
+        """Return a complete snapshot, including during mixed-fleet rewrites."""
         if not os.path.exists(self.path):
             return []
-        try:
-            with self._open_locked(shared=True, create=False):
-                # A pre-flock NFS handle can retain an in-progress rewrite.
-                # Reopen after locking while the guard remains held.
-                with open(self.path) as snapshot:
-                    return self._load(snapshot)
-        except FileNotFoundError:
-            return []
+        deadline = time.monotonic() + READ_SNAPSHOT_RETRY_S
+        while True:
+            try:
+                with self._open_locked(shared=True, create=False):
+                    # Reopen after locking: pre-flock NFS handles can retain a
+                    # stale partial rewrite. Retry parse failures because old
+                    # fleet writers do not yet participate in this lock.
+                    with open(self.path) as snapshot:
+                        return self._load(snapshot)
+            except FileNotFoundError:
+                return []
+            except json.JSONDecodeError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.05)
 
     @staticmethod
     def _validate_enqueue_job(job: dict, *, require_pinned_git: bool = False) -> None:
