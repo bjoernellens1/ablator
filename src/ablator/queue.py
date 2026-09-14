@@ -245,8 +245,14 @@ class Queue:
                 pass  # truly out of space even for the restore; nothing more we can do here
             raise
 
-    def _open_locked(self, timeout_s: float | None = None):
-        """Open the queue file and acquire LOCK_EX with a deadline.
+    def _open_locked(
+        self,
+        timeout_s: float | None = None,
+        *,
+        shared: bool = False,
+        create: bool = True,
+    ):
+        """Open the queue file and acquire a flock with a deadline.
 
         The queue lives on NFS; a lost lock owner or a peer hung while
         holding the lock must not freeze this runner permanently. Raises
@@ -255,13 +261,15 @@ class Queue:
         if timeout_s is None:
             timeout_s = float(os.environ.get("ABLATOR_FLOCK_TIMEOUT_S",
                                              DEFAULT_FLOCK_TIMEOUT_S))
-        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
-        open(self.path, "a").close()
-        f = open(self.path, "r+")
+        if create:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            open(self.path, "a").close()
+        f = open(self.path, "r+" if create else "r")
+        lock_type = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
         deadline = time.monotonic() + timeout_s
         while True:
             try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(f, lock_type | fcntl.LOCK_NB)
                 return f
             except (BlockingIOError, PermissionError):
                 if time.monotonic() >= deadline:
@@ -272,11 +280,14 @@ class Queue:
 
     # -- public API ------------------------------------------------------
     def read(self) -> list[dict]:
-        """Lock-free snapshot for status displays."""
+        """Return a shared-lock snapshot for status displays."""
         if not os.path.exists(self.path):
             return []
-        with open(self.path) as f:
-            return [json.loads(l) for l in f if l.strip()]
+        try:
+            with self._open_locked(shared=True, create=False) as f:
+                return self._load(f)
+        except FileNotFoundError:
+            return []
 
     @staticmethod
     def _validate_enqueue_job(job: dict, *, require_pinned_git: bool = False) -> None:
