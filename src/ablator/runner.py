@@ -24,6 +24,7 @@ import shlex
 import shutil
 import signal
 import socket
+import sys
 import subprocess
 import threading
 import time
@@ -34,6 +35,7 @@ from . import error as errormod
 from . import execution_receipt as receiptmod
 from . import experiment_declaration as declarations
 from . import health as healthmod
+from . import lifecycle_cost as lifecyclecost
 from . import provenance as provmod
 from . import resources
 from . import source_checkout as sourcecheckout
@@ -2251,6 +2253,10 @@ def run_job(cfg: dict, job: dict, machine: str,
     if mcfg.get("backend") == "k8s":
         return run_job_k8s(cfg, job, machine, mcfg, q)
     log_path = os.path.join(cfgmod.log_dir(cfg), f"{job['id']}.log")
+    lifecycle = lifecyclecost.start(job, machine)
+    lifecycle_error: str | None = None
+    source_release = "not_acquired"
+    attestation: dict | None = None
     prepared_source: sourcecheckout.PreparedSource | None = None
     execution_receipt: dict | None = None
     execution_receipt_sha256 = ""
@@ -2274,6 +2280,7 @@ def run_job(cfg: dict, job: dict, machine: str,
         prepared_source = sourcecheckout.prepare_job_source(cfg, job, machine, tcfg)
         tcfg = prepared_source.type_config
         if prepared_source.checkout_path:
+            source_release = "unknown"
             job["_prepared_repo_cwd"] = prepared_source.checkout_path
             job.update({
                 "source_checkout": prepared_source.checkout_path,
@@ -2379,6 +2386,8 @@ def run_job(cfg: dict, job: dict, machine: str,
             proc = subprocess.Popen(argv, env=env, cwd=cwd,
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)
+            if lifecycle is not None:
+                lifecycle.child_started = time.monotonic_ns()
             if container_name:
                 container_identity = _capture_container_identity(
                     argv[0], container_name
@@ -2398,6 +2407,8 @@ def run_job(cfg: dict, job: dict, machine: str,
                 q.update(job["id"], actual_launch=actual_launch)
             override = supervise(cfg, job, proc, cwd or os.getcwd(), q, argv=argv,
                                  machine=machine)
+            if lifecycle is not None and proc.returncode is not None:
+                lifecycle.child_wait_completed = time.monotonic_ns()
         exit_code = proc.returncode
         if override is not None:
             # Control-triggered stop/skip/requeue (or a lane preemption)
@@ -2450,12 +2461,14 @@ def run_job(cfg: dict, job: dict, machine: str,
         else:
             status = "done" if exit_code == 0 else "failed"
     except (KeyError, TemplateError, sourcecheckout.SourcePreparationError) as e:
+        lifecycle_error = str(e)
         print(f"[ablator] {job['id']} unrunnable: {e}", flush=True)
         if proc is not None and actual_launch is None and launched_argv is not None:
             kill_job(proc, job, launched_argv)
         if q is not None and isinstance(e, sourcecheckout.SourcePreparationError):
             q.update(job["id"], source_prepare_error=str(e))
     except Exception as e:
+        lifecycle_error = str(e)
         print(f"[ablator] {job['id']} crashed: {e}", flush=True)
     finally:
         if prepared_source is not None and prepared_source.checkout_path:
@@ -2490,6 +2503,7 @@ def run_job(cfg: dict, job: dict, machine: str,
                     error=str(exc),
                 )
             if attestation["verdict"] != "ACCEPTED":
+                lifecycle_error = lifecycle_error or attestation["error"]
                 status = "failed"
                 print(
                     f"[ablator] {job['id']} final source attestation rejected: "
@@ -2499,7 +2513,9 @@ def run_job(cfg: dict, job: dict, machine: str,
                 q.update(job["id"], execution_attestation=attestation)
             try:
                 sourcecheckout.release_source(prepared_source)
+                source_release = "released"
             except sourcecheckout.SourcePreparationError as exc:
+                lifecycle_error = lifecycle_error or str(exc)
                 status = "failed"
                 if q is not None:
                     q.update(job["id"], source_release_error=str(exc))
@@ -2507,6 +2523,18 @@ def run_job(cfg: dict, job: dict, machine: str,
                     f"[ablator] {job['id']} source lease release failed: {exc}",
                     flush=True,
                 )
+        if lifecycle is not None:
+            lifecycle.publish(
+                cfgmod.log_dir(cfg), status=status, exit_code=exit_code,
+                bindings={
+                    "execution_receipt": execution_receipt,
+                    "execution_receipt_sha256": execution_receipt_sha256 or None,
+                    "actual_launch": actual_launch,
+                    "execution_attestation": attestation,
+                },
+                error=lifecycle_error, proc=proc, source_release=source_release,
+                owner_unwinding=sys.exc_info()[0] is not None,
+            )
     return status, exit_code
 
 
